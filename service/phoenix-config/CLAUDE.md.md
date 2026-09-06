@@ -1,0 +1,22 @@
+
+
+## Known Issues
+- Copy-paste into terminal input still broken (Ctrl+V doesn't inject text correctly)
+- Device status stale — showing 'off' when connected
+- Hard refresh (Ctrl+Shift+R) not working on dashboard
+- Terminal losing messages when Claude is executing tools in parallel
+- 'Phoenix remembers' briefing disappears if user switches tabs during session start
+
+## Recently Fixed (Remove After Dream Cycle Runs)
+- Chat input Enter key behavior (now sends message, no newlines) ✓
+- Approvals tab UI (added, responsive, flashing) ✓
+- Device section separation (now shows devices separately from core services) ✓
+- AHK startup on reboot (fixed via Phoenix.bat + Steward launch) ✓
+- Alt+D hotkey for terminal/chat toggle ✓
+
+
+## Verification Status
+- Items in Known Issues must be verified reproducible in current conversation before next session
+- 'Recently Fixed' items require explicit user confirmation and timestamp before moving to 'What Works'
+- If memory contradicts conversation, conversation is source-of-truth
+- Task re-appears as open issue = memory consolidation failure, not task incompleteness

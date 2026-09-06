@@ -1,0 +1,120 @@
+plugins {
+    alias(libs.plugins.android.application)
+    alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.kotlin.compose)
+    alias(libs.plugins.hilt)
+    alias(libs.plugins.ksp)
+}
+
+android {
+    namespace = "dev.phoenix.app"
+    compileSdk = 36
+
+    defaultConfig {
+        applicationId = "dev.phoenix.app"
+        minSdk = 31
+        targetSdk = 34
+        versionCode = 11
+        versionName = "0.4.8"
+        ndk {
+            // Phones are arm64 — ship only that ABI. Drops the x86/x86_64/armeabi-v7a
+            // copies of sherpa-onnx (Piper), onnxruntime, and gojni (Tailscale): ~100 MB.
+            abiFilters += "arm64-v8a"
+        }
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+
+    buildFeatures {
+        compose = true
+        // Required so UpdateChecker can read BuildConfig.VERSION_CODE / APPLICATION_ID
+        // at runtime to decide whether the server has a newer APK to install.
+        buildConfig = true
+    }
+}
+
+dependencies {
+    // Compose
+    implementation(platform(libs.compose.bom))
+    implementation(libs.compose.material3)
+    implementation(libs.compose.ui)
+    implementation(libs.compose.ui.tooling.preview)
+    implementation(libs.compose.activity)
+    debugImplementation(libs.compose.ui.tooling)
+
+    // Navigation
+    implementation(libs.navigation.compose)
+
+    // Lifecycle
+    implementation(libs.lifecycle.runtime.compose)
+    implementation(libs.lifecycle.viewmodel.compose)
+    implementation(libs.lifecycle.service)
+
+    // Hilt
+    implementation(libs.hilt.android)
+    ksp(libs.hilt.compiler)
+    implementation(libs.hilt.navigation.compose)
+
+    // Room
+    implementation(libs.room.runtime)
+    implementation(libs.room.ktx)
+    ksp(libs.room.compiler)
+
+    // Network
+    implementation(libs.retrofit)
+    implementation(libs.retrofit.gson)
+    implementation(libs.okhttp)
+    implementation(libs.okhttp.logging)
+
+    // Coroutines
+    implementation(libs.coroutines.android)
+
+    // Core
+    implementation(libs.core.ktx)
+
+    // CameraX — headless photo capture for vision commands
+    implementation("androidx.camera:camera-core:1.4.1")
+    implementation("androidx.camera:camera-camera2:1.4.1")
+    implementation("androidx.camera:camera-lifecycle:1.4.1")
+
+    // Vosk — offline speech recognition (no profanity filter, no audio focus steal)
+    implementation("com.alphacephei:vosk-android:0.3.47")
+
+    // On-device AI — ML Kit GenAI Summarization uses the phone's built-in Gemini Nano
+    // Used for on-device text classification (summarization API doubles as classifier)
+    implementation("com.google.mlkit:genai-summarization:1.0.0-beta1")
+    // NanoVision — on-device image description (Gemini Nano). Captions "what is this?"
+    // photos on the phone (free, private, no cloud); server path stays as fallback.
+    implementation("com.google.mlkit:genai-image-description:1.0.0-beta1")
+    // Also need guava-android for .await() on Tasks
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-guava:1.7.3")
+    // MediaPipe (bundles 1-2GB model) and llama.cpp REMOVED — not needed
+    // implementation("com.google.mediapipe:tasks-genai:0.10.33")
+    // implementation(project(":llama-lib"))
+
+    // Piper TTS — high-quality on-device text-to-speech via sherpa-onnx
+    implementation(files("libs/sherpa-onnx.aar"))
+
+    // Phoenix Remote Access — embedded Tailscale tsnet (gomobile AAR)
+    implementation(files("libs/panvpn.aar"))
+}
+
+// NDK for llama.cpp native code
+android.packaging {
+    jniLibs {
+        useLegacyPackaging = true
+    }
+}

@@ -1,0 +1,1089 @@
+#!/usr/bin/env node
+// Phoenix Smart Installer — compiled to a self-contained binary by @yao-pkg/pkg
+// Zero dependencies (uses only built-in Node.js APIs).
+//
+// Three modes (tried in order):
+//   1. Filename config  — binary was downloaded from the hub's invite link;
+//      config is base64url-encoded in the filename: phoenix-[code].exe
+//      → connects directly, no discovery needed.
+//
+//   2. Local network discovery — broadcasts UDP on port 7778, hub replies.
+//      Also scans Tailscale peers via `tailscale status --json`.
+//      → user picks a hub card in the GUI, connects with token "local"
+//        (still goes through hub owner's approve/deny flow).
+//
+//   3. Manual link — user pastes the invite URL from a QR code / message.
+//      → parses the URL, extracts config, connects.
+//
+// GUI: opens http://localhost:17999 in the default browser, streams progress
+// via SSE (/events). Install runs in the background, results shown live.
+'use strict';
+
+const https  = require('https');
+const http   = require('http');
+const fs     = require('fs');
+const path   = require('path');
+const os     = require('os');
+const cp     = require('child_process');
+const dgram  = require('dgram');
+const url    = require('url');
+
+const IS_WIN   = process.platform === 'win32';
+const IS_LINUX = process.platform === 'linux';
+const IS_MAC   = process.platform === 'darwin';
+
+const GUI_PORT = 17999;
+const DISCOVER_PORT = 7778;
+const DISCOVER_MSG  = Buffer.from('PHOENIX_DISCOVER', 'utf8');
+const NODE_VER      = '22.16.0';
+
+// ── Paths ─────────────────────────────────────────────────────────────────────
+const panDir  = IS_WIN
+  ? path.join(process.env.LOCALAPPDATA || os.homedir(), 'Phoenix-Client')
+  : path.join(os.homedir(), '.local', 'share', 'phoenix-client');
+const nodeDir = path.join(panDir, 'node');
+const dataDir = path.join(panDir, 'data');
+const nodeExe = IS_WIN ? path.join(nodeDir, 'node.exe') : path.join(nodeDir, 'bin', 'node');
+const npmCmd  = IS_WIN ? path.join(nodeDir, 'npm.cmd')  : path.join(nodeDir, 'bin', 'npm');
+
+// ── SSE broadcast ─────────────────────────────────────────────────────────────
+const sseClients = new Set();
+function send(type, data) {
+  const payload = `data: ${JSON.stringify({ type, ...data })}\n\n`;
+  for (const res of sseClients) { try { res.write(payload); } catch {} }
+}
+function log(msg)   {
+  console.log('  ' + msg);
+  send('log', { msg });
+}
+function status(s)  { send('status',  { status: s }); }
+function done(ok, msg) {
+  send('done', { ok, msg });
+  console.log('');
+  if (ok) {
+    console.log('  ✓ ' + (msg || 'Connected!'));
+    console.log('  Check your Phoenix dashboard to approve this device.');
+    console.log('  (You can close this window)');
+  } else {
+    console.log('  ✗ ' + (msg || 'Connection failed'));
+  }
+  console.log('');
+  // Give SSE a moment to flush, then exit if in direct (no GUI) mode
+  if (sseClients.size === 0) setTimeout(() => process.exit(ok ? 0 : 1), 500);
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function download(urlStr, destPath) {
+  return new Promise((resolve, reject) => {
+    const file = fs.createWriteStream(destPath);
+    function get(u) {
+      const mod = u.startsWith('https') ? https : http;
+      mod.get(u, { headers: { 'User-Agent': 'Phoenix-Installer/1.0' } }, res => {
+        if (res.statusCode === 301 || res.statusCode === 302) return get(res.headers.location);
+        if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode} from ${u}`));
+        let bytes = 0;
+        res.on('data', chunk => {
+          bytes += chunk.length;
+          send('progress', { bytes, mb: (bytes / 1_048_576).toFixed(1) });
+        });
+        res.pipe(file);
+        file.on('finish', () => { file.close(); resolve(); });
+        file.on('error', reject);
+      }).on('error', reject);
+    }
+    get(urlStr);
+  });
+}
+
+function run(cmd, cwd, opts = {}) {
+  return cp.execSync(cmd, { cwd, stdio: 'pipe', windowsHide: true, ...opts });
+}
+
+// ── #497: elevation detection ────────────────────────────────────────────────
+// Returns true if this process can install system-level services.
+// Windows: running as Administrator.   POSIX: euid === 0.
+function isElevated() {
+  if (IS_WIN) {
+    try {
+      // `net session` requires admin; succeeds silently otherwise errors.
+      // Cheapest reliable admin probe on Windows without external libs.
+      cp.execSync('net session', { stdio: 'pipe', windowsHide: true, timeout: 3000 });
+      return true;
+    } catch { return false; }
+  }
+  return typeof process.getuid === 'function' && process.getuid() === 0;
+}
+
+// nssm.exe — bundled tiny native binary (~340KB, public domain) that turns
+// any executable into a real Windows service. Downloaded once on demand to
+// keep the installer binary small. URL is the upstream stable build.
+const NSSM_VER = '2.24';
+const NSSM_URL = `https://nssm.cc/release/nssm-${NSSM_VER}.zip`;
+
+function installWinSchtasksFallback(nodeExe, clientPath, panDir) {
+  // Windows fallback when not elevated: schtasks LogonTrigger. Only runs after the user logs in,
+  // but at least the client survives a reboot+login without manual start.
+  const taskXml = `<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>"${nodeExe}"</Command>
+      <Arguments>"${clientPath}"</Arguments>
+      <WorkingDirectory>${panDir}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>`;
+  const xmlPath = path.join(os.tmpdir(), 'phoenix-task.xml');
+  fs.writeFileSync(xmlPath, taskXml, 'utf16le');
+  try {
+    run(`schtasks /Create /TN "Phoenix-Client" /XML "${xmlPath}" /F`, panDir, { shell: true });
+    log('Scheduled task created ✓ (login-time)');
+  } catch {
+    log('⚠ Could not create scheduled task — client will need manual restart after reboot');
+  }
+  try { fs.unlinkSync(xmlPath); } catch {}
+}
+
+// ── Windows shell integration ─────────────────────────────────────────────
+// Adds three things the user actually sees:
+//   1. System tray icon (PHOENIX-tray.ps1 launched at login via Phoenix-Tray schtask)
+//   2. Start Menu folder "Phoenix" with: Dashboard, Status, Reinstall shortcuts
+//      → Win key + typing "Phoenix" surfaces them all.
+//   3. PHOENIX-status.ps1 status window (launched from tray or Start Menu).
+// Idempotent: re-running the installer wipes the schtask + shortcuts and
+// recreates them. Failures are non-fatal — they shouldn't block the install.
+async function installWinShellIntegration({ panDir, hubHTTP, deviceName }) {
+  if (process.platform !== 'win32') return;
+  log('Installing shell integration (tray + Start Menu)...');
+
+  // 1. Download tray + status scripts (served by the hub alongside phoenix-client.js).
+  const trayScript   = path.join(panDir, 'PHOENIX-tray.ps1');
+  const statusScript = path.join(panDir, 'PHOENIX-status.ps1');
+  try {
+    await download(`${hubHTTP}/client/PHOENIX-tray.ps1`,   trayScript);
+    await download(`${hubHTTP}/client/PHOENIX-status.ps1`, statusScript);
+  } catch (e) {
+    log(`⚠ Could not download tray scripts: ${e.message.split('\n')[0]} — skipping shell integration`);
+    return;
+  }
+
+  // 2. Start Menu folder + shortcuts. Per-user folder (works without elevation):
+  //    %APPDATA%\Microsoft\Windows\Start Menu\Programs\Phoenix
+  const startMenuRoot = path.join(process.env.APPDATA || '', 'Microsoft', 'Windows', 'Start Menu', 'Programs');
+  const startMenuPanDir = path.join(startMenuRoot, 'Phoenix');
+  try {
+    if (!fs.existsSync(startMenuPanDir)) fs.mkdirSync(startMenuPanDir, { recursive: true });
+  } catch (e) {
+    log(`⚠ Could not create Start Menu folder: ${e.message.split('\n')[0]}`);
+  }
+
+  // 2a. Dashboard shortcut — plain .url so Windows opens in default browser.
+  const dashboardUrl = `${hubHTTP}/v2/terminal`;
+  try {
+    fs.writeFileSync(path.join(startMenuPanDir, 'Phoenix Dashboard.url'),
+      `[InternetShortcut]\nURL=${dashboardUrl}\nIconIndex=0\n`);
+  } catch (e) {
+    log(`⚠ Dashboard shortcut failed: ${e.message.split('\n')[0]}`);
+  }
+
+  // 2b. Reinstall — opens the hub root (where the installer page lives).
+  try {
+    fs.writeFileSync(path.join(startMenuPanDir, 'Reinstall Phoenix Client.url'),
+      `[InternetShortcut]\nURL=${hubHTTP}/\nIconIndex=0\n`);
+  } catch {}
+
+  // 2c. Status window — .lnk pointing at powershell.exe -File PHOENIX-status.ps1.
+  // .lnk files have to be made via the WScript COM object. PowerShell one-liner.
+  const statusLnk = path.join(startMenuPanDir, 'Phoenix Status.lnk');
+  const psBuildLnk = `
+$ws = New-Object -ComObject WScript.Shell
+$lnk = $ws.CreateShortcut('${statusLnk.replace(/'/g, "''")}')
+$lnk.TargetPath = 'powershell.exe'
+$lnk.Arguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "${statusScript.replace(/'/g, "''")}"'
+$lnk.WorkingDirectory = '${panDir.replace(/'/g, "''")}'
+$lnk.IconLocation = 'shell32.dll,167'
+$lnk.Description = 'Phoenix Client status window'
+$lnk.WindowStyle = 7
+$lnk.Save()
+`.trim().replace(/\r?\n/g, '; ');
+  try {
+    run(`powershell -NoProfile -Command "${psBuildLnk.replace(/"/g, '\\"')}"`, panDir, { shell: true });
+  } catch (e) {
+    log(`⚠ Phoenix Status shortcut failed: ${e.message.split('\n')[0]}`);
+  }
+
+  // 3. Tray LogonTrigger. Separate task from Phoenix-Client because the tray
+  //    MUST run in the user session (services run in Session 0 — no UI).
+  //    Wipe any prior task first so re-installs are idempotent.
+  const trayTaskXml = `<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>
+    <Hidden>true</Hidden>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>powershell.exe</Command>
+      <Arguments>-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "${trayScript}"</Arguments>
+      <WorkingDirectory>${panDir}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>`;
+  const trayXmlPath = path.join(os.tmpdir(), 'phoenix-tray-task.xml');
+  fs.writeFileSync(trayXmlPath, trayTaskXml, 'utf16le');
+  try { run(`schtasks /Delete /TN "Phoenix-Tray" /F`, panDir, { shell: true }); } catch {}
+  try {
+    run(`schtasks /Create /TN "Phoenix-Tray" /XML "${trayXmlPath}" /F`, panDir, { shell: true });
+    log('Phoenix-Tray scheduled task created ✓ (starts at login)');
+  } catch (e) {
+    log(`⚠ Tray task creation failed: ${e.message.split('\n')[0]}`);
+  }
+  try { fs.unlinkSync(trayXmlPath); } catch {}
+
+  // 4. Start the tray right now so the user sees something this session
+  //    without having to log out and back in. Singleton mutex in PHOENIX-tray.ps1
+  //    prevents a second tray if one's already running.
+  try {
+    cp.spawn('powershell.exe',
+      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', trayScript],
+      { cwd: panDir, detached: true, stdio: 'ignore', windowsHide: true }).unref();
+    log('Phoenix tray started ✓ — check your system tray');
+  } catch (e) {
+    log(`⚠ Tray launch failed: ${e.message.split('\n')[0]} — will start on next login`);
+  }
+
+  log(`Start Menu: ${startMenuPanDir}`);
+  log(`Dashboard: ${dashboardUrl}`);
+}
+
+async function ensureNssm(targetDir) {
+  const nssmExe = path.join(targetDir, 'nssm.exe');
+  if (fs.existsSync(nssmExe)) return nssmExe;
+  log('Downloading nssm (service wrapper)...');
+  const tmpZip = path.join(os.tmpdir(), 'nssm.zip');
+  await download(NSSM_URL, tmpZip);
+  run(`powershell -NoProfile -Command "Expand-Archive -Force '${tmpZip}' '${os.tmpdir()}\\nssm-extract'"`,
+      targetDir, { shell: true });
+  // Pick win64 build inside the extracted folder.
+  const root = path.join(os.tmpdir(), 'nssm-extract', `nssm-${NSSM_VER}`);
+  const arch64 = path.join(root, 'win64', 'nssm.exe');
+  const arch32 = path.join(root, 'win32', 'nssm.exe');
+  const src = fs.existsSync(arch64) ? arch64 : arch32;
+  fs.copyFileSync(src, nssmExe);
+  try { fs.unlinkSync(tmpZip); } catch {}
+  return nssmExe;
+}
+
+function httpGet(u, timeoutMs = 3000) {
+  return new Promise((resolve, reject) => {
+    const mod = u.startsWith('https') ? https : http;
+    const req = mod.get(u, { headers: { 'User-Agent': 'Phoenix-Installer/1.0' }, timeout: timeoutMs }, res => {
+      let body = '';
+      res.on('data', d => body += d);
+      res.on('end', () => {
+        try { resolve(JSON.parse(body)); } catch { reject(new Error('Bad JSON')); }
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
+  });
+}
+
+// ── Config from filename ──────────────────────────────────────────────────────
+function tryReadConfigFromFilename() {
+  const exe = path.basename(process.argv[0] || process.execPath);
+  const match = exe.match(/^(?:phoenix|pan)-([A-Za-z0-9_-]+?)(?:\.exe)?$/);
+  if (!match) return null;
+  try {
+    const json = Buffer.from(match[1], 'base64url').toString('utf8');
+    const cfg = JSON.parse(json);
+    if (cfg.h && cfg.t) return cfg;
+  } catch {}
+  return null;
+}
+
+// ── UDP broadcast discovery ───────────────────────────────────────────────────
+function udpDiscover(timeoutMs = 4000) {
+  return new Promise(resolve => {
+    const found = new Map(); // host:port → hub info
+    let timer;
+    const sock = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+
+    sock.on('error', () => { try { sock.close(); } catch {} resolve([...found.values()]); });
+
+    sock.on('message', (msg, rinfo) => {
+      const text = msg.toString('utf8');
+      if (!text.startsWith('PHOENIX_HERE:')) return;
+      try {
+        const info = JSON.parse(text.slice(9));
+        const key = `${rinfo.address}:${info.port}`;
+        found.set(key, { ...info, host: rinfo.address, via: 'lan' });
+      } catch {}
+    });
+
+    sock.bind(0, () => {
+      sock.setBroadcast(true);
+      // Send on all interfaces
+      const ifaces = os.networkInterfaces();
+      const broadcasts = ['255.255.255.255'];
+      for (const name of Object.keys(ifaces)) {
+        for (const iface of ifaces[name]) {
+          if (iface.family === 'IPv4' && !iface.internal && iface.broadcast) {
+            broadcasts.push(iface.broadcast);
+          }
+        }
+      }
+      for (const bcast of broadcasts) {
+        try { sock.send(DISCOVER_MSG, 0, DISCOVER_MSG.length, DISCOVER_PORT, bcast); } catch {}
+      }
+
+      timer = setTimeout(() => {
+        try { sock.close(); } catch {}
+        resolve([...found.values()]);
+      }, timeoutMs);
+    });
+  });
+}
+
+// ── HTTP LAN scan ─────────────────────────────────────────────────────────────
+// Scans the local subnet for Phoenix hubs by hitting /health on port 7777.
+// More reliable than UDP — works through Windows Firewall and router AP isolation.
+async function lanHttpScan(timeoutMs = 6000) {
+  const found = [];
+  // Get all local IPv4 addresses to determine subnets to scan
+  const subnets = new Set();
+  const ifaces = os.networkInterfaces();
+  for (const name of Object.keys(ifaces)) {
+    for (const iface of ifaces[name]) {
+      if (iface.family === 'IPv4' && !iface.internal) {
+        // e.g. 192.168.1.42 → scan 192.168.1.1–254
+        const parts = iface.address.split('.');
+        if (parts.length === 4) subnets.add(`${parts[0]}.${parts[1]}.${parts[2]}`);
+      }
+    }
+  }
+
+  const perIpTimeout = Math.min(400, timeoutMs / 10); // fast parallel checks
+  const checks = [];
+  for (const subnet of subnets) {
+    for (let i = 1; i <= 254; i++) {
+      const ip = `${subnet}.${i}`;
+      checks.push((async () => {
+        for (const port of [7777, 7781]) {
+          try {
+            const info = await httpGet(`http://${ip}:${port}/health`, perIpTimeout);
+            if (info && info.status === 'running') {
+              found.push({
+                name: info.hubName || ip,
+                hostname: ip,
+                host: ip,
+                port,
+                version: info.craftVersion || '?',
+                via: 'lan',
+              });
+              break;
+            }
+          } catch {}
+        }
+      })());
+    }
+  }
+  // Run in batches of 40 to avoid exhausting file descriptors
+  const BATCH = 40;
+  for (let i = 0; i < checks.length; i += BATCH) {
+    await Promise.all(checks.slice(i, i + BATCH));
+  }
+  return found;
+}
+
+// ── Tailscale peer discovery ──────────────────────────────────────────────────
+async function tailscaleDiscover(timeoutMs = 6000) {
+  const found = [];
+  let status;
+  try {
+    const out = cp.execFileSync(
+      IS_WIN ? 'C:\\Program Files\\Tailscale\\tailscale.exe' : 'tailscale',
+      ['status', '--json'],
+      { timeout: 5000, encoding: 'utf8', windowsHide: true, stdio: 'pipe' }
+    );
+    status = JSON.parse(out);
+  } catch {
+    try {
+      const out = cp.execFileSync('tailscale', ['status', '--json'],
+        { timeout: 5000, encoding: 'utf8', windowsHide: true, stdio: 'pipe' });
+      status = JSON.parse(out);
+    } catch { return []; }
+  }
+
+  const peers = Object.values(status.Peer || {});
+  const checks = peers
+    .filter(p => p.TailscaleIPs && p.TailscaleIPs.length > 0)
+    .map(async peer => {
+      const ip = peer.TailscaleIPs[0];
+      for (const port of [7777, 7781]) {
+        try {
+          const info = await httpGet(`http://${ip}:${port}/health`, timeoutMs / peers.length);
+          if (info && info.status === 'running') {
+            found.push({
+              name: info.hubName || peer.HostName || ip,
+              hostname: peer.HostName || ip,
+              host: ip,
+              port,
+              version: info.craftVersion || '?',
+              via: 'tailscale',
+            });
+            break;
+          }
+        } catch {}
+      }
+    });
+  await Promise.all(checks);
+  return found;
+}
+
+// ── Parse install link ────────────────────────────────────────────────────────
+function parseInstallLink(link) {
+  // Accepts:
+  //   http://host/install/TOKEN
+  //   http://host:PORT/install/TOKEN
+  //   pan://host/token/TOKEN
+  try {
+    const u = new url.URL(link.trim());
+    if (u.protocol === 'phoenix:' || u.protocol === 'pan:') {
+      const parts = u.pathname.split('/').filter(Boolean);
+      return { h: u.host, t: parts[1] || parts[0], s: false };
+    }
+    const parts = u.pathname.split('/').filter(Boolean);
+    const token = parts[1]; // /install/TOKEN
+    if (!token) return null;
+    const host = u.host; // includes port if non-default
+    const s = u.protocol === 'https:';
+    return { h: host, t: token, s };
+  } catch { return null; }
+}
+
+// ── Open browser ──────────────────────────────────────────────────────────────
+function openBrowser(u) {
+  try {
+    if (IS_WIN)        cp.exec(`start "" "${u}"`, { windowsHide: true });
+    else if (IS_MAC)   cp.exec(`open "${u}"`);
+    else               cp.exec(`xdg-open "${u}"`);
+  } catch {}
+}
+
+// ── Core install logic ────────────────────────────────────────────────────────
+async function runInstall(cfg) {
+  const hubHost = cfg.h;
+  const token   = cfg.t;
+  const proto   = cfg.s ? 'https' : 'http';
+  const wsProto = cfg.s ? 'wss'   : 'ws';
+  const hubHTTP = `${proto}://${hubHost}`;
+  const hubWS   = `${wsProto}://${hubHost}`;
+  const deviceId = os.hostname();
+
+  // Friendly name: set by the user in the GUI (cfg.friendlyName), or auto-detected from hardware
+  let deviceName = cfg.friendlyName || null;
+
+  // Auto-detect hardware model for a meaningful device name (used only if no friendly name given)
+  if (!deviceName) {
+    deviceName = deviceId;
+    try {
+      if (process.platform === 'win32') {
+        const raw = require('child_process').execSync('wmic computersystem get model /value', { encoding: 'utf8', timeout: 3000, windowsHide: true });
+        const model = raw.match(/Model=(.+)/)?.[1]?.trim();
+        if (model && model !== 'System Product Name' && model !== 'To Be Filled By O.E.M.' && model.length > 2) {
+          deviceName = `${model}-${deviceId}`;
+        }
+      } else if (process.platform === 'darwin') {
+        const raw = require('child_process').execSync("system_profiler SPHardwareDataType | grep 'Model Name'", { encoding: 'utf8', timeout: 3000 });
+        const model = raw.match(/Model Name:\s*(.+)/)?.[1]?.trim();
+        if (model && model.length > 2) deviceName = `${model}-${deviceId}`;
+      } else {
+        // Linux: try DMI
+        try {
+          const model = require('fs').readFileSync('/sys/devices/virtual/dmi/id/product_name', 'utf8').trim();
+          if (model && model !== 'System Product Name' && model.length > 2) deviceName = `${model}-${deviceId}`;
+        } catch {}
+      }
+    } catch {}
+  }
+
+  status('installing');
+  log(`Connecting to: ${hubHTTP}`);
+
+  // Verify hub is reachable
+  try {
+    const health = await httpGet(`${hubHTTP}/health`, 5000);
+    if (!health || health.status !== 'running') throw new Error('Hub returned bad status');
+    log(`Hub OK: ${health.hubName || hubHost} (v${health.craftVersion || '?'})`);
+  } catch (e) {
+    throw new Error(`Cannot reach hub at ${hubHTTP}: ${e.message}`);
+  }
+
+  // Create dirs
+  for (const d of [panDir, nodeDir, dataDir]) {
+    if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
+  }
+
+  // ── Node.js ─────────────────────────────────────────────────────────────────
+  if (!fs.existsSync(nodeExe)) {
+    log('Downloading Node.js...');
+    const arch    = process.arch === 'arm64' ? 'arm64' : 'x64';
+    const nodeURL = IS_WIN
+      ? `https://nodejs.org/dist/v${NODE_VER}/node-v${NODE_VER}-win-${arch}.zip`
+      : IS_MAC
+        ? `https://nodejs.org/dist/v${NODE_VER}/node-v${NODE_VER}-darwin-${arch}.tar.xz`
+        : `https://nodejs.org/dist/v${NODE_VER}/node-v${NODE_VER}-linux-${arch}.tar.xz`;
+
+    const tmpArchive = path.join(os.tmpdir(), IS_WIN ? 'phoenix-node.zip' : 'phoenix-node.tar.xz');
+    await download(nodeURL, tmpArchive);
+
+    log('Extracting Node.js...');
+    if (IS_WIN) {
+      run(
+        `powershell -NoProfile -Command "Expand-Archive -Force '${tmpArchive}' '${os.tmpdir()}\\pan-node-extract'"`,
+        panDir, { shell: true }
+      );
+      const extracted = fs.readdirSync(path.join(os.tmpdir(), 'phoenix-node-extract'))[0];
+      const srcDir = path.join(os.tmpdir(), 'phoenix-node-extract', extracted);
+      for (const f of fs.readdirSync(srcDir)) {
+        const src = path.join(srcDir, f), dst = path.join(nodeDir, f);
+        if (fs.existsSync(dst)) fs.rmSync(dst, { recursive: true, force: true });
+        fs.renameSync(src, dst);
+      }
+    } else {
+      run(`tar -xJf "${tmpArchive}" -C "${nodeDir}" --strip-components=1`, panDir, { shell: true });
+    }
+    try { fs.unlinkSync(tmpArchive); } catch {}
+    log('Node.js ready ✓');
+  } else {
+    log('Node.js already installed ✓');
+  }
+
+  // ── phoenix-client.js ────────────────────────────────────────────────────────
+  log('Downloading Phoenix client...');
+  const clientPath = path.join(panDir, 'phoenix-client.js');
+  await download(`${hubHTTP}/client/phoenix-client.js`, clientPath);
+  log('Phoenix client downloaded ✓');
+
+  // ── npm install ws ───────────────────────────────────────────────────────────
+  log('Installing dependencies...');
+  const pkgJson = path.join(panDir, 'package.json');
+  if (!fs.existsSync(pkgJson)) {
+    fs.writeFileSync(pkgJson, JSON.stringify({ name: 'phoenix-client', version: '1.0.0', type: 'module' }));
+  }
+  try {
+    run(`"${npmCmd}" install ws --no-audit --no-fund --save`, panDir, { shell: IS_WIN });
+    log('Dependencies installed ✓');
+  } catch (e) {
+    throw new Error(`npm install failed: ${e.message}`);
+  }
+
+  // ── Config ───────────────────────────────────────────────────────────────────
+  const cfgPath = path.join(panDir, 'phoenix-client-config.json');
+  fs.writeFileSync(cfgPath, JSON.stringify({
+    hub_ws:    hubWS,
+    hub_http:  hubHTTP,
+    token,
+    device_id: deviceId,
+    name:      deviceName,
+  }, null, 2));
+  log('Config saved ✓');
+  log(`Device name: ${deviceName}`);
+
+  // ── Startup registration (#497) ─────────────────────────────────────────────
+  // Goal: client survives reboot on EVERY system, without requiring login.
+  // Elevated install → real system service (boot-time, no login needed).
+  // Non-elevated   → user-session fallback (login-time): schtasks, LaunchAgent, systemd --user.
+  const elevated = isElevated();
+  log(`Privilege: ${elevated ? 'elevated (system-service install)' : 'normal user (login-time fallback)'}`);
+  // Track whether the service manager already started the client. If true, we skip
+  // the manual spawn below — otherwise we double-spawn and the second instance
+  // either crashes on port conflicts or floods the hub with duplicate registers.
+  let clientAlreadyStarted = false;
+
+  if (IS_WIN) {
+    if (elevated) {
+      // Real Windows service via nssm — survives reboot without anyone logging in.
+      try {
+        const nssmExe = await ensureNssm(panDir);
+        // Wipe any prior install so re-running this installer is idempotent.
+        try { run(`"${nssmExe}" stop Phoenix-Client`, panDir, { shell: true }); } catch {}
+        try { run(`"${nssmExe}" remove Phoenix-Client confirm`, panDir, { shell: true }); } catch {}
+        run(`"${nssmExe}" install Phoenix-Client "${nodeExe}" "${clientPath}"`, panDir, { shell: true });
+        run(`"${nssmExe}" set Phoenix-Client AppDirectory "${panDir}"`, panDir, { shell: true });
+        run(`"${nssmExe}" set Phoenix-Client DisplayName "Phoenix Client"`, panDir, { shell: true });
+        run(`"${nssmExe}" set Phoenix-Client Description "Phoenix client — connects this PC to its Phoenix hub."`, panDir, { shell: true });
+        run(`"${nssmExe}" set Phoenix-Client Start SERVICE_AUTO_START`, panDir, { shell: true });
+        run(`"${nssmExe}" set Phoenix-Client AppStdout "${path.join(panDir, 'phoenix-client.log')}"`, panDir, { shell: true });
+        run(`"${nssmExe}" set Phoenix-Client AppStderr "${path.join(panDir, 'phoenix-client.log')}"`, panDir, { shell: true });
+        run(`"${nssmExe}" set Phoenix-Client AppRotateFiles 1`, panDir, { shell: true });
+        run(`"${nssmExe}" set Phoenix-Client AppRotateBytes 1048576`, panDir, { shell: true });
+        run(`"${nssmExe}" start Phoenix-Client`, panDir, { shell: true });
+        log('Windows service installed ✓ (boot-time, runs as SYSTEM)');
+        clientAlreadyStarted = true;
+      } catch (e) {
+        log(`⚠ nssm service install failed: ${e.message.split('\n')[0]} — falling back to scheduled task`);
+        installWinSchtasksFallback(nodeExe, clientPath, panDir);
+      }
+    } else {
+      log('Tip: re-run installer as Administrator for a real Windows service (boot-time).');
+      installWinSchtasksFallback(nodeExe, clientPath, panDir);
+    }
+
+    // Shell integration runs on BOTH elevated and non-elevated paths — it's
+    // per-user state (Start Menu + tray) that doesn't need admin. Wrapped in
+    // its own try so a failure here can't undo a working service install.
+    try {
+      await installWinShellIntegration({ panDir, hubHTTP, deviceName });
+    } catch (e) {
+      log(`⚠ Shell integration partially failed: ${e.message.split('\n')[0]}`);
+    }
+  } else if (IS_MAC) {
+    // macOS: LaunchDaemon if root (boot), LaunchAgent if user.
+    const label = 'dev.phoenix.client';
+    const plistPath = elevated
+      ? `/Library/LaunchDaemons/${label}.plist`
+      : path.join(os.homedir(), 'Library', 'LaunchAgents', `${label}.plist`);
+    const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>${label}</string>
+  <key>ProgramArguments</key><array>
+    <string>${nodeExe}</string>
+    <string>${clientPath}</string>
+  </array>
+  <key>WorkingDirectory</key><string>${panDir}</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>${path.join(panDir, 'phoenix-client.log')}</string>
+  <key>StandardErrorPath</key><string>${path.join(panDir, 'phoenix-client.log')}</string>
+</dict></plist>`;
+    try {
+      if (!fs.existsSync(path.dirname(plistPath))) fs.mkdirSync(path.dirname(plistPath), { recursive: true });
+      fs.writeFileSync(plistPath, plist);
+      try { run(`launchctl unload "${plistPath}"`, panDir, { shell: true }); } catch {}
+      run(`launchctl load -w "${plistPath}"`, panDir, { shell: true });
+      log(elevated
+        ? `LaunchDaemon installed ✓ (boot-time, ${plistPath})`
+        : `LaunchAgent installed ✓ (login-time, ${plistPath})`);
+      clientAlreadyStarted = true;
+    } catch (e) {
+      log(`⚠ launchd install failed: ${e.message.split('\n')[0]} — starting in background`);
+      cp.spawn(nodeExe, [clientPath], { cwd: panDir, detached: true, stdio: 'ignore' }).unref();
+    }
+  } else {
+    // Linux: system unit if root (boot), user unit otherwise (login-time).
+    const unitBody = `[Unit]
+Description=Phoenix Client
+After=network.target
+
+[Service]
+ExecStart=${nodeExe} ${clientPath}
+WorkingDirectory=${panDir}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=${elevated ? 'multi-user.target' : 'default.target'}
+`;
+    if (elevated) {
+      try {
+        fs.writeFileSync('/etc/systemd/system/phoenix-client.service', unitBody);
+        run('systemctl daemon-reload && systemctl enable --now phoenix-client.service', panDir, { shell: true });
+        log('Systemd system unit installed ✓ (boot-time, /etc/systemd/system/phoenix-client.service)');
+        clientAlreadyStarted = true;
+      } catch (e) {
+        log(`⚠ system unit install failed: ${e.message.split('\n')[0]}`);
+      }
+    } else {
+      const svcDir = path.join(os.homedir(), '.config', 'systemd', 'user');
+      if (!fs.existsSync(svcDir)) fs.mkdirSync(svcDir, { recursive: true });
+      fs.writeFileSync(path.join(svcDir, 'phoenix-client.service'), unitBody);
+      try {
+        run('systemctl --user daemon-reload && systemctl --user enable --now phoenix-client.service', panDir, { shell: true });
+        log('Systemd --user unit installed ✓ (login-time)');
+        log('Tip: run `loginctl enable-linger $USER` so the client keeps running after logout.');
+        clientAlreadyStarted = true;
+      } catch {
+        cp.spawn(nodeExe, [clientPath], { cwd: panDir, detached: true, stdio: 'ignore' }).unref();
+        log('Client started in background ✓ (no systemd available)');
+      }
+    }
+  }
+
+  // ── Launch ───────────────────────────────────────────────────────────────────
+  // Skip if the service manager (nssm / launchd / systemd) already started the client.
+  // Otherwise spawn manually so first install gets the client up immediately
+  // (schtasks LogonTrigger doesn't fire until next login).
+  if (!clientAlreadyStarted && IS_WIN) {
+    log('Starting Phoenix client...');
+    cp.spawn(nodeExe, [clientPath], {
+      cwd: panDir, detached: true, stdio: 'ignore', windowsHide: true,
+    }).unref();
+  } else if (clientAlreadyStarted) {
+    log('Phoenix client already running under service manager ✓');
+  }
+
+  log('');
+  log('Waiting for hub owner to approve this device...');
+  log('You can close this window once approved.');
+
+  // ── Tailscale hostname rename ─────────────────────────────────────────────
+  // Rename this machine in Tailscale so it appears as the friendly name there too.
+  // Fail silently — Tailscale may not be installed and that's fine.
+  try {
+    const tsArgs = ['set', '--hostname', deviceName];
+    if (IS_WIN) {
+      cp.execFileSync('C:\\Program Files\\Tailscale\\tailscale.exe', tsArgs,
+        { windowsHide: true, timeout: 5000, stdio: 'pipe' });
+    } else {
+      cp.execFileSync('tailscale', tsArgs, { timeout: 5000, stdio: 'pipe' });
+    }
+    log(`Tailscale hostname set to: ${deviceName} ✓`);
+  } catch (e) {
+    log(`(Tailscale rename skipped: ${e.message.split('\n')[0]})`);
+  }
+
+  done(true, `Connected to ${hubHTTP} — waiting for approval`);
+}
+
+// ── Embedded HTML GUI ─────────────────────────────────────────────────────────
+const HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Phoenix Installer</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: #0d1117; color: #e6edf3; min-height: 100vh;
+    display: flex; flex-direction: column; align-items: center;
+    padding: 40px 20px;
+  }
+  .logo { font-size: 48px; font-weight: 800; letter-spacing: -2px;
+    background: linear-gradient(135deg, #58a6ff, #bc8cff);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    margin-bottom: 8px; }
+  .subtitle { color: #8b949e; font-size: 14px; margin-bottom: 40px; }
+  .card {
+    background: #161b22; border: 1px solid #30363d; border-radius: 12px;
+    padding: 24px; width: 100%; max-width: 520px; margin-bottom: 16px;
+  }
+  .card h2 { font-size: 16px; color: #c9d1d9; margin-bottom: 16px;
+    display: flex; align-items: center; gap: 8px; }
+  .hub-list { display: flex; flex-direction: column; gap: 10px; }
+  .hub-card {
+    background: #0d1117; border: 1px solid #30363d; border-radius: 8px;
+    padding: 14px 16px; cursor: pointer; transition: border-color 0.15s;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .hub-card:hover { border-color: #58a6ff; }
+  .hub-card.selected { border-color: #58a6ff; background: #0c1929; }
+  .hub-name { font-weight: 600; color: #e6edf3; font-size: 15px; }
+  .hub-meta { font-size: 12px; color: #8b949e; margin-top: 3px; }
+  .hub-badge {
+    font-size: 11px; padding: 2px 8px; border-radius: 20px;
+    background: #1a2740; color: #58a6ff; border: 1px solid #1f4070;
+    white-space: nowrap;
+  }
+  .hub-badge.tailscale { background: #1a1f2e; color: #bc8cff; border-color: #3d2c60; }
+  .empty { color: #8b949e; font-size: 14px; text-align: center; padding: 20px 0; }
+  .divider { display: flex; align-items: center; gap: 12px; color: #8b949e;
+    font-size: 12px; margin: 4px 0; }
+  .divider::before, .divider::after { content: ''; flex: 1;
+    height: 1px; background: #30363d; }
+  input[type=text] {
+    width: 100%; background: #0d1117; border: 1px solid #30363d;
+    border-radius: 8px; padding: 10px 14px; color: #e6edf3; font-size: 14px;
+    outline: none; transition: border-color 0.15s;
+  }
+  input[type=text]:focus { border-color: #58a6ff; }
+  input[type=text]::placeholder { color: #484f58; }
+  .btn {
+    width: 100%; padding: 12px; border: none; border-radius: 8px;
+    font-size: 15px; font-weight: 600; cursor: pointer; transition: opacity 0.15s;
+    margin-top: 12px;
+  }
+  .btn-primary { background: #238636; color: #fff; }
+  .btn-primary:hover { background: #2ea043; }
+  .btn-primary:disabled { opacity: 0.4; cursor: default; }
+  .btn-refresh { background: #21262d; color: #e6edf3; border: 1px solid #30363d;
+    font-size: 13px; padding: 8px 14px; border-radius: 8px; cursor: pointer; }
+  .btn-refresh:hover { background: #30363d; }
+  .log-box {
+    background: #0d1117; border: 1px solid #30363d; border-radius: 8px;
+    padding: 14px; font-family: 'Cascadia Code', 'Consolas', monospace;
+    font-size: 13px; color: #7ee787; max-height: 220px; overflow-y: auto;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .spinner {
+    width: 20px; height: 20px; border: 2px solid #30363d;
+    border-top-color: #58a6ff; border-radius: 50%; animation: spin 0.8s linear infinite;
+    display: inline-block; vertical-align: middle;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .status-icon { font-size: 20px; }
+  .success { color: #7ee787; }
+  .error { color: #f85149; }
+  #installBtn { display: none; }
+  #doneCard { display: none; }
+  .progress-bar {
+    height: 4px; background: #21262d; border-radius: 2px; margin-top: 8px; overflow: hidden;
+  }
+  .progress-fill {
+    height: 100%; background: linear-gradient(90deg, #58a6ff, #bc8cff);
+    width: 0%; transition: width 0.3s; border-radius: 2px;
+  }
+</style>
+</head>
+<body>
+<div class="logo">PHOENIX</div>
+<div class="subtitle">Phoenix — Device Installer</div>
+
+<div class="card">
+  <h2>Name your device</h2>
+  <label for="nameInput" style="font-size:13px;color:#8b949e;display:block;margin-bottom:8px">
+    This name appears in your Phoenix dashboard and Tailscale network.
+  </label>
+  <input type="text" id="nameInput" placeholder="e.g. Predator, LivingRoomPC" />
+</div>
+
+<div class="card">
+  <h2>Paste your invite link</h2>
+  <input type="text" id="linkInput" placeholder="https://your-hub/install/phoenix-..." />
+</div>
+
+<button class="btn btn-primary" id="installBtn" onclick="startInstall()">⬇ Connect to Phoenix</button>
+
+<div class="card" id="installCard" style="display:none">
+  <h2>Installing...</h2>
+  <div class="log-box" id="logBox"></div>
+  <div class="progress-bar"><div class="progress-fill" id="progFill"></div></div>
+</div>
+
+<div class="card" id="doneCard">
+  <h2 id="doneTitle"></h2>
+  <p id="doneMsg" style="font-size:14px;color:#8b949e;margin-top:8px"></p>
+</div>
+
+<script>
+let installing = false;
+
+function updateInstallBtn() {
+  const btn = document.getElementById('installBtn');
+  const hasLink = document.getElementById('linkInput').value.trim();
+  btn.style.display = hasLink ? 'block' : 'none';
+  btn.disabled = installing;
+  btn.textContent = installing ? 'Connecting...' : '⬇ Connect to Phoenix';
+}
+
+document.getElementById('linkInput').addEventListener('input', updateInstallBtn);
+
+// Populate default device name from the server (os.hostname())
+(async function loadDefaultName() {
+  try {
+    const r = await fetch('/api/hostname');
+    const d = await r.json();
+    const nameEl = document.getElementById('nameInput');
+    if (d.hostname && !nameEl.value) nameEl.value = d.hostname;
+  } catch {}
+})();
+
+async function startInstall() {
+  if (installing) return;
+  const link = document.getElementById('linkInput').value.trim();
+  if (!link) return;
+  const friendlyName = document.getElementById('nameInput').value.trim() || undefined;
+
+  installing = true;
+  updateInstallBtn();
+  document.getElementById('installCard').style.display = 'block';
+  document.getElementById('logBox').textContent = '';
+
+  const es = new EventSource('/events');
+  es.onmessage = e => {
+    try {
+      const d = JSON.parse(e.data);
+      if (d.type === 'log') {
+        const box = document.getElementById('logBox');
+        box.textContent += d.msg + '\\n';
+        box.scrollTop = box.scrollHeight;
+      } else if (d.type === 'progress') {
+        document.getElementById('progFill').style.width = Math.min(d.mb * 5, 90) + '%';
+      } else if (d.type === 'done') {
+        es.close();
+        document.getElementById('progFill').style.width = '100%';
+        document.getElementById('doneCard').style.display = 'block';
+        document.getElementById('doneTitle').innerHTML = d.ok
+          ? '<span class="success">✓ Connected! Check your Phoenix dashboard to approve.</span>'
+          : '<span class="error">✗ Failed: ' + (d.msg || 'unknown error') + '</span>';
+      }
+    } catch {}
+  };
+
+  await fetch('/api/install', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ link, friendlyName }),
+  });
+}
+
+// Auto-read clipboard on open — if invite link is there, fill it and connect
+(async function tryClipboard() {
+  try {
+    const text = (await navigator.clipboard.readText()).trim();
+    if (/\/install\/(?:phoenix|pan)-[a-f0-9]+/.test(text)) {
+      document.getElementById('linkInput').value = text;
+      updateInstallBtn();
+      setTimeout(startInstall, 1500);
+    }
+  } catch {}
+})();
+
+</script>
+</body>
+</html>`;
+
+// ── HTTP GUI server ────────────────────────────────────────────────────────────
+function startGUI(launchUrl = `http://localhost:${GUI_PORT}`) {
+  const server = http.createServer(async (req, res) => {
+    const u = req.url.split('?')[0];
+
+    if (req.method === 'GET' && u === '/') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(HTML);
+      return;
+    }
+
+    if (req.method === 'GET' && u === '/events') {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'Access-Control-Allow-Origin': '*',
+      });
+      res.write(':\n\n'); // ping
+      sseClients.add(res);
+      req.on('close', () => sseClients.delete(res));
+      return;
+    }
+
+    if (req.method === 'GET' && u === '/api/hostname') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ hostname: os.hostname() }));
+      return;
+    }
+
+    if (req.method === 'GET' && u === '/api/hubs') {
+      // Run all discovery methods in parallel:
+      // 1. UDP broadcast — fast, may be blocked by firewall/AP isolation
+      // 2. HTTP LAN scan — reliable, works through firewall (just needs port 7777 open)
+      // 3. Tailscale peers — for remote hubs on the same Tailscale network
+      const [udpHubs, httpHubs, tsHubs] = await Promise.all([
+        udpDiscover(3000),
+        lanHttpScan(6000),
+        tailscaleDiscover(5000),
+      ]);
+      // De-dupe by host:port (UDP → HTTP → Tailscale priority)
+      const all = new Map();
+      for (const h of tsHubs)  all.set(`${h.host}:${h.port}`, h);
+      for (const h of httpHubs) all.set(`${h.host}:${h.port}`, h);
+      for (const h of udpHubs) all.set(`${h.host}:${h.port}`, h);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify([...all.values()]));
+      return;
+    }
+
+    if (req.method === 'POST' && u === '/api/install') {
+      let body = '';
+      req.on('data', d => body += d);
+      req.on('end', async () => {
+        res.writeHead(202, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+
+        let cfg;
+        try {
+          const payload = JSON.parse(body);
+          const friendlyName = (payload.friendlyName || '').trim() || undefined;
+          if (payload.hub) {
+            // Hub discovered locally — use 'local' token
+            const h = payload.hub;
+            cfg = { h: `${h.host}:${h.port}`, t: 'local', s: false, friendlyName };
+          } else if (payload.link) {
+            cfg = parseInstallLink(payload.link);
+            if (!cfg) { done(false, 'Invalid install link'); return; }
+            cfg.friendlyName = friendlyName;
+          } else { done(false, 'No hub or link provided'); return; }
+        } catch (e) { done(false, `Bad request: ${e.message}`); return; }
+
+        runInstall(cfg).catch(e => done(false, e.message));
+      });
+      return;
+    }
+
+    res.writeHead(404);
+    res.end('Not found');
+  });
+
+  server.listen(GUI_PORT, '127.0.0.1', () => {
+    console.log(`\n  Phoenix Installer running at http://localhost:${GUI_PORT}\n`);
+    openBrowser(launchUrl);
+  });
+
+  server.on('error', err => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`\n  Port ${GUI_PORT} already in use. Opening existing installer...\n`);
+      openBrowser(launchUrl);
+    } else {
+      console.error('[Phoenix Installer] Server error:', err.message);
+    }
+  });
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+async function main() {
+  console.clear();
+  console.log('');
+  console.log('  ╔══════════════════════════════════════╗');
+  console.log('  ║                                      ║');
+  console.log('  ║      PHOENIX  ·  Device Installer    ║');
+  console.log('  ║                                      ║');
+  console.log('  ╚══════════════════════════════════════╝');
+  console.log('');
+  console.log('  Device Installer');
+  console.log('  ─────────────────────────────────────');
+  console.log('  Opening installer in your browser...');
+  console.log('  (Keep this window open while installing)');
+  console.log('');
+
+  // Fast path: filename has encoded config — connect directly in terminal, no browser needed
+  const filenameCfg = tryReadConfigFromFilename();
+  if (filenameCfg) {
+    console.log('  Hub address loaded from filename — connecting...');
+    console.log('');
+    runInstall(filenameCfg).catch(e => done(false, e.message));
+    return;
+  }
+
+  // Normal path: scan network, show GUI, let user pick or paste link
+  startGUI();
+}
+
+main().catch(e => {
+  console.error('\n  Fatal error:', e.message);
+  process.exit(1);
+});

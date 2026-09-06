@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>Phoenix</title>
+		<link rel="preconnect" href="https://fonts.googleapis.com">
+		<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+		<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
+		<link href="./_app/immutable/entry/start.I519eXTS.js" rel="modulepreload">
+		<link href="./_app/immutable/chunks/dQis-Gbb.js" rel="modulepreload">
+		<link href="./_app/immutable/chunks/lJg17zR0.js" rel="modulepreload">
+		<link href="./_app/immutable/chunks/K_h55RLa.js" rel="modulepreload">
+		<link href="./_app/immutable/chunks/C_oMJGr5.js" rel="modulepreload">
+		<link href="./_app/immutable/entry/app.BtvtoZr5.js" rel="modulepreload">
+		<link href="./_app/immutable/chunks/j6NluSen.js" rel="modulepreload">
+		<link href="./_app/immutable/chunks/DbQeXaZJ.js" rel="modulepreload">
+		<link href="./_app/immutable/chunks/B34qpdlx.js" rel="modulepreload">
+		<link href="./_app/immutable/chunks/7SpAA7GC.js" rel="modulepreload">
+		<link href="./_app/immutable/chunks/CrEqVSAs.js" rel="modulepreload">
+		<link href="./_app/immutable/chunks/e4QTU2zu.js" rel="modulepreload">
+		
+		<style>
+			/* Loading screen — visible before SvelteKit hydrates, then fades out */
+			#phoenix-loading {
+				position: fixed;
+				inset: 0;
+				z-index: 99999;
+				background: #0a0a0f;
+				display: flex;
+				flex-direction: column;
+				align-items: center;
+				justify-content: center;
+				transition: opacity 0.3s ease;
+			}
+			#phoenix-loading.fade-out {
+				opacity: 0;
+				pointer-events: none;
+			}
+			#phoenix-loading .logo-mark {
+				font-family: serif;
+				font-size: 64px;
+				font-weight: 700;
+				color: #89b4fa;
+				letter-spacing: 4px;
+				user-select: none;
+				animation: phoenix-pulse 2s ease-in-out infinite;
+			}
+			#phoenix-loading .loading-sub {
+				margin-top: 12px;
+				font-family: 'Inter', -apple-system, sans-serif;
+				font-size: 13px;
+				color: #6c7086;
+				letter-spacing: 1px;
+			}
+			@keyframes phoenix-pulse {
+				0%, 100% { opacity: 0.7; }
+				50% { opacity: 1; }
+			}
+		</style>
+	</head>
+	<body data-sveltekit-preload-data="hover" style="background:#0a0a0f;margin:0;padding:0">
+		<!-- Loading screen: shows immediately, removed after SvelteKit hydrates -->
+		<div id="phoenix-loading">
+			<div class="logo-mark" id="phoenix-loading-logo">Phoenix</div>
+			<div class="loading-sub"></div>
+		</div>
+		<script>
+			// Show custom branding — image takes priority over text
+			(function() {
+				try {
+					var img = localStorage.getItem('phoenix_branding_image');
+					var el = document.getElementById('phoenix-loading-logo');
+					if (img) {
+						var imgEl = document.createElement('img');
+						imgEl.src = img;
+						imgEl.alt = 'Logo';
+						imgEl.style.cssText = 'max-height:80px;max-width:200px;object-fit:contain;';
+						el.textContent = '';
+						el.appendChild(imgEl);
+					} else {
+						var custom = localStorage.getItem('phoenix_branding_logo');
+						if (custom) el.textContent = custom;
+					}
+				} catch(e) {}
+			})();
+			// Universal "SvelteKit has rendered SOMETHING" detector.
+			// SvelteKit mounts the page into a "display:contents" div.
+			// Any non-script/style child means a route hydrated — works for ALL pages
+			// (terminal with .shell, comms with .comms-app, future routes, etc).
+			function phoenixAppRendered() {
+				if (document.querySelector('.shell')) return true;
+				if (document.querySelector('[data-sveltekit-hydrate]')) return true;
+				if (document.querySelector('nav.sidebar')) return true;
+				if (document.querySelector('[data-widget]')) return true;
+				if (document.querySelector('.comms-app')) return true;
+				// Universal fallback: SvelteKit's target container has rendered content
+				var targets = document.querySelectorAll('div[style*="display: contents"], div[style*="display:contents"]');
+				for (var t = 0; t < targets.length; t++) {
+					var kids = targets[t].children;
+					for (var i = 0; i < kids.length; i++) {
+						var tag = kids[i].tagName;
+						if (tag !== 'SCRIPT' && tag !== 'STYLE') return true;
+					}
+				}
+				return false;
+			}
+
+			// Remove loading screen once SvelteKit has mounted
+			(function() {
+				var el = document.getElementById('phoenix-loading');
+				if (!el) return;
+				// SvelteKit replaces the body placeholder on hydrate.
+				// Use a MutationObserver on the body to detect when the app shell appears.
+				var observer = new MutationObserver(function() {
+					if (phoenixAppRendered()) {
+						el.classList.add('fade-out');
+						setTimeout(function() { el.remove(); }, 350);
+						observer.disconnect();
+						// Shell rendered — clear stuck-reload counter so future load failures get a fresh budget.
+						try { sessionStorage.removeItem('phoenix_stuck_reload_count'); } catch(e) {}
+					}
+				});
+				observer.observe(document.body, { childList: true, subtree: true });
+				// Fallback: remove after 5s no matter what (prevents stuck loading screen)
+				setTimeout(function() {
+					if (el && el.parentNode) {
+						el.classList.add('fade-out');
+						setTimeout(function() { if (el.parentNode) el.remove(); }, 350);
+					}
+				}, 5000);
+			})();
+
+			// ─── Stuck-refresh self-heal (task #503) ───────────────────────────
+			// If the app shell never appears within 8s of page load, the bundle is
+			// stuck (network hiccup, Svelte hydration crash, CSS bomb, etc).
+			// Auto-reload up to 3 times, then surface a visible error banner so
+			// we stop looping forever. Counter lives in sessionStorage so it
+			// survives across the reloads but resets on a fresh tab.
+			(function() {
+				var STUCK_TIMEOUT_MS = 8000;
+				var MAX_RELOADS = 3;
+				var COUNTER_KEY = 'phoenix_stuck_reload_count';
+				function shellRendered() {
+					return phoenixAppRendered();
+				}
+				setTimeout(function check() {
+					if (shellRendered()) {
+						try { sessionStorage.removeItem(COUNTER_KEY); } catch(e) {}
+						return;
+					}
+					var count = 0;
+					try { count = parseInt(sessionStorage.getItem(COUNTER_KEY) || '0', 10) || 0; } catch(e) {}
+					if (count < MAX_RELOADS) {
+						try { sessionStorage.setItem(COUNTER_KEY, String(count + 1)); } catch(e) {}
+						// Tell the server we had to self-heal so it can be tracked
+						// in dashboard_health when L2 lands. Fire-and-forget.
+						try {
+							fetch('/api/v1/logs', {
+								method: 'POST',
+								headers: {'Content-Type': 'application/json'},
+								body: JSON.stringify({
+									device_id: 'desktop-dashboard',
+									level: 'warn',
+									tag: 'stuck-refresh',
+									message: 'dashboard shell did not render within ' + STUCK_TIMEOUT_MS + 'ms — auto-reload attempt ' + (count + 1) + '/' + MAX_RELOADS
+								})
+							}).catch(function(){});
+						} catch(e) {}
+						location.reload();
+						return;
+					}
+					// Reload budget exhausted — show a real error banner instead
+					// of an endless loop. User can hit "Retry" to reset the counter.
+					var banner = document.createElement('div');
+					banner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:100000;background:#7f1d1d;color:#fff;padding:14px 20px;font-family:Inter,sans-serif;font-size:14px;display:flex;align-items:center;gap:12px;box-shadow:0 4px 12px rgba(0,0,0,.4)';
+					banner.innerHTML = '<strong>Phoenix dashboard failed to load after ' + MAX_RELOADS + ' attempts.</strong> Bundle, network, or hydration is stuck. <button id="phoenix-stuck-retry" style="margin-left:auto;background:#fff;color:#7f1d1d;border:0;padding:6px 14px;border-radius:4px;font-weight:600;cursor:pointer">Retry</button>';
+					document.body.appendChild(banner);
+					document.getElementById('phoenix-stuck-retry').addEventListener('click', function() {
+						try { sessionStorage.removeItem(COUNTER_KEY); } catch(e) {}
+						location.reload();
+					});
+				}, STUCK_TIMEOUT_MS);
+			})();
+
+			// Block mouse back/forward buttons from navigating — Phoenix uses them for voice hotkeys
+			// XButton1 (button 3) = back = Win+H voice typing
+			// XButton2 (button 4) = forward = Phoenix whisper dictation
+			var _phoenixXbFired = {};
+			['mousedown','mouseup','pointerdown','pointerup','auxclick'].forEach(function(evt) {
+				window.addEventListener(evt, function(e) {
+					if (e.button === 3 || e.button === 4) {
+						e.preventDefault();
+						e.stopPropagation();
+						// Fire voice action on mousedown only (not repeat for mouseup etc)
+						if (evt === 'mousedown' && !_phoenixXbFired[e.button]) {
+							_phoenixXbFired[e.button] = true;
+							var action = e.button === 3 ? 'winh' : 'dictate';
+							fetch('/api/v1/voice/trigger', {
+								method: 'POST',
+								headers: {'Content-Type': 'application/json'},
+								body: JSON.stringify({action: action})
+							}).catch(function(){});
+						}
+						if (evt === 'mouseup') _phoenixXbFired[e.button] = false;
+						return false;
+					}
+				}, true);
+			});
+		</script>
+		<div style="display: contents">
+			<script>
+				{
+					__sveltekit_1lshpoz = {
+						base: new URL(".", location).pathname.slice(0, -1),
+						assets: "/v2"
+					};
+
+					const element = document.currentScript.parentElement;
+
+					Promise.all([
+						import("./_app/immutable/entry/start.I519eXTS.js"),
+						import("./_app/immutable/entry/app.BtvtoZr5.js")
+					]).then(([kit, app]) => {
+						kit.start(app, element);
+					});
+				}
+			</script>
+		</div>
+	</body>
+</html>

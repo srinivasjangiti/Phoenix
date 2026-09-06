@@ -1,0 +1,122 @@
+// Phoenix Intuition API — /api/v1/intuition/*
+//
+// Exposes the live-situational-state daemon (see ../intuition.js) over HTTP:
+//   GET  /current      current snapshot + as_of
+//   GET  /history      recent snapshots (Atlas timeline feed)
+//   GET  /status       daemon liveness
+//   POST /observe      pendant/phone pushes a raw observation (frame/audio/sensor)
+//   POST /tick         force a tick now (debug / manual refresh)
+
+import { Router } from 'express';
+import { db } from '../db.js';
+import {
+  getCurrentSnapshot,
+  getSnapshotHistory,
+  tickIntuition,
+  getIntuitionStatus,
+  getCurrentOrgSnapshot,
+  getOrgSnapshotHistory,
+  getOrgMemberSnapshots,
+  tickOrgIntuition,
+} from '../intuition.js';
+
+const router = Router();
+
+// Resolve org context for a request — explicit ?org_id wins, then the
+// x-phoenix-org header (Phoenix's standard scoping signal), then req.activeOrg (if
+// upstream middleware populated it), then null (= "any org, latest globally").
+// Returning null is safe — getCurrentSnapshot/getSnapshotHistory both accept
+// null and fall back to the legacy non-scoped query.
+function resolveOrgId(req) {
+  return req.query.org_id || req.get('x-phoenix-org') || req.activeOrg?.id || null;
+}
+
+// GET /current?org_id=org_personal — single latest snapshot scoped to caller's org
+router.get('/current', (req, res) => {
+  const snap = getCurrentSnapshot(resolveOrgId(req));
+  if (!snap) return res.status(503).json({ ok: false, error: 'no snapshot yet' });
+  res.json({ ok: true, snapshot: snap, as_of: snap.as_of });
+});
+
+// GET /history?limit=50&org_id=org_personal — recent snapshots for Atlas timeline
+router.get('/history', (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 50, 500);
+  res.json({ ok: true, snapshots: getSnapshotHistory(limit, resolveOrgId(req)) });
+});
+
+// GET /status — is the daemon alive, writing, which commander
+router.get('/status', (req, res) => {
+  res.json({ ok: true, ...getIntuitionStatus() });
+});
+
+// POST /observe — pendant / phone / any sensor source pushes raw data here.
+// Body: { source, kind, data, timestamp? }
+//   source: 'pendant' | 'phone' | 'desktop' | 'sensor:<id>'
+//   kind:   'frame' | 'audio' | 'sensor' | 'text' | 'location'
+//   data:   service-specific payload (base64 for binary, JSON for structured)
+//
+// v1: just logs it as an 'Observation' event so the daemon's next tick sees it.
+// v2: will hand frames to vision model, audio to whisper, etc.
+router.post('/observe', (req, res) => {
+  const { source, kind, data, timestamp } = req.body || {};
+  if (!source || !kind) return res.status(400).json({ ok: false, error: 'source and kind required' });
+
+  const ts = timestamp || Date.now();
+  try {
+    db.prepare(`
+      INSERT INTO events (event_type, session_id, data, org_id)
+      VALUES ('Observation', ?, ?, 'org_personal')
+    `).run(`intuition-${source}`, JSON.stringify({ source, kind, data, ts }));
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+
+  // Trigger a fresh tick so the observation gets folded in immediately
+  const snap = tickIntuition('observe');
+  res.json({ ok: true, observed: { source, kind, ts }, snapshot_as_of: snap?.as_of || null });
+});
+
+// POST /tick — force a manual refresh (useful from Atlas "refresh now" button)
+router.post('/tick', (req, res) => {
+  const snap = tickIntuition('manual');
+  if (!snap) return res.status(503).json({ ok: false, error: 'daemon not running' });
+  res.json({ ok: true, snapshot: snap });
+});
+
+// ─── Org-wide intuition ───────────────────────────────────────────────────
+
+// GET /org/current?org_id=org_personal — org-level aggregated snapshot
+router.get('/org/current', (req, res) => {
+  const orgId = req.query.org_id || 'org_personal';
+  const snap = getCurrentOrgSnapshot(orgId);
+  if (!snap) return res.status(503).json({ ok: false, error: 'no org snapshot yet' });
+  res.json({ ok: true, snapshot: snap, as_of: snap.as_of });
+});
+
+// GET /org/members?org_id=org_personal — latest snapshot per member in the org
+router.get('/org/members', (req, res) => {
+  const orgId = req.query.org_id || 'org_personal';
+  const members = getOrgMemberSnapshots(orgId);
+  res.json({ ok: true, org_id: orgId, members });
+});
+
+// GET /org/history?org_id=org_personal&limit=50 — org snapshot timeline
+router.get('/org/history', (req, res) => {
+  const orgId = req.query.org_id || 'org_personal';
+  const limit = Math.min(parseInt(req.query.limit) || 50, 500);
+  res.json({ ok: true, org_id: orgId, snapshots: getOrgSnapshotHistory(orgId, limit) });
+});
+
+// POST /org/tick — force a fresh org snapshot
+router.post('/org/tick', async (req, res) => {
+  const orgId = req.query.org_id || req.body?.org_id || 'org_personal';
+  try {
+    const snap = await tickOrgIntuition(orgId, 'manual');
+    if (!snap) return res.status(503).json({ ok: false, error: 'org tick failed' });
+    res.json({ ok: true, snapshot: snap });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+export default router;

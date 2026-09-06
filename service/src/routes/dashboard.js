@@ -1,0 +1,2221 @@
+import { Router } from 'express';
+import { all, get, run, insert, DB_PATH, allScoped, getScoped, runScoped, insertScoped, getOllamaUrl } from '../db.js';
+import { getAtlasData } from '../steward.js';
+import { phoenixNotify } from '../phoenix-notify.js';
+// screen-watcher and webcam-watcher status shown in Intuition panel, not Services
+import { getFindings, updateFinding, scout } from '../scout.js';
+import { statSync, readdirSync, existsSync, unlinkSync, readFileSync } from 'fs';
+import { join, dirname } from 'path';
+import { broadcastNotification } from '../terminal-bridge.js';
+import { readTranscript as readPtyTranscript, renameTranscript, setSessionName } from '../pty-transcript.js';
+import { fileURLToPath } from 'url';
+import { createHash } from 'crypto';
+import { hostname } from 'os';
+import { execSync as _execSync, execFile } from 'child_process';
+
+const __dirname2 = dirname(fileURLToPath(import.meta.url));
+const PHOTOS_DIR = join(__dirname2, '..', 'data', 'photos');
+
+const router = Router();
+
+// Password verification for delete operations
+// Password is stored as SHA-256 hash in the settings table
+// Default password on first use: "phoenix" (user should change it)
+function hashPassword(pw) {
+  return createHash('sha256').update(pw).digest('hex');
+}
+
+// Settings table is created by schema.sql — no inline CREATE needed
+
+function getOrCreatePassword() {
+  const existing = get("SELECT value FROM settings WHERE key = 'delete_password'");
+  if (existing) return existing.value;
+  const defaultHash = hashPassword('phoenix');
+  run("INSERT OR REPLACE INTO settings (key, value) VALUES ('delete_password', :hash)", { ':hash': defaultHash });
+  return defaultHash;
+}
+
+router.post('/api/verify-password', (req, res) => {
+  const { password } = req.body;
+  if (!password) return res.json({ valid: false });
+  const storedHash = getOrCreatePassword();
+  const inputHash = hashPassword(password);
+  res.json({ valid: storedHash === inputHash });
+});
+
+router.post('/api/change-password', (req, res) => {
+  const { current, newPassword } = req.body;
+  if (!current || !newPassword) return res.status(400).json({ error: 'missing fields' });
+  const storedHash = getOrCreatePassword();
+  if (hashPassword(current) !== storedHash) return res.json({ success: false, error: 'wrong password' });
+  run("INSERT OR REPLACE INTO settings (key, value) VALUES ('delete_password', :hash)", { ':hash': hashPassword(newPassword) });
+  res.json({ success: true });
+});
+
+// GET /dashboard/api/photos — list all captured photos
+// PERF (2026-05-30): the previous /api/photos did `SELECT ... WHERE data LIKE
+// '%<filename>%'` once per photo file — full-table scan of the events table
+// (220K+ rows) per photo. With many photos, this routinely chewed 60-70 sec
+// of sync better-sqlite3 time, blocking the Craft event loop and causing
+// every concurrent API call to 502. Field receipt: a 69,602ms /api/photos
+// call coincided with a 70,076ms loop block, and 5+ other endpoints
+// (/api/v1/voice/status, /api/v1/org/current, /dashboard/api/services) 502'd
+// in the same window because they were queued behind it.
+//
+// Fix:
+//   - 30s response cache so repeat visits to the Data panel are instant.
+//   - On cache miss, do ONE batched query against events.event_type =
+//     'VisionAnalysis' (uses idx_events_type, indexed) and build a JS Map
+//     keyed by filename. Per-photo lookup becomes O(1) instead of a scan.
+//   - All file system work stays sync but is bounded by the photos dir size.
+let _photosCache = { ts: 0, body: null };
+const PHOTOS_CACHE_TTL_MS = 30_000;
+router.get('/api/photos', (req, res) => {
+  if (_photosCache.body && Date.now() - _photosCache.ts < PHOTOS_CACHE_TTL_MS) {
+    return res.json(_photosCache.body);
+  }
+  if (!existsSync(PHOTOS_DIR)) {
+    _photosCache = { ts: Date.now(), body: [] };
+    return res.json([]);
+  }
+  try {
+    const photoNames = readdirSync(PHOTOS_DIR).filter(f => f.endsWith('.jpg') || f.endsWith('.png'));
+
+    // ONE query — scoped by event_type (indexed) — instead of N LIKE scans.
+    // Limit by recency: the photos dir holds at most the last few weeks, so
+    // bounding to the most-recent VisionAnalysis events is a safe + fast cap.
+    let visionEvents = [];
+    try {
+      visionEvents = allScoped(req,
+        "SELECT data FROM events WHERE event_type = 'VisionAnalysis' AND org_id = :org_id ORDER BY created_at DESC LIMIT 5000"
+      );
+    } catch {}
+
+    // Build filename → { description, question } in one JSON.parse pass.
+    // VisionAnalysis events typically store the filename in data.image_path
+    // or data.path; fall back to searching the raw JSON string only when
+    // those keys are absent.
+    const byFilename = new Map();
+    for (const e of visionEvents) {
+      let d;
+      try { d = JSON.parse(e.data); } catch { continue; }
+      const path = d.image_path || d.path || d.file || d.filename || '';
+      let key = null;
+      if (path) {
+        const m = String(path).match(/[/\\]([^/\\]+\.(?:jpg|png))$/i);
+        if (m) key = m[1];
+      }
+      // Fallback: scan the raw data string for any of the photo filenames.
+      // Only do this when the structured key was absent.
+      if (!key) {
+        for (const f of photoNames) {
+          if (!byFilename.has(f) && e.data.includes(f)) { key = f; break; }
+        }
+      }
+      if (!key || byFilename.has(key)) continue;
+      byFilename.set(key, {
+        description: d.description || '',
+        question: d.question || '',
+      });
+    }
+
+    const files = photoNames
+      .map(f => {
+        let stat;
+        try { stat = statSync(join(PHOTOS_DIR, f)); } catch { return null; }
+        const meta = byFilename.get(f) || { description: '', question: '' };
+        return {
+          filename: f,
+          url: `/photos/${f}`,
+          size: stat.size,
+          created: stat.mtime.toISOString(),
+          description: meta.description,
+          question: meta.question,
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => new Date(b.created) - new Date(a.created));
+
+    _photosCache = { ts: Date.now(), body: files };
+    res.json(files);
+  } catch (e) {
+    res.json([]);
+  }
+});
+
+// DELETE /dashboard/api/photos/:filename
+router.delete('/api/photos/:filename', (req, res) => {
+  const f = req.params.filename.replace(/[^a-zA-Z0-9._-]/g, '');
+  const path = join(PHOTOS_DIR, f);
+  try {
+    if (existsSync(path)) unlinkSync(path);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /dashboard/api/jobs — list scheduled jobs and running processes.
+//
+// PERF (2026-05-30): this handler used to fire 3 sync execSync calls
+// (schtasks + 2× tasklist), each with a 5-second timeout. Under Windows
+// load each one would routinely take 1-2 seconds; in a bad case the whole
+// handler pinned the Craft event loop for 5-15 seconds. Since the Data
+// Overview panel hits /api/jobs on EVERY visit, navigating to Data Overview
+// would freeze the dashboard for several seconds AND cause downstream 502s
+// on whatever other API calls landed during the freeze.
+//
+// Fix: cache the subprocess-derived parts for 30 seconds, and refresh the
+// cache async (no awaiter) — never block the handler on the subprocess. The
+// handler returns whatever's cached even if stale-by-some-seconds. Pure
+// "what's running on the machine" doesn't change second-to-second; 30s is
+// plenty fresh.
+let _jobsProcCache = {
+  ts: 0,
+  schtasks: null,
+  pythonRunning: null,
+  electronRunning: null,
+  voiceStats: null,
+  dockerVersion: null,
+  dockerContainers: null,
+};
+const JOBS_CACHE_TTL_MS = 30_000;
+let _jobsRefreshing = false;
+function _refreshJobsCacheAsync() {
+  if (_jobsRefreshing) return;
+  if (process.platform !== 'win32') return;
+  _jobsRefreshing = true;
+  const next = {
+    ts: Date.now(),
+    schtasks: null, pythonRunning: false, electronRunning: false,
+    voiceStats: null, dockerVersion: null, dockerContainers: null,
+  };
+  let pending = 6;
+  const done = () => {
+    pending--;
+    if (pending === 0) { _jobsProcCache = next; _jobsRefreshing = false; }
+  };
+  const fire = (cmd, args, opts, onDone) => {
+    try {
+      const proc = execFile(cmd, args, { windowsHide: true, timeout: 5000, killSignal: 'SIGKILL', ...opts },
+        (err, stdout) => { try { onDone(err, stdout); } catch {}; done(); });
+      // Hard kill backstop — execFile's `timeout` only sends SIGTERM, which
+      // some Windows tools (PowerShell COM init, schtasks under WMI load)
+      // ignore. SIGKILL on a timer guarantees cleanup so we don't leak
+      // children or the `done` callback never fires.
+      setTimeout(() => { try { proc?.kill('SIGKILL'); } catch {} }, 6000);
+    } catch { done(); }
+  };
+  fire('schtasks', ['/query', '/tn', 'Phoenix-VoiceTraining', '/fo', 'CSV', '/nh'], {},
+    (err, stdout) => { next.schtasks = err ? null : (stdout || '').trim(); });
+  fire('tasklist', ['/fi', 'IMAGENAME eq python.exe', '/fo', 'CSV', '/nh'], {},
+    (err, stdout) => { next.pythonRunning = !err && (stdout || '').includes('python.exe'); });
+  fire('tasklist', ['/fi', 'IMAGENAME eq electron.exe', '/fo', 'CSV', '/nh'], {},
+    (err, stdout) => { next.electronRunning = !err && (stdout || '').includes('electron.exe'); });
+  fire('docker', ['--version'], {},
+    (err, stdout) => { next.dockerVersion = err ? null : (stdout || '').trim(); });
+  fire('docker', ['info', '--format', '{{.ContainersRunning}}'], {},
+    (err, stdout) => { next.dockerContainers = err ? null : (stdout || '').trim(); });
+  fire('python', ['src/voice-recorder.py', '--stats'], { cwd: join(__dirname2, '..', '..') },
+    (err, stdout) => {
+      if (err || !stdout) { next.voiceStats = null; return; }
+      try { next.voiceStats = JSON.parse(stdout); } catch { next.voiceStats = null; }
+    });
+}
+
+router.get('/api/jobs', async (req, res) => {
+  // Always fire-and-forget a refresh so the cache stays warm; never await.
+  if (Date.now() - _jobsProcCache.ts > JOBS_CACHE_TTL_MS) _refreshJobsCacheAsync();
+  const jobs = [];
+
+  // Scheduled task from cache
+  const taskOutput = _jobsProcCache.schtasks;
+  if (taskOutput && !taskOutput.includes('not found')) {
+    const parts = taskOutput.split(',').map(s => s.replace(/"/g, ''));
+    jobs.push({
+      name: 'Voice Training',
+      description: 'Piper voice model training — transcribe + train overnight',
+      type: 'scheduled_task',
+      status: parts[2]?.trim()?.toLowerCase() || 'unknown',
+      schedule: 'Daily at 12:00 AM EST',
+      next_run: parts[1]?.trim() || null,
+    });
+  }
+
+  // Phoenix Service status
+  jobs.push({
+    name: 'Phoenix Service',
+    description: 'Core server on port 7777 — hooks, API, dashboard',
+    type: 'service',
+    status: 'running',
+    schedule: 'Auto-start on boot (Windows Service)',
+  });
+
+  // Voice Recorder (cached)
+  jobs.push({
+    name: 'Voice Recorder',
+    description: 'Hotkey-triggered mic recording for voice training data',
+    type: 'process',
+    status: _jobsProcCache.pythonRunning === null ? 'unknown' : (_jobsProcCache.pythonRunning ? 'running' : 'stopped'),
+    schedule: 'Triggered by mouse side button (XButton1/XButton2)',
+  });
+
+  // Electron Tray (cached)
+  jobs.push({
+    name: 'Desktop Agent (Electron)',
+    description: 'Tray app — executes UI automation, terminal opens, system commands',
+    type: 'process',
+    status: _jobsProcCache.electronRunning === null ? 'unknown' : (_jobsProcCache.electronRunning ? 'running' : 'stopped'),
+    schedule: 'Manual start or via Phoenix shortcut',
+  });
+
+  // Classifier
+  jobs.push({
+    name: 'Event Classifier',
+    description: 'Classifies raw events into categories',
+    type: 'internal',
+    status: 'running',
+    schedule: 'Every 5 minutes',
+  });
+
+  // Project Sync
+  jobs.push({
+    name: 'Project Sync',
+    description: 'Scans disk for .phoenix files, syncs project database',
+    type: 'internal',
+    status: 'running',
+    schedule: 'Every 10 minutes',
+  });
+
+  // Issue Checker
+  jobs.push({
+    name: 'Issue Checker',
+    description: 'Checks filed GitHub issues for responses (Anthropic, Microsoft)',
+    type: 'internal',
+    status: 'ready',
+    schedule: 'Daily (not yet automated)',
+  });
+
+  // Tool Scout
+  try {
+    const newFindings = getScoped(req, `SELECT COUNT(*) as c FROM scout_findings WHERE status = 'new' AND org_id = :org_id`);
+    const totalFindings = getScoped(req, `SELECT COUNT(*) as c FROM scout_findings WHERE org_id = :org_id`);
+    jobs.push({
+      name: 'Tool Scout',
+      description: `Discovers new AI CLIs and tools for Phoenix — ${newFindings?.c || 0} new, ${totalFindings?.c || 0} total`,
+      type: 'internal',
+      status: 'running',
+      schedule: 'Every 12 hours (BetterStack, GitHub Trending, Product Hunt)',
+    });
+  } catch {
+    jobs.push({
+      name: 'Tool Scout',
+      description: 'Discovers new AI CLIs and tools for Phoenix',
+      type: 'internal',
+      status: 'starting',
+      schedule: 'Every 12 hours',
+    });
+  }
+
+  // Voice training data stats (from cache; refreshed async every 30s)
+  if (_jobsProcCache.voiceStats) {
+    const parsed = _jobsProcCache.voiceStats;
+    jobs.push({
+      name: 'Voice Training Data',
+      description: `${parsed.segments} segments, ${parsed.total_minutes} min, ${parsed.storage_mb}MB`,
+      type: 'data',
+      status: parsed.total_minutes >= 30 ? 'ready' : 'collecting',
+      schedule: 'Accumulates via hotkey recording',
+    });
+  }
+
+  // Docker status (from cache)
+  if (_jobsProcCache.dockerVersion) {
+    jobs.push({
+      name: 'Docker',
+      description: _jobsProcCache.dockerVersion,
+      type: 'service',
+      status: 'running',
+      detail: `${_jobsProcCache.dockerContainers || '?'} container(s) running`,
+    });
+  } else {
+    jobs.push({
+      name: 'Docker',
+      description: 'Container runtime for voice training and native builds',
+      type: 'service',
+      status: _jobsProcCache.ts === 0 ? 'unknown' : 'stopped',
+    });
+  }
+
+  // Piper Voice Model
+  try {
+    const modelDir = join(__dirname2, '..', 'data', 'voice_model');
+    const onnxPath = join(modelDir, 'phoenix-voice.onnx');
+    const configPath = join(modelDir, 'training_config.json');
+    const hasModel = existsSync(onnxPath);
+    const hasConfig = existsSync(configPath);
+    jobs.push({
+      name: 'Piper Voice Model',
+      description: hasModel ? 'Custom TTS voice trained and ready' : 'Voice model for text-to-speech',
+      type: 'ai_model',
+      status: hasModel ? 'ready' : hasConfig ? 'training' : 'not_started',
+    });
+  } catch {}
+
+  // Local LLM (phone)
+  try {
+    const devices = allScoped(req, `SELECT * FROM devices WHERE device_type = 'phone' AND last_seen > datetime('now','localtime', '-5 minutes') AND org_id = :org_id`);
+    const phoneOnline = devices.length > 0;
+    jobs.push({
+      name: 'Local LLM (Phone)',
+      description: 'On-device AI model for intent classification',
+      type: 'ai_model',
+      status: phoneOnline ? 'connected' : 'offline',
+      detail: 'Phi 3.5 Mini — 2.3GB downloaded',
+    });
+  } catch {}
+
+  // Resistance Router stats
+  try {
+    const pathCount = getScoped(req, `SELECT COUNT(*) as c FROM resistance_paths WHERE org_id = :org_id`);
+    const logCount = getScoped(req, `SELECT COUNT(*) as c FROM resistance_log WHERE org_id = :org_id`);
+    const successRate = getScoped(req, `SELECT ROUND(100.0 * SUM(success) / COUNT(*), 1) as rate FROM resistance_log WHERE org_id = :org_id`);
+    jobs.push({
+      name: 'Resistance Router',
+      description: `${pathCount?.c || 0} paths, ${logCount?.c || 0} attempts, ${successRate?.rate || 0}% success`,
+      type: 'internal',
+      status: 'running',
+    });
+  } catch {}
+
+  // Device preferences
+  try {
+    const prefs = allScoped(req, `SELECT * FROM resistance_preferences WHERE org_id = :org_id`);
+    if (prefs.length > 0) {
+      jobs.push({
+        name: 'User Preferences',
+        description: prefs.map(p => `${p.action}: ${p.preferred_path}`).join(', '),
+        type: 'config',
+        status: 'configured',
+      });
+    }
+  } catch {}
+
+  // Connected devices
+  try {
+    const devices = allScoped(req, `SELECT * FROM devices WHERE last_seen > datetime('now','localtime', '-10 minutes') AND org_id = :org_id`);
+    jobs.push({
+      name: 'Connected Devices',
+      description: devices.map(d => `${d.name} (${d.device_type})`).join(', ') || 'No devices connected',
+      type: 'devices',
+      status: devices.length > 0 ? 'online' : 'offline',
+      detail: `${devices.length} device(s)`,
+    });
+  } catch {}
+
+  res.json({ jobs });
+});
+
+// GET /dashboard/api/search?q=text — search all events by transcript text
+router.get('/api/search', (req, res) => {
+  const q = req.query.q;
+  if (!q) return res.json([]);
+  const results = allScoped(req, `SELECT * FROM events WHERE data LIKE :q AND org_id = :org_id ORDER BY created_at DESC LIMIT 50`, {
+    ':q': `%${q}%`
+  });
+  res.json(results);
+});
+
+// GET /dashboard/api/events?type=X&limit=50&offset=0&date=2026-03-20&q=search
+router.get('/api/events', (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 50, 500);
+  const offset = parseInt(req.query.offset) || 0;
+  const type = req.query.type || null;
+  const date = req.query.date || null;
+  const search = req.query.q || null;
+  const sessionId = req.query.session_id || null;
+
+  let where = ['org_id = :org_id'];
+  let params = {};
+
+  if (type) {
+    where.push("event_type = :type");
+    params[':type'] = type;
+  }
+  if (date) {
+    where.push("date(created_at) = :date");
+    params[':date'] = date;
+  }
+  if (search) {
+    where.push("data LIKE :q");
+    params[':q'] = `%${search}%`;
+  }
+  if (sessionId) {
+    where.push("session_id = :session_id");
+    params[':session_id'] = sessionId;
+  }
+  const projectPath = req.query.project_path || null;
+  if (projectPath) {
+    // Match events whose cwd contains this project path
+    // Events store cwd with JSON-escaped backslashes (\\\\) — normalize and match both forms
+    const fwd = projectPath.replace(/\\/g, '/');                    // %USERPROFILE%/.../Phoenix
+    const bk = fwd.replace(/\//g, '\\\\');                          // %USERPROFILE%\\...\\Phoenix (as in JSON)
+    where.push("(data LIKE :pp1 OR data LIKE :pp2)");
+    params[':pp1'] = `%${bk}%`;
+    params[':pp2'] = `%${fwd}%`;
+  }
+
+  const whereClause = `WHERE ${where.join(' AND ')}`;
+
+  const total = getScoped(req, `SELECT COUNT(*) as count FROM events ${whereClause}`, params);
+  const events = allScoped(req,
+    `SELECT * FROM events ${whereClause} ORDER BY created_at DESC LIMIT :limit OFFSET :offset`,
+    { ...params, ':limit': limit, ':offset': offset }
+  );
+
+  res.json({ events, total: total?.count || 0, limit, offset });
+});
+
+// Transcript cache — avoids re-parsing huge JSONL files on every poll
+const transcriptCache = new Map(); // path -> { mtime, size, messages }
+
+// GET /api/transcript — read full conversation from JSONL transcript file
+// Returns user prompts, full assistant text responses, and tool call summaries
+router.get('/api/transcript', (req, res) => {
+  // Never let browsers cache transcript responses — they update constantly
+  res.setHeader('Cache-Control', 'no-store, must-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  const sessionId = req.query.session_id;
+  if (!sessionId) return res.json({ error: 'session_id required', messages: [] });
+
+  // Find the transcript path from the most recent event for this session
+  const event = getScoped(req,
+    "SELECT data FROM events WHERE session_id = :sid AND event_type IN ('Stop', 'UserPromptSubmit') AND org_id = :org_id ORDER BY created_at DESC LIMIT 1",
+    { ':sid': sessionId }
+  );
+  if (!event) return res.json({ error: 'session not found', messages: [] });
+
+  let transcriptPath;
+  try {
+    transcriptPath = JSON.parse(event.data).transcript_path;
+  } catch {}
+  if (!transcriptPath || !existsSync(transcriptPath)) {
+    return res.json({ error: 'transcript not found', messages: [] });
+  }
+
+  try {
+    // Check cache — skip re-parsing if file hasn't changed.
+    // Compare BOTH mtime AND size: on Windows, mtime can be stale when Claude
+    // holds the file handle open and appends data. Size always reflects appends.
+    const fileStat = statSync(transcriptPath);
+    const cached = transcriptCache.get(transcriptPath);
+    if (cached && cached.mtime >= fileStat.mtimeMs && cached.size >= fileStat.size) {
+      const limit = parseInt(req.query.limit) || 200;
+      return res.json({ messages: cached.messages.slice(-limit) });
+    }
+
+    const raw = readFileSync(transcriptPath, 'utf-8').trim();
+    const lines = raw.split('\n');
+    const messages = [];
+
+    for (const line of lines) {
+      let obj;
+      try { obj = JSON.parse(line); } catch { continue; }
+
+      // User prompt — content can be a string (typed message) or array (tool results, skip those)
+      if (obj.type === 'user' && obj.message) {
+        const content = obj.message.content;
+        if (typeof content === 'string' && content.trim()) {
+          messages.push({ role: 'user', type: 'prompt', text: content, ts: obj.timestamp });
+        } else if (Array.isArray(content)) {
+          // Array content — look for text and image blocks (skip tool_result entries)
+          let textParts = [];
+          let images = [];
+          for (const block of content) {
+            if (block.type === 'text' && block.text?.trim()) {
+              textParts.push(block.text);
+            } else if (block.type === 'image' && block.source) {
+              // Extract clipboard filename from file path if available
+              if (block.source.type === 'file' && block.source.file_path) {
+                const m = block.source.file_path.match(/phoenix-clipboard[\/\\](clipboard_\d+\.\w+)/);
+                if (m) images.push({ clipboardFile: m[1] });
+              } else if (block.source.type === 'base64') {
+                // For base64, generate a small data URL for the thumbnail
+                images.push({ dataUrl: `data:${block.source.media_type};base64,${block.source.data.substring(0, 200)}`, isBase64: true, mediaType: block.source.media_type });
+              }
+            }
+          }
+          if (textParts.length || images.length) {
+            messages.push({ role: 'user', type: 'prompt', text: textParts.join('\n'), images, ts: obj.timestamp });
+          }
+        }
+        continue;
+      }
+
+      // Meta entry with [Image: source: ...] — attach clipboard reference to previous user message
+      if (obj.isMeta && obj.message?.content) {
+        const metaText = typeof obj.message.content === 'string' ? obj.message.content :
+          Array.isArray(obj.message.content) ? obj.message.content.map(b => b.text || '').join('') : '';
+        const imgMatch = metaText.match(/\[Image:?\s*source:?\s*[^\]]*phoenix-clipboard[\/\\](clipboard_\d+\.\w+)/i);
+        if (imgMatch && messages.length > 0) {
+          const last = messages[messages.length - 1];
+          if (last.role === 'user') {
+            if (!last.images) last.images = [];
+            last.images.push({ clipboardFile: imgMatch[1] });
+          }
+        }
+        continue;
+      }
+
+      // Assistant messages
+      if (obj.type === 'assistant' && Array.isArray(obj.message?.content)) {
+        const model = obj.message?.model || null;
+        for (const block of obj.message.content) {
+          if (block.type === 'text' && block.text) {
+            messages.push({ role: 'assistant', type: 'text', text: block.text, ts: obj.timestamp, model });
+          } else if (block.type === 'tool_use') {
+            // Summarize tool calls — just name and key info
+            const name = block.name || 'unknown';
+            let summary = name;
+            const input = block.input || {};
+            if (name === 'Bash' && input.command) summary = `Bash: ${input.command.substring(0, 120)}`;
+            else if (name === 'Edit' && input.file_path) summary = `Edit: ${input.file_path.split(/[/\\]/).pop()}`;
+            else if (name === 'Read' && input.file_path) summary = `Read: ${input.file_path.split(/[/\\]/).pop()}`;
+            else if (name === 'Write' && input.file_path) summary = `Write: ${input.file_path.split(/[/\\]/).pop()}`;
+            else if (name === 'Grep' && input.pattern) summary = `Grep: ${input.pattern.substring(0, 60)}`;
+            else if (name === 'Glob' && input.pattern) summary = `Glob: ${input.pattern}`;
+            else if (name === 'Agent') summary = `Agent: ${input.description || 'subagent'}`;
+            messages.push({ role: 'assistant', type: 'tool', text: summary, ts: obj.timestamp });
+          }
+        }
+      }
+    }
+
+    // Cache the parsed result
+    transcriptCache.set(transcriptPath, { mtime: fileStat.mtimeMs, size: fileStat.size, messages });
+    // Limit cache size to 20 entries
+    if (transcriptCache.size > 20) {
+      const oldest = transcriptCache.keys().next().value;
+      transcriptCache.delete(oldest);
+    }
+
+    // Only return the last N messages to keep payload reasonable
+    const limit = parseInt(req.query.limit) || 200;
+    res.json({ messages: messages.slice(-limit), total: messages.length });
+  } catch (err) {
+    res.json({ error: err.message, messages: [] });
+  }
+});
+
+// GET /api/pty-transcript — read PTY transcript by tab session ID.
+// LLM-agnostic: keyed by tab session ID, persists across Claude restarts.
+router.get('/api/pty-transcript', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store, must-revalidate');
+  const sessionId = req.query.session_id;
+  if (!sessionId) return res.json({ error: 'session_id required', messages: [] });
+  try {
+    const messages = readPtyTranscript(sessionId);
+    const limit = parseInt(req.query.limit) || 200;
+    res.json({ messages: messages.slice(-limit), total: messages.length });
+  } catch (err) {
+    res.json({ error: err.message, messages: [] });
+  }
+});
+
+// GET /dashboard/api/stats
+// Cached — queries run on a 72K-row events table (2-3s each). Stale for 60s is fine for dashboard counters.
+// PERF (2026-05-29): /api/stats was the single worst route in the codebase.
+// On a 1.6GB pan.db it routinely took 20-30 SECONDS per cold call, blocking
+// the entire Craft event loop while better-sqlite3 ran:
+//   - 6 COUNT(*) table scans across events / memory_items / sessions / etc
+//   - COUNT(DISTINCT event_type) on events
+//   - GROUP BY event_type on events
+//   - TWO `lower(data) LIKE '%restart%'` full-table scans for the "restart
+//     friction metric" — these alone were 10-20s each because they do a
+//     per-row text conversion and substring match across millions of events
+//
+// The handler had a 60s response cache, but the FIRST hit after every Craft
+// swap (and after every cache expiry, every 60s) re-triggered the full scan
+// and pinned the loop. That's why /api/stats showed up as a 31s slow route
+// and was a top contributor to the 170-195s event-loop blocks the user kept
+// seeing.
+//
+// New shape:
+//   - Background ticker recomputes the snapshot every 5 minutes. It's still
+//     a sync set of queries, but a 5-min cadence means there's only ~one
+//     pinning event per 5min worst case (down from 1 per 60s).
+//   - The restart-friction LIKE scans are now done at the SAME 5-min cadence
+//     but in a SEPARATE try/catch that the rest of the snapshot doesn't wait
+//     on — if they fail or time out, the dashboard still gets the cheap counts.
+//   - The handler is pure-fast: read snapshot, return JSON. Never blocks.
+//   - On the very first call before the ticker has populated, we fall back
+//     to cheap COUNT(*) queries WITHOUT the restart scan (returns nulls for
+//     those fields) so the dashboard still renders.
+let _statsSnapshot = null;       // { totalCounts, eventTypes, restarts, dbSize, computedAt }
+let _statsTickerStarted = false;
+
+function _computeCheapStatsSnapshot(reqOrgId = 'org_personal') {
+  // Cheap counts — these hit indexed primary keys or small tables fast.
+  // We intentionally don't pass through req scoping here because the ticker
+  // is org-agnostic — the dashboard's stats panel is currently global.
+  const stats = get(`SELECT
+    (SELECT COUNT(*) FROM events WHERE org_id = :org_id) as total_events,
+    (SELECT COUNT(*) FROM memory_items WHERE org_id = :org_id) as total_memory_items,
+    (SELECT COUNT(*) FROM sessions WHERE org_id = :org_id) as total_sessions,
+    (SELECT COUNT(*) FROM projects WHERE org_id = :org_id) as total_projects,
+    (SELECT COUNT(*) FROM devices WHERE org_id = :org_id) as total_devices,
+    (SELECT COUNT(DISTINCT event_type) FROM events WHERE org_id = :org_id) as event_types`,
+    { ':org_id': reqOrgId });
+  const eventTypes = all(`SELECT event_type, COUNT(*) as count FROM events
+    WHERE org_id = :org_id GROUP BY event_type ORDER BY count DESC`,
+    { ':org_id': reqOrgId });
+  let dbSize = 0;
+  try { dbSize = statSync(DB_PATH).size; } catch {}
+  return { stats, eventTypes, dbSize };
+}
+
+function _computeRestartFriction(reqOrgId = 'org_personal') {
+  // Heaviest queries in the codebase — full table scan + per-row lower() + LIKE.
+  // Kept isolated so a slow run doesn't poison the rest of the snapshot.
+  let totalRestarts = 0;
+  let restartsByProject = [];
+  try {
+    const r = get(`
+      SELECT COUNT(*) AS c FROM events
+      WHERE event_type IN ('UserPromptSubmit','user','user_prompt')
+        AND lower(data) LIKE '%restart%'
+        AND org_id = :org_id`,
+      { ':org_id': reqOrgId });
+    totalRestarts = r?.c || 0;
+    restartsByProject = all(`
+      SELECT COALESCE(p.name, 'unscoped') AS project, COUNT(*) AS count
+      FROM events e
+      LEFT JOIN sessions s ON s.id = e.session_id
+      LEFT JOIN projects p ON p.id = s.project_id
+      WHERE e.event_type IN ('UserPromptSubmit','user','user_prompt')
+        AND lower(e.data) LIKE '%restart%'
+        AND e.org_id = :org_id
+      GROUP BY project ORDER BY count DESC`,
+      { ':org_id': reqOrgId });
+  } catch (err) {
+    console.warn('[stats] restart friction scan failed:', err.message);
+  }
+  return { totalRestarts, restartsByProject };
+}
+
+function _refreshStatsSnapshot() {
+  try {
+    const t0 = Date.now();
+    const { stats, eventTypes, dbSize } = _computeCheapStatsSnapshot();
+    _statsSnapshot = {
+      ...stats,
+      db_size_bytes: dbSize,
+      db_size: dbSize ? `${(dbSize / 1048576).toFixed(1)} MB` : '--',
+      event_types: eventTypes,
+      // Restart-friction metric is DISABLED — see _computeRestartFriction note.
+      total_restarts: null,
+      restarts_by_project: [],
+      computed_at: new Date().toISOString(),
+      computed_ms: Date.now() - t0,
+    };
+  } catch (e) {
+    console.warn('[stats] snapshot refresh failed:', e.message);
+  }
+}
+
+// _computeRestartFriction is the bad function. lower(data) LIKE '%restart%' on
+// the events table runs a full table scan WITH a per-row text conversion. On a
+// 1.6GB pan.db with millions of events this can lock the better-sqlite3 reader
+// for 10-30 seconds, blocking the entire Craft event loop. We're keeping the
+// function definition (above) for future use once we either:
+//   (a) move events.data into an FTS5 virtual table for fast substring search, or
+//   (b) tag UserPromptSubmit events with a precomputed "contains_restart" flag.
+// Until then, _refreshStatsSnapshot does not call it. The dashboard renders
+// `total_restarts = null` and the stats panel suppresses the row gracefully.
+
+// REGRESSION KILLER (2026-05-29 evening): the previous version of this code
+// set up a setInterval(_refreshStatsSnapshot, 5 * 60_000) the first time
+// anyone hit /api/stats. That meant every 5 minutes the BACKGROUND ticker
+// ran the GROUP BY event_type query on the events table — sync, on the
+// main thread — and blocked the entire Craft event loop for 2-3 minutes
+// EACH time. Field receipts: 183s block at 23:28, 184s at 23:33, 155s at
+// 23:37 — exactly 5 min apart, exactly matching the setInterval cadence.
+//
+// The original code (on-demand cache, no background ticker) was correct.
+// Restoring that pattern: compute on-demand, cache the result for 10 min.
+// The /api/stats panel is a "click to see" view, not something the
+// dashboard polls — so on-demand is the right shape.
+router.get('/api/stats', (req, res) => {
+  if (_statsSnapshot && Date.now() - new Date(_statsSnapshot.computed_at).getTime() < 10 * 60_000) {
+    return res.json(_statsSnapshot);
+  }
+  try {
+    _refreshStatsSnapshot(); // sync; populates _statsSnapshot
+    if (_statsSnapshot) return res.json(_statsSnapshot);
+    return res.status(500).json({ error: 'stats snapshot failed' });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /dashboard/api/memory — reads actual Claude Code memory files from ~/.claude/projects/*/memory/
+router.get('/api/memory', (req, res) => {
+  const claudeDir = join(process.env.USERPROFILE || process.env.HOME || '', '.claude', 'projects');
+  const memories = [];
+
+  try {
+    if (!existsSync(claudeDir)) return res.json({ memories: [] });
+    const projectDirs = readdirSync(claudeDir).filter(d => {
+      try { return statSync(join(claudeDir, d)).isDirectory(); } catch { return false; }
+    });
+
+    for (const projDir of projectDirs) {
+      const memDir = join(claudeDir, projDir, 'memory');
+      if (!existsSync(memDir)) continue;
+
+      // Derive a readable project name from the dir name (C--Users-owner-OneDrive-Desktop-Phoenix → Phoenix)
+      const parts = projDir.replace(/^C--/, '').split('-');
+      const projectName = parts[parts.length - 1] || parts[parts.length - 2] || projDir;
+
+      const files = readdirSync(memDir).filter(f => f.endsWith('.md') && f !== 'MEMORY.md');
+      for (const file of files) {
+        try {
+          const content = readFileSync(join(memDir, file), 'utf8');
+          // Parse frontmatter
+          let name = file.replace('.md', ''), type = 'unknown', description = '';
+          const fmMatch = content.match(/^---\s*\n([\s\S]*?)\n---\s*\n([\s\S]*)$/);
+          let body = content;
+          if (fmMatch) {
+            const fm = fmMatch[1];
+            body = fmMatch[2].trim();
+            const nameMatch = fm.match(/name:\s*(.+)/);
+            const typeMatch = fm.match(/type:\s*(.+)/);
+            const descMatch = fm.match(/description:\s*(.+)/);
+            if (nameMatch) name = nameMatch[1].trim();
+            if (typeMatch) type = typeMatch[1].trim();
+            if (descMatch) description = descMatch[1].trim();
+          }
+          const stat = statSync(join(memDir, file));
+          memories.push({ name, type, description, body, project: projectName, file, modified: stat.mtime.toISOString() });
+        } catch {}
+      }
+    }
+  } catch {}
+
+  // Sort by modified date, newest first
+  memories.sort((a, b) => new Date(b.modified) - new Date(a.modified));
+  res.json({ memories });
+});
+
+// GET /dashboard/api/conversations?limit=50&filter=voice&q=searchtext
+router.get('/api/conversations', (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+  const offset = parseInt(req.query.offset) || 0;
+  const filter = req.query.filter || 'all';
+  const search = req.query.q || '';
+
+  // Map filter to event types
+  const filterMap = {
+    'all': null, // null = no type filter, show everything
+    'voice': "('RouterCommand', 'PhoneAudio')",
+    'commands': "('RouterCommand')",
+    'photos': "('PandantPhoto', 'VisionAnalysis')",
+    'sensors': "('SensorData')",
+    'system': "('SessionStart', 'SessionEnd', 'Stop', 'UserPromptSubmit')",
+  };
+  const typeFilter = filterMap[filter] !== undefined ? filterMap[filter] : null;
+
+  let whereClause = typeFilter ? `WHERE org_id = :org_id AND event_type IN ${typeFilter}` : 'WHERE org_id = :org_id';
+  const params = { ':limit': limit, ':offset': offset };
+
+  if (search) {
+    // Split search into words and AND them together for better matching
+    const words = search.split(/\s+/).filter(w => w.length > 0);
+    if (words.length > 0) {
+      const wordClauses = words.map((w, i) => {
+        params[`:q${i}`] = `%${w}%`;
+        return `data LIKE :q${i}`;
+      });
+      const combined = wordClauses.join(' AND ');
+      whereClause += ` AND (${combined})`;
+    }
+  }
+
+  const events = allScoped(req,
+    `SELECT * FROM events ${whereClause} ORDER BY created_at DESC LIMIT :limit OFFSET :offset`,
+    params
+  );
+
+  const total = getScoped(req, `SELECT COUNT(*) as count FROM events ${whereClause}`, params);
+
+  const conversations = events.map(e => {
+    let data = {};
+    try { data = JSON.parse(e.data); } catch {}
+    return {
+      id: e.id,
+      event_type: e.event_type,
+      session_id: e.session_id,
+      created_at: e.created_at,
+      transcript: data.transcript || data.user_text || data.text || data.question || '',
+      response: data.response || data.response_text || data.result || data.description || '',
+      route: data.route || data.intent || '',
+      model: data.model || '',
+      response_time_ms: data.response_time_ms || data.duration_ms || null,
+      data
+    };
+  });
+
+  res.json({ conversations, total: total?.count || 0 });
+});
+
+// GET /dashboard/api/projects
+router.get('/api/projects', (req, res) => {
+  const projects = allScoped(req, `SELECT * FROM projects WHERE org_id = :org_id ORDER BY name`);
+  res.json(projects);
+});
+
+// POST /dashboard/api/phone-ping — mobile dashboard heartbeat
+// Called every 2 min from /mobile/ to keep phone last_seen fresh
+router.post('/api/phone-ping', (req, res) => {
+  const { device_id } = req.body || {};
+  if (device_id) {
+    // Update specific device if provided
+    runScoped(req, `UPDATE devices SET last_seen = datetime('now','localtime'), online = 1
+      WHERE hostname = :h AND org_id = :org_id`, { ':h': device_id });
+  } else {
+    // Update most recently seen phone (fallback when device_id unknown)
+    runScoped(req, `UPDATE devices SET last_seen = datetime('now','localtime'), online = 1
+      WHERE device_type = 'phone' AND org_id = :org_id
+      AND last_seen = (SELECT MAX(last_seen) FROM devices WHERE device_type = 'phone' AND org_id = :org_id)`);
+  }
+  res.json({ ok: true });
+});
+
+// PATCH /dashboard/api/devices/:id — rename a device
+router.patch('/api/devices/:id', (req, res) => {
+  const { name, tailscale_hostname } = req.body || {};
+  if (!name && !tailscale_hostname) return res.status(400).json({ error: 'name or tailscale_hostname required' });
+  if (name) run('UPDATE devices SET name = :n WHERE id = :id', { ':n': name, ':id': req.params.id });
+  if (tailscale_hostname) run('UPDATE devices SET tailscale_hostname = :ts WHERE id = :id', { ':ts': tailscale_hostname, ':id': req.params.id });
+  res.json({ ok: true, id: req.params.id });
+});
+
+// DELETE /dashboard/api/devices/:id — remove a device record
+router.delete('/api/devices/:id', (req, res) => {
+  const callerIp = req.ip || req.socket?.remoteAddress || 'unknown';
+  // Capture hostname before deleting
+  const devRow = get('SELECT hostname FROM devices WHERE id = :id', { ':id': req.params.id });
+  run('DELETE FROM devices WHERE id = :id', { ':id': req.params.id });
+  try {
+    run(`INSERT INTO device_audit_log (action, hostname, caller_ip, endpoint, notes)
+         VALUES ('deleted', :h, :ip, 'DELETE /dashboard/api/devices/:id', NULL)`,
+      { ':h': devRow?.hostname || null, ':ip': callerIp });
+  } catch {}
+  res.json({ ok: true, id: req.params.id });
+});
+
+// POST /dashboard/api/devices — register or update a device (admin/manual)
+router.post('/api/devices', (req, res) => {
+  const { hostname: devHost, name, device_type = 'pc', tailscale_hostname, capabilities } = req.body || {};
+  if (!devHost || !name) return res.status(400).json({ error: 'hostname and name required' });
+  const existing = get('SELECT id FROM devices WHERE hostname = :h', { ':h': devHost });
+  if (existing) {
+    run(`UPDATE devices SET name = :n, device_type = :t, tailscale_hostname = :ts, last_seen = datetime('now','localtime')
+         WHERE hostname = :h`,
+      { ':n': name, ':t': device_type, ':ts': tailscale_hostname || null, ':h': devHost });
+    res.json({ ok: true, id: existing.id, updated: true });
+  } else {
+    const id = insert(
+      `INSERT INTO devices (hostname, name, device_type, capabilities, tailscale_hostname, last_seen, org_id)
+       VALUES (:h, :n, :t, :caps, :ts, datetime('now','localtime'), 'org_personal')`,
+      { ':h': devHost, ':n': name, ':t': device_type,
+        ':caps': capabilities || '[]', ':ts': tailscale_hostname || null }
+    );
+    res.json({ ok: true, id, created: true });
+  }
+});
+
+// GET /dashboard/api/devices
+router.get('/api/devices', (req, res) => {
+  const devices = allScoped(req, `SELECT * FROM devices WHERE org_id = :org_id ORDER BY last_seen DESC`);
+  // Enrich with real activity from client_logs (phone's last_seen may lag if logs handler doesn't update it)
+  const recentLogs = allScoped(req, `
+    SELECT device_id, MAX(created_at) as last_log
+    FROM client_logs WHERE org_id = :org_id
+    GROUP BY device_id`);
+  const logMap = Object.fromEntries(recentLogs.map(r => [r.device_id, r.last_log]));
+  // Hub detection: match by hostname OR by Windows COMPUTERNAME (may differ from os.hostname() in some envs)
+  const serverHosts = new Set([hostname().toLowerCase()]);
+  try {
+    const cn = _execSync('wmic computersystem get name /value', { encoding: 'utf8', windowsHide: true, timeout: 2000 });
+    const cn2 = cn.match(/Name=(.+)/)?.[1]?.trim().toLowerCase();
+    if (cn2) serverHosts.add(cn2);
+  } catch {}
+  const enriched = devices.map(d => {
+    const lastLog = logMap[d.hostname];
+    const isHub = serverHosts.has(d.hostname?.toLowerCase());
+    const base = lastLog && (!d.last_seen || lastLog > d.last_seen)
+      ? { ...d, last_seen: lastLog, online: 1 }
+      : { ...d };
+    return { ...base, is_hub: isHub };
+  });
+  res.json(enriched);
+});
+
+// GET /dashboard/api/status — lightweight Craft health check (used by swap-reload polling)
+router.get('/api/status', (req, res) => {
+  res.json({ ok: true, pid: process.pid, ts: Date.now() });
+});
+
+// Module-level response cache for /api/services.
+// Cache is scoped by org_id (taken from req.org_id which the auth middleware
+// attaches). The external probes (Whisper, Ollama, Super-Carrier /health)
+// run on a background ticker — see _externalProbeSnapshot below — so the
+// HTTP handler is pure-synchronous DB work and answers in single-digit ms.
+const _servicesCache = new Map(); // org_id -> { ts, body }
+const _servicesInflight = new Map(); // org_id -> Promise (dedupe concurrent calls)
+const _SERVICES_TTL_MS = 3000;
+
+// Background snapshot of the 3 external probes. Refreshed every 10s on a
+// timer; /api/services just reads this. This decouples request latency
+// from network probes — previously the dashboard paid the full Ollama
+// timeout (3s) on every cold sidebar refresh because Ollama is on a
+// remote the local Ollama box over Tailscale and probes can be slow even when up.
+const _externalProbeSnapshot = {
+  ts: 0,
+  health:  { status: 'pending', value: null },
+  whisper: { status: 'pending', value: null },
+  ollama:  { status: 'pending', value: null },
+};
+let _externalProbeTimer = null;
+
+async function _refreshExternalProbes() {
+  const _ollamaUrl = getOllamaUrl();
+  const probes = await Promise.allSettled([
+    fetch('http://127.0.0.1:7777/health', { signal: AbortSignal.timeout(2000) })
+      .then(async (r) => r.ok ? await r.json().catch(() => ({})) : null),
+    fetch('http://127.0.0.1:7782', { signal: AbortSignal.timeout(2000) })
+      .then(async (r) => r.ok ? { ok: true, body: await r.json().catch(() => ({})) } : { ok: false }),
+    fetch(`${_ollamaUrl}/api/tags`, { signal: AbortSignal.timeout(4000) })
+      .then(async (r) => r.ok ? { ok: true, body: await r.json().catch(() => ({})) } : { ok: false }),
+  ]);
+  _externalProbeSnapshot.health  = probes[0];
+  _externalProbeSnapshot.whisper = probes[1];
+  _externalProbeSnapshot.ollama  = probes[2];
+  _externalProbeSnapshot.ts = Date.now();
+}
+
+function _startExternalProbeTicker() {
+  if (_externalProbeTimer) return;
+  // Kick off the first round immediately (non-blocking).
+  _refreshExternalProbes().catch(() => {});
+  _externalProbeTimer = setInterval(() => {
+    _refreshExternalProbes().catch(() => {});
+  }, 10000);
+}
+
+// Fire the ticker on module load — Craft is already past the boot-heavy
+// window by the time this route module is required.
+_startExternalProbeTicker();
+
+// GET /dashboard/api/services — unified services + devices status
+router.get('/api/services', async (req, res) => {
+  const orgKey = req.org_id || 'default';
+  const cached = _servicesCache.get(orgKey);
+  if (cached && Date.now() - cached.ts < _SERVICES_TTL_MS) {
+    return res.json(cached.body);
+  }
+  // Coalesce concurrent in-flight requests so only ONE actually runs the work.
+  const existing = _servicesInflight.get(orgKey);
+  if (existing) {
+    try { const body = await existing; return res.json(body); }
+    catch (e) { return res.status(500).json({ error: e.message }); }
+  }
+
+  const runner = (async () => {
+  const services = [];
+  const issues = [];
+  const pcHost = hostname();
+
+  // Read from the background snapshot — no network wait. If the ticker
+  // hasn't completed its first round yet (within a few seconds of boot),
+  // probes will be in 'pending' state and we treat them like fulfilled-but-empty.
+  const healthProbe = _externalProbeSnapshot.health;
+  const whisperProbe = _externalProbeSnapshot.whisper;
+  const ollamaProbe = _externalProbeSnapshot.ollama;
+
+  // Process layer stack — Super-Carrier → Carrier → Craft
+  const uptime = process.uptime();
+  let scPid = null, carrierPid = null, scReady = false;
+  if (healthProbe.status === 'fulfilled' && healthProbe.value) {
+    const hData = healthProbe.value;
+    scPid    = hData.superCarrierPid ?? null;
+    carrierPid = hData.carrierPid ?? null;
+    scReady  = !!hData.superCarrier;
+  }
+
+  if (scReady && scPid) {
+    services.push({
+      category: 'Phoenix Core', name: 'Super-Carrier', status: 'up',
+      role: 'Immortal process layer · owns :7777 + all browser connections',
+      detail: `PID ${scPid} · port 7777 · never restarts`,
+    });
+    services.push({
+      category: 'Phoenix Core', name: 'Carrier', status: 'up',
+      role: 'Hot-swap coordinator · PTY sessions + WebSocket routing',
+      detail: carrierPid ? `PID ${carrierPid} · port 17760 · restarts freely` : 'port 17760 · restarts freely',
+    });
+    services.push({
+      category: 'Phoenix Core', name: 'Craft', status: 'up',
+      role: 'HTTP server · all routes + API · hot-swappable',
+      detail: `PID ${process.pid} · port 17700 · uptime ${Math.round(uptime)}s`,
+    });
+  } else {
+    // Fallback — no Super-Carrier (dev mode or direct launch)
+    services.push({
+      category: 'Phoenix Core', name: 'Phoenix Server', status: 'up',
+      role: 'HTTP server · all routes + API',
+      detail: `PID ${process.pid} · port 7777 · uptime ${Math.round(uptime)}s`,
+    });
+  }
+
+  // Parse latest StewardHeartbeat — single source of truth for all service statuses
+  const heartbeatRow = getScoped(req, `SELECT data, created_at FROM events WHERE event_type = 'StewardHeartbeat' AND org_id = :org_id ORDER BY created_at DESC LIMIT 1`);
+  let stewardServices = {};
+  let heartbeatAge = Infinity;
+  if (heartbeatRow) {
+    heartbeatAge = (Date.now() - new Date(heartbeatRow.created_at).getTime()) / 1000;
+    try {
+      const hb = JSON.parse(heartbeatRow.data);
+      for (const s of (hb.services || [])) stewardServices[s.id] = s;
+    } catch {}
+  }
+
+  // Build Atlas model map (live, always current)
+  let atlasModelMap = {};
+  try {
+    const atlas = getAtlasData();
+    for (const s of (atlas.services || [])) {
+      const mc = s.modelCurrent;
+      if (mc && mc !== 'N/A' && !mc.startsWith('N/A')) atlasModelMap[s.id] = mc;
+    }
+  } catch {}
+
+  const stewardStatus = (id) => {
+    const s = stewardServices[id];
+    if (!s) return { status: 'unknown', detail: 'No heartbeat data' };
+    const st = s.status === 'running' ? 'up' : s.status === 'down' ? 'down' : s.status === 'stopped' ? 'down' : s.status === 'degraded' ? 'unknown' : 'unknown';
+    const note = s.lastError ? ` · ${s.lastError}` : '';
+    const label = s.status.charAt(0).toUpperCase() + s.status.slice(1);
+    // Pull model from live Atlas data (always accurate, not from stale heartbeat)
+    const mc = atlasModelMap[id] || null;
+    const modelTag = mc ? ` · ${mc}` : '';
+    return { status: st, detail: `${label}${modelTag}${note}`, model: mc };
+  };
+
+  // Steward itself
+  services.push({ category: 'Phoenix Core', name: 'Steward', ...(heartbeatAge < 600 ? { status: 'up', detail: `Running · heartbeat ${Math.round(heartbeatAge)}s ago` } : { status: 'unknown', detail: 'No recent heartbeat' }) });
+
+  // All steward-managed Phoenix Core services
+  const coreServiceDefs = [
+    { id: 'intuition',     name: 'Intuition',       role: 'Situational awareness · who/where/what/mood' },
+    { id: 'dream',         name: 'Dream',            role: 'Memory consolidation cycle · runs every 6h' },
+    { id: 'consolidation', name: 'Archivist',        role: 'Episodic + semantic memory builder' },
+    { id: 'scout',         name: 'Scout',            role: 'Background research · Cerebras 120B' },
+    { id: 'orchestrator',  name: 'Orchestrator',     role: 'Task planning + execution coordinator' },
+    { id: 'evolution',     name: 'Evolution Engine', role: 'Memory decay + reinforcement · runs every 6h' },
+    { id: 'classifier',   name: 'Augur',             role: 'Event classification · runs every 5m' },
+    { id: 'embeddings',    name: 'Resonance',        role: 'Text embeddings · semantic memory search' },
+    { id: 'stack-scanner', name: 'Cartographer',     role: 'Codebase + project structure scanner' },
+    { id: 'voice-shell',   name: 'Voice Shell',      role: 'Voice command pipeline · dictate-vad.py' },
+    { id: 'autodev',       name: 'Forge',            role: 'Autonomous dev agent · paused unless triggered' },
+  ];
+  for (const def of coreServiceDefs) {
+    const { status, detail } = stewardStatus(def.id);
+    services.push({ category: 'Phoenix Core', name: def.name, role: def.role, status, detail });
+  }
+
+  // AI / LLM Services
+  // Pull usage counts for context (last 24h)
+  const usageRows = allScoped(req, `SELECT caller, model, COUNT(*) as calls FROM ai_usage WHERE org_id = :org_id AND created_at > datetime('now','-1 day') GROUP BY caller, model`);
+  const usageMap = {};
+  for (const r of usageRows) usageMap[`${r.caller}:${r.model}`] = r.calls;
+  const totalCalls = usageRows.reduce((s, r) => s + r.calls, 0);
+
+  // Whisper STT — consumes the parallel probe fired at the top of the handler
+  if (whisperProbe.status === 'fulfilled' && whisperProbe.value?.ok) {
+    const wd = whisperProbe.value.body || {};
+    const enrolled = wd.enrolled != null ? `${wd.enrolled} voice${wd.enrolled !== 1 ? 's' : ''} enrolled` : '';
+    services.push({ category: 'AI Models', name: 'Whisper STT', status: 'up',
+      role: 'Speech → text for all voice commands + passive speaker ID',
+      detail: [enrolled, `${wd.model || 'base'} model · port 7782`].filter(Boolean).join(' · ') });
+  } else if (whisperProbe.status === 'fulfilled') {
+    services.push({ category: 'AI Models', name: 'Whisper STT', status: 'down', role: 'Speech → text', detail: 'Server error' });
+  } else {
+    services.push({ category: 'AI Models', name: 'Whisper STT', status: 'down', role: 'Speech → text', detail: 'Not running · steward will restart' });
+  }
+
+  // Ollama + loaded models
+  const deviceWithOllama = allScoped(req, `SELECT name, hostname, reported_services FROM devices WHERE reported_services IS NOT NULL AND org_id = :org_id`)
+    .map(d => { try { return { ...d, services: JSON.parse(d.reported_services) }; } catch { return null; } })
+    .filter(Boolean)
+    .find(d => d.services.some(s => s.name === 'ollama' && s.status === 'up'));
+
+  // Ollama — consumes the parallel probe fired at the top of the handler
+  if (ollamaProbe.status === 'fulfilled' && ollamaProbe.value?.ok) {
+    const od = ollamaProbe.value.body || {};
+    const models = od.models || [];
+    if (models.length === 0) {
+      services.push({ category: 'AI Models', name: 'Ollama', status: 'up', role: 'Local LLM runtime', detail: 'Running · no models loaded' });
+    } else {
+      // Classify model roles by name pattern
+      const roleFor = (name) => {
+        const n = name.toLowerCase();
+        if (n.includes('embed')) return 'Text embeddings · memory search';
+        if (n.includes('qwen') && n.includes('235')) return 'Local fast router (offline fallback)';
+        if (n.includes('qwen')) return 'Local reasoning · offline capable';
+        if (n.includes('llama')) return 'Local LLM · general purpose';
+        if (n.includes('mistral')) return 'Local LLM · fast inference';
+        if (n.includes('phi')) return 'Local LLM · lightweight';
+        if (n.includes('nomic') || n.includes('mxbai')) return 'Text embeddings · memory search';
+        return 'Local LLM · offline capable';
+      };
+      for (const m of models) {
+        const sizeGb = m.size ? (m.size / 1e9).toFixed(1) + 'GB' : '';
+        services.push({ category: 'AI Models', name: m.name, status: 'up',
+          role: roleFor(m.name),
+          detail: `Ollama local${sizeGb ? ' · ' + sizeGb : ''}` });
+      }
+    }
+  } else if (ollamaProbe.status === 'fulfilled') {
+    services.push({ category: 'AI Models', name: 'Ollama', status: 'down', role: 'Local LLM runtime', detail: 'Server error' });
+  } else {
+    if (deviceWithOllama) {
+      services.push({ category: 'AI Models', name: 'Ollama', status: 'up',
+        role: 'Local LLM runtime · embeddings',
+        detail: `Running on ${deviceWithOllama.name}`,
+        deviceName: deviceWithOllama.name });
+    } else {
+      services.push({ category: 'AI Models', name: 'Ollama', status: 'down', role: 'Local LLM runtime · embeddings', detail: 'Not running · offline features unavailable' });
+    }
+  }
+
+  // Cerebras — check via a settings key or just show config status
+  const cerebrasKey = get(`SELECT value FROM settings WHERE key = 'cerebras_api_key'`);
+  const aiModel = get(`SELECT value FROM settings WHERE key = 'ai_model'`);
+  const usingCerebras = aiModel?.value?.startsWith('cerebras:');
+  const cerebrasModel = aiModel?.value?.replace('cerebras:', '') || '';
+  const cerebrasCalls = usageRows.filter(r => r.model?.includes('cerebras') || r.caller === 'router').reduce((s, r) => s + r.calls, 0);
+  services.push({
+    category: 'AI Models', name: 'Cerebras',
+    status: cerebrasKey ? (usingCerebras ? 'up' : 'unknown') : 'unknown',
+    role: 'Voice router · classifies every voice command (~580ms)',
+    detail: usingCerebras
+      ? `Active model · ${cerebrasModel}${cerebrasCalls ? ` · ${cerebrasCalls} calls today` : ''}`
+      : (cerebrasKey ? 'Configured · not current model' : 'No API key · falling back to Claude')
+  });
+
+  // Claude CLI
+  const claudeModel = aiModel?.value;
+  const isClaudeActive = claudeModel && !claudeModel.startsWith('cerebras:') && !claudeModel.startsWith('ollama:');
+  const claudeCalls = usageRows.filter(r => r.caller === 'terminal' || r.caller === 'session').reduce((s, r) => s + r.calls, 0);
+  services.push({
+    category: 'AI Models', name: 'Claude CLI',
+    status: 'up',
+    role: 'Terminal sessions · smart tasks · code · this conversation',
+    detail: isClaudeActive
+      ? `Active model · ${claudeModel}${claudeCalls ? ` · ${claudeCalls} calls today` : ''}`
+      : `Fallback · claude -p subscription${claudeCalls ? ` · ${claudeCalls} calls today` : ''}`
+  });
+
+  // Devices — enrich last_seen from client_logs for devices that log but don't heartbeat
+  const allDevRaw = allScoped(req, `SELECT * FROM devices WHERE org_id = :org_id ORDER BY last_seen DESC`);
+  const recentDevLogs = allScoped(req, `SELECT device_id, MAX(created_at) as last_log FROM client_logs WHERE org_id = :org_id GROUP BY device_id`);
+  const devLogMap = Object.fromEntries(recentDevLogs.map(r => [r.device_id, r.last_log]));
+  const devices = allDevRaw.map(d => {
+    const lastLog = devLogMap[d.hostname];
+    if (lastLog && (!d.last_seen || lastLog > d.last_seen)) return { ...d, last_seen: lastLog };
+    return d;
+  });
+  for (const d of devices) {
+    const ageSec = d.last_seen ? (Date.now() - new Date(d.last_seen).getTime()) / 1000 : Infinity;
+    // PC running this server is ALWAYS online
+    const isThisPC = d.hostname === pcHost || d.device_type === 'pc' && ageSec < 10;
+    const isOnline = isThisPC || ageSec < 120;
+    const ageStr = ageSec < 60 ? `${Math.round(ageSec)}s ago` : ageSec < 3600 ? `${Math.round(ageSec / 60)}m ago` : `${Math.round(ageSec / 3600)}h ago`;
+    services.push({
+      category: 'Devices', name: d.name || d.hostname,
+      hostname: d.hostname, device_type: d.device_type,
+      status: isOnline ? 'up' : 'down',
+      detail: `${d.device_type === 'phone' ? 'Phone' : 'PC'} — last seen ${isThisPC ? '0s ago' : ageStr}`
+    });
+  }
+
+  // Annotate services with the device that runs them
+  const hubDevice = devices.find(d => d.hostname?.toLowerCase() === pcHost.toLowerCase());
+  const hubName = hubDevice?.name || pcHost;
+  const ollamaUrl = getOllamaUrl();
+  const ollamaIsLocal = /localhost|127\.0\.0\.1/.test(ollamaUrl);
+  let ollamaDeviceName = ollamaIsLocal ? hubName : null;
+  let ollamaDeviceHost = ollamaIsLocal ? pcHost : null;
+  if (!ollamaIsLocal) {
+    try {
+      const u = new URL(ollamaUrl);
+      const urlHost = u.hostname.toLowerCase();
+      const match = devices.find(d =>
+        d.hostname?.toLowerCase() === urlHost || d.tailscale_hostname?.toLowerCase() === urlHost
+      );
+      ollamaDeviceName = match?.name || urlHost;
+      ollamaDeviceHost = match?.hostname || urlHost;
+    } catch {}
+  }
+  for (const s of services) {
+    if (s.category === 'Devices') continue;
+    if (s.category === 'Phoenix Core') {
+      s.device = pcHost; s.deviceName = hubName;
+    } else if (s.category === 'AI Models') {
+      if (s.name === 'Whisper STT' || s.name === 'Claude CLI') {
+        s.device = pcHost; s.deviceName = hubName;
+      } else if (s.name === 'Ollama' || s.detail?.startsWith('Ollama local')) {
+        s.device = ollamaDeviceHost; s.deviceName = ollamaDeviceName;
+      }
+      // Cerebras / Claude API = remote cloud, no device
+    }
+  }
+
+    return { services, issues };
+  })();
+
+  _servicesInflight.set(orgKey, runner);
+  try {
+    const body = await runner;
+    _servicesCache.set(orgKey, { ts: Date.now(), body });
+    res.json(body);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  } finally {
+    _servicesInflight.delete(orgKey);
+  }
+});
+
+// GET /dashboard/api/sessions
+router.get('/api/sessions', (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+  const sessions = allScoped(req, `SELECT * FROM sessions WHERE org_id = :org_id ORDER BY started_at DESC LIMIT :limit`, { ':limit': limit });
+  res.json(sessions);
+});
+
+// DELETE /dashboard/api/events/:id
+router.delete('/api/events/:id', (req, res, next) => {
+  const id = parseInt(req.params.id);
+  if (!id) return next(); // non-numeric (e.g. "bulk") — fall through to /api/events/bulk
+
+  const existing = getScoped(req, `SELECT id FROM events WHERE id = :id AND org_id = :org_id`, { ':id': id });
+  if (!existing) return res.status(404).json({ error: 'not found' });
+
+  runScoped(req, `DELETE FROM events WHERE id = :id AND org_id = :org_id`, { ':id': id });
+  res.json({ ok: true, deleted: id });
+});
+
+// DELETE /dashboard/api/events/bulk?type=X&date=X&q=search — bulk delete matching events
+router.delete('/api/events/bulk', (req, res) => {
+  if (req.query.confirm !== 'yes') return res.status(400).json({ error: 'missing confirm' });
+
+  let where = ['org_id = :org_id'];
+  let params = {};
+  if (req.query.type) { where.push("event_type = :type"); params[':type'] = req.query.type; }
+  if (req.query.date) { where.push("date(created_at) = :date"); params[':date'] = req.query.date; }
+  if (req.query.q) { where.push("data LIKE :q"); params[':q'] = `%${req.query.q}%`; }
+
+  if (where.length <= 1) return res.status(400).json({ error: 'no filters specified' });
+
+  const whereClause = `WHERE ${where.join(' AND ')}`;
+  const count = getScoped(req, `SELECT COUNT(*) as count FROM events ${whereClause}`, params);
+  runScoped(req, `DELETE FROM events ${whereClause}`, params);
+  res.json({ ok: true, deleted_count: count?.count || 0 });
+});
+
+// DELETE /dashboard/api/events/day/:date
+router.delete('/api/events/day/:date', (req, res) => {
+  const date = req.params.date;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return res.status(400).json({ error: 'invalid date format, use YYYY-MM-DD' });
+  }
+
+  const count = getScoped(req, `SELECT COUNT(*) as count FROM events WHERE date(created_at) = :date AND org_id = :org_id`, { ':date': date });
+  runScoped(req, `DELETE FROM events WHERE date(created_at) = :date AND org_id = :org_id`, { ':date': date });
+  res.json({ ok: true, deleted_count: count?.count || 0, date });
+});
+
+// POST /dashboard/api/memory/cleanup — nuke all old memory_items (state file replaces them)
+router.post('/api/memory/cleanup', (req, res) => {
+  const before = getScoped(req, `SELECT COUNT(*) as count FROM memory_items WHERE org_id = :org_id`);
+  // Keep only 'processed' markers (used by classifier to track which events were seen)
+  const result = runScoped(req, `DELETE FROM memory_items WHERE item_type != 'processed' AND org_id = :org_id`);
+  const remaining = getScoped(req, `SELECT COUNT(*) as count FROM memory_items WHERE org_id = :org_id`);
+  res.json({ ok: true, deleted: result?.changes || 0, before: before?.count || 0, remaining: remaining?.count || 0 });
+});
+
+// DELETE /dashboard/api/memory/:id
+router.delete('/api/memory/:id', (req, res) => {
+  const id = parseInt(req.params.id);
+  if (!id) return res.status(400).json({ error: 'invalid id' });
+
+  const existing = getScoped(req, `SELECT id FROM memory_items WHERE id = :id AND org_id = :org_id`, { ':id': id });
+  if (!existing) return res.status(404).json({ error: 'not found' });
+
+  runScoped(req, `DELETE FROM memory_items WHERE id = :id AND org_id = :org_id`, { ':id': id });
+  res.json({ ok: true, deleted: id });
+});
+
+// DELETE /dashboard/api/all?confirm=yes
+router.delete('/api/all', (req, res) => {
+  if (req.query.confirm !== 'yes') {
+    return res.status(400).json({ error: 'must pass ?confirm=yes' });
+  }
+
+  runScoped(req, `DELETE FROM events WHERE org_id = :org_id`);
+  runScoped(req, `DELETE FROM memory_items WHERE org_id = :org_id`);
+  runScoped(req, `DELETE FROM sessions WHERE org_id = :org_id`);
+  runScoped(req, `DELETE FROM command_queue WHERE org_id = :org_id`);
+  runScoped(req, `DELETE FROM command_logs WHERE org_id = :org_id`);
+
+  res.json({ ok: true, message: 'all data deleted' });
+});
+
+// GET /dashboard/api/scout — list discovered tools
+router.get('/api/scout', (req, res) => {
+  const status = req.query.status || 'new';
+  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+  const findings = getFindings({ status, limit });
+  res.json({ findings, total: findings.length });
+});
+
+// POST /dashboard/api/scout/scan — trigger an immediate scan
+router.post('/api/scout/scan', async (req, res) => {
+  try {
+    const count = await scout();
+    res.json({ ok: true, new_findings: count });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /dashboard/api/scout/:id/status — update finding status
+router.post('/api/scout/:id/status', (req, res) => {
+  const { status } = req.body;
+  if (!['new', 'reviewed', 'integrated', 'dismissed', 'approved'].includes(status)) {
+    return res.status(400).json({ error: 'invalid status' });
+  }
+  updateFinding(parseInt(req.params.id), status);
+  res.json({ ok: true });
+});
+
+// PATCH /dashboard/api/scout/:id — update finding (status, etc.)
+router.patch('/api/scout/:id', (req, res) => {
+  const { status } = req.body;
+  if (status) {
+    updateFinding(parseInt(req.params.id), status);
+  }
+  res.json({ ok: true });
+});
+
+// GET /dashboard/api/progress — project progress for WezTerm sidebar
+// Returns all projects with milestone/task completion percentages
+// Cached for 10s to avoid N×M query storm on every sidebar refresh
+let _progressCache = null;
+let _progressCacheTime = 0;
+router.get('/api/progress', (req, res) => {
+  const now = Date.now();
+  if (_progressCache && (now - _progressCacheTime) < 10000) {
+    return res.json(_progressCache);
+  }
+  const projects = allScoped(req, "SELECT * FROM projects WHERE org_id = :org_id ORDER BY name");
+
+  const result = projects.map(p => {
+    // Get milestones for this project
+    const milestones = allScoped(req,
+      "SELECT * FROM project_milestones WHERE project_id = :pid AND org_id = :org_id ORDER BY sort_order, name",
+      { ':pid': p.id }
+    );
+
+    // Get task counts per milestone and overall
+    const totalTasks = getScoped(req,
+      "SELECT COUNT(*) as total, SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) as done, SUM(CASE WHEN status IN ('in_progress','in_test') THEN 1 ELSE 0 END) as in_progress FROM project_tasks WHERE project_id = :pid AND org_id = :org_id",
+      { ':pid': p.id }
+    );
+
+    const milestonesWithProgress = milestones.map(m => {
+      const mTasks = getScoped(req,
+        "SELECT COUNT(*) as total, SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) as done, SUM(CASE WHEN status IN ('in_progress','in_test') THEN 1 ELSE 0 END) as in_progress FROM project_tasks WHERE milestone_id = :mid AND org_id = :org_id",
+        { ':mid': m.id }
+      );
+      const total = mTasks?.total || 0;
+      const done = mTasks?.done || 0;
+      const inProgress = mTasks?.in_progress || 0;
+      return {
+        id: m.id,
+        name: m.name,
+        description: m.description,
+        total,
+        done,
+        in_progress: inProgress,
+        percentage: total > 0 ? Math.round((done + inProgress * 0.5) / total * 100) : 0,
+      };
+    });
+
+    // Uncategorized tasks (no milestone)
+    const uncategorized = getScoped(req,
+      "SELECT COUNT(*) as total, SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) as done, SUM(CASE WHEN status IN ('in_progress','in_test') THEN 1 ELSE 0 END) as in_progress FROM project_tasks WHERE project_id = :pid AND milestone_id IS NULL AND org_id = :org_id",
+      { ':pid': p.id }
+    );
+
+    const total = totalTasks?.total || 0;
+    const done = totalTasks?.done || 0;
+    const inProgress = totalTasks?.in_progress || 0;
+
+    // Session count for activity
+    const sessionCount = getScoped(req, "SELECT COUNT(*) as c FROM sessions WHERE project_id = :pid AND org_id = :org_id", { ':pid': p.id });
+
+    return {
+      id: p.id,
+      name: p.name,
+      path: p.path,
+      description: p.description,
+      classification: p.classification,
+      total_tasks: total,
+      done_tasks: done,
+      in_progress_tasks: inProgress,
+      percentage: total > 0 ? Math.round((done + inProgress * 0.5) / total * 100) : 0,
+      milestones: milestonesWithProgress,
+      uncategorized_tasks: uncategorized?.total || 0,
+      session_count: sessionCount?.c || 0,
+    };
+  });
+
+  // Activity stats
+  const totalEvents = getScoped(req, "SELECT COUNT(*) as c FROM events WHERE org_id = :org_id")?.c || 0;
+  const deviceCount = getScoped(req, "SELECT COUNT(*) as c FROM devices WHERE org_id = :org_id")?.c || 0;
+
+  const response = {
+    projects: result,
+    activity: { total_events: totalEvents, devices: deviceCount },
+    timestamp: new Date().toISOString(),
+  };
+  _progressCache = response;
+  _progressCacheTime = Date.now();
+  res.json(response);
+});
+
+// GET /dashboard/api/projects/:id/tasks — all tasks for a project
+router.get('/api/projects/:id/tasks', (req, res) => {
+  const pid = parseInt(req.params.id);
+  const milestones = allScoped(req,
+    "SELECT * FROM project_milestones WHERE project_id = :pid AND org_id = :org_id ORDER BY sort_order, name",
+    { ':pid': pid }
+  );
+  const tasks = allScoped(req,
+    `SELECT t.*, u.display_name as assigned_name
+     FROM project_tasks t
+     LEFT JOIN users u ON t.assigned_to = u.id
+     WHERE t.project_id = :pid AND t.org_id = :org_id
+     ORDER BY t.milestone_id, t.sort_order, t.title`,
+    { ':pid': pid }
+  );
+  // Also return team members for assignment dropdowns
+  const project = getScoped(req, "SELECT team_id FROM projects WHERE id = :pid AND org_id = :org_id", { ':pid': pid });
+  let members = [];
+  if (project?.team_id) {
+    members = allScoped(req,
+      `SELECT u.id, u.display_name, u.email, tm.role as team_role
+       FROM team_members tm JOIN users u ON tm.user_id = u.id
+       WHERE tm.team_id = :tid`,
+      { ':tid': project.team_id }
+    );
+  }
+  // Fallback: return all users in the org if no team assigned
+  if (members.length === 0) {
+    members = allScoped(req,
+      `SELECT u.id, u.display_name, u.email
+       FROM memberships m JOIN users u ON m.user_id = u.id
+       WHERE m.org_id = :org_id`,
+      {}
+    );
+  }
+  res.json({ milestones, tasks, members, team_id: project?.team_id || null });
+});
+
+// PUT /dashboard/api/projects/:id/team — assign team to project
+router.put('/api/projects/:id/team', (req, res) => {
+  const pid = parseInt(req.params.id);
+  const { team_id } = req.body;
+  try {
+    runScoped(req,
+      "UPDATE projects SET team_id = :tid WHERE id = :pid AND org_id = :org_id",
+      { ':tid': team_id || null, ':pid': pid }
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /dashboard/api/projects/:id/milestones — create a milestone
+router.post('/api/projects/:id/milestones', (req, res) => {
+  const pid = parseInt(req.params.id);
+  const { name, description } = req.body;
+  if (!name) return res.status(400).json({ error: 'name required' });
+  const maxOrder = getScoped(req, "SELECT MAX(sort_order) as m FROM project_milestones WHERE project_id = :pid AND org_id = :org_id", { ':pid': pid });
+  const id = insertScoped(req,
+    "INSERT INTO project_milestones (project_id, name, description, sort_order, org_id) VALUES (:pid, :name, :desc, :order, :org_id)",
+    { ':pid': pid, ':name': name, ':desc': description || null, ':order': (maxOrder?.m || 0) + 1 }
+  );
+  res.json({ id, name });
+});
+
+// POST /dashboard/api/projects/:id/tasks — create a task
+router.post('/api/projects/:id/tasks', (req, res) => {
+  const pid = parseInt(req.params.id);
+  const { title, description, milestone_id, status, priority, type, assigned_to } = req.body;
+  if (!title) return res.status(400).json({ error: 'title required' });
+  const maxOrder = getScoped(req, "SELECT MAX(sort_order) as m FROM project_tasks WHERE project_id = :pid AND org_id = :org_id", { ':pid': pid });
+  const id = insertScoped(req,
+    "INSERT INTO project_tasks (project_id, milestone_id, title, description, status, priority, type, assigned_to, sort_order, org_id) VALUES (:pid, :mid, :title, :desc, :status, :pri, :type, :assign, :order, :org_id)",
+    {
+      ':pid': pid,
+      ':mid': milestone_id || null,
+      ':title': title,
+      ':desc': description || null,
+      ':status': status || 'todo',
+      ':pri': priority || 0,
+      ':type': type || 'task',
+      ':assign': assigned_to || null,
+      ':order': (maxOrder?.m || 0) + 1,
+    }
+  );
+  res.json({ id, title, status: status || 'todo', type: type || 'task' });
+});
+
+// PUT /dashboard/api/tasks/:id — update a task (status, title, etc.)
+router.put('/api/tasks/:id', (req, res) => {
+  const id = parseInt(req.params.id);
+  const { title, description, status, priority, milestone_id } = req.body;
+  const existing = getScoped(req, "SELECT * FROM project_tasks WHERE id = :id AND org_id = :org_id", { ':id': id });
+  if (!existing) return res.status(404).json({ error: 'not found' });
+
+  const updates = [];
+  const params = { ':id': id };
+
+  if (title !== undefined) { updates.push("title = :title"); params[':title'] = title; }
+  if (description !== undefined) { updates.push("description = :desc"); params[':desc'] = description; }
+  if (status !== undefined) {
+    updates.push("status = :status");
+    params[':status'] = status;
+    if (status === 'done' && existing.status !== 'done') {
+      updates.push("completed_at = datetime('now','localtime')");
+    }
+    if (status !== 'done') {
+      updates.push("completed_at = NULL");
+    }
+  }
+  if (priority !== undefined) { updates.push("priority = :pri"); params[':pri'] = priority; }
+  if (milestone_id !== undefined) { updates.push("milestone_id = :mid"); params[':mid'] = milestone_id; }
+  if (req.body.sort_order !== undefined) { updates.push("sort_order = :sort"); params[':sort'] = req.body.sort_order; }
+  if (req.body.type !== undefined) { updates.push("type = :type"); params[':type'] = req.body.type; }
+  if (req.body.assigned_to !== undefined) { updates.push("assigned_to = :assign"); params[':assign'] = req.body.assigned_to || null; }
+
+  if (updates.length === 0) return res.json({ ok: true, unchanged: true });
+
+  runScoped(req, `UPDATE project_tasks SET ${updates.join(', ')} WHERE id = :id AND org_id = :org_id`, params);
+
+  // Notify on status transitions involving in_test
+  if (status !== undefined && status !== existing.status) {
+    try {
+      if (status === 'in_test') {
+        phoenixNotify('Phoenix · ⚡', `🧪 Task #${id} is now being tested: ${existing.title}`,
+          `Task #${id} moved to in_test.\nTitle: ${existing.title}`,
+          { severity: 'info', metadata: { task_id: id } });
+      } else if (status === 'done' && existing.status === 'in_test') {
+        phoenixNotify('Phoenix · ⚡', `✅ Task #${id} passed tests and closed: ${existing.title}`,
+          `Task #${id} passed tests and was closed.\nTitle: ${existing.title}`,
+          { severity: 'info', metadata: { task_id: id } });
+      }
+    } catch (err) {
+      console.warn('[tasks] phoenixNotify failed:', err.message);
+    }
+  }
+
+  res.json({ ok: true });
+});
+
+// DELETE /dashboard/api/tasks/:id
+router.delete('/api/tasks/:id', (req, res) => {
+  const id = parseInt(req.params.id);
+  runScoped(req, "DELETE FROM project_tasks WHERE id = :id AND org_id = :org_id", { ':id': id });
+  res.json({ ok: true });
+});
+
+// DELETE /dashboard/api/milestones/:id — also deletes child tasks
+router.delete('/api/milestones/:id', (req, res) => {
+  const id = parseInt(req.params.id);
+  runScoped(req, "DELETE FROM project_tasks WHERE milestone_id = :id AND org_id = :org_id", { ':id': id });
+  runScoped(req, "DELETE FROM project_milestones WHERE id = :id AND org_id = :org_id", { ':id': id });
+  res.json({ ok: true });
+});
+
+// PUT /dashboard/api/tasks/reorder — batch update sort_order + status (for Kanban drag-drop)
+router.put('/api/tasks/reorder', (req, res) => {
+  const { tasks } = req.body; // [{ id, status, sort_order }]
+  if (!Array.isArray(tasks)) return res.status(400).json({ error: 'tasks array required' });
+  for (const t of tasks) {
+    const existing = getScoped(req, "SELECT * FROM project_tasks WHERE id = :id AND org_id = :org_id", { ':id': t.id });
+    if (!existing) continue;
+    const updates = ["sort_order = :sort"];
+    const params = { ':id': t.id, ':sort': t.sort_order ?? 0 };
+    if (t.status !== undefined) {
+      updates.push("status = :status");
+      params[':status'] = t.status;
+      if (t.status === 'done' && existing.status !== 'done') updates.push("completed_at = datetime('now','localtime')");
+      if (t.status !== 'done') updates.push("completed_at = NULL");
+    }
+    runScoped(req, `UPDATE project_tasks SET ${updates.join(', ')} WHERE id = :id AND org_id = :org_id`, params);
+    // Notify on in_test / done-from-in_test transitions (Kanban drag-drop)
+    if (t.status !== undefined && t.status !== existing.status) {
+      try {
+        if (t.status === 'in_test') {
+          phoenixNotify('Phoenix · ⚡', `🧪 Task #${t.id} is now being tested: ${existing.title}`,
+            `Task #${t.id} moved to in_test.\nTitle: ${existing.title}`,
+            { severity: 'info', metadata: { task_id: t.id } });
+        } else if (t.status === 'done' && existing.status === 'in_test') {
+          phoenixNotify('Phoenix · ⚡', `✅ Task #${t.id} passed tests and closed: ${existing.title}`,
+            `Task #${t.id} passed tests and was closed.\nTitle: ${existing.title}`,
+            { severity: 'info', metadata: { task_id: t.id } });
+        }
+      } catch (err) {
+        console.warn('[tasks/reorder] phoenixNotify failed:', err.message);
+      }
+    }
+  }
+  res.json({ ok: true, updated: tasks.length });
+});
+
+// POST /dashboard/api/projects/:id/bulk-tasks — create multiple tasks at once
+// Body: { milestone_name: "...", tasks: ["task1", "task2", ...] }
+router.post('/api/projects/:id/bulk-tasks', (req, res) => {
+  const pid = parseInt(req.params.id);
+  const { milestone_name, tasks } = req.body;
+  if (!tasks || !Array.isArray(tasks)) return res.status(400).json({ error: 'tasks array required' });
+
+  let milestoneId = null;
+  if (milestone_name) {
+    // Find or create milestone
+    const existing = getScoped(req,
+      "SELECT id FROM project_milestones WHERE project_id = :pid AND name = :name AND org_id = :org_id",
+      { ':pid': pid, ':name': milestone_name }
+    );
+    if (existing) {
+      milestoneId = existing.id;
+    } else {
+      const maxOrder = getScoped(req, "SELECT MAX(sort_order) as m FROM project_milestones WHERE project_id = :pid AND org_id = :org_id", { ':pid': pid });
+      milestoneId = insertScoped(req,
+        "INSERT INTO project_milestones (project_id, name, sort_order, org_id) VALUES (:pid, :name, :order, :org_id)",
+        { ':pid': pid, ':name': milestone_name, ':order': (maxOrder?.m || 0) + 1 }
+      );
+    }
+  }
+
+  let created = 0;
+  for (const task of tasks) {
+    const title = typeof task === 'string' ? task : task.title;
+    const status = (typeof task === 'object' && task.status) || 'todo';
+    if (!title) continue;
+    insertScoped(req,
+      "INSERT INTO project_tasks (project_id, milestone_id, title, status, sort_order, org_id) VALUES (:pid, :mid, :title, :status, :order, :org_id)",
+      { ':pid': pid, ':mid': milestoneId, ':title': title, ':status': status, ':order': created }
+    );
+    created++;
+  }
+  res.json({ ok: true, created, milestone_id: milestoneId });
+});
+
+// PUT /dashboard/api/projects/:id/bulk-tasks — bulk update/upsert tasks
+// Body: { tasks: [{ id?, title, status, milestone_name?, priority? }] }
+router.put('/api/projects/:id/bulk-tasks', (req, res) => {
+  const pid = parseInt(req.params.id);
+  const { tasks } = req.body;
+  if (!tasks || !Array.isArray(tasks)) return res.status(400).json({ error: 'tasks array required' });
+
+  let updated = 0, created = 0;
+  for (const task of tasks) {
+    if (task.id) {
+      // Update existing
+      const sets = [];
+      const params = { ':id': task.id };
+      if (task.title) { sets.push('title = :title'); params[':title'] = task.title; }
+      if (task.status) { sets.push('status = :status'); params[':status'] = task.status; }
+      if (task.priority != null) { sets.push('priority = :priority'); params[':priority'] = task.priority; }
+      if (sets.length > 0) {
+        runScoped(req, `UPDATE project_tasks SET ${sets.join(', ')} WHERE id = :id AND org_id = :org_id`, params);
+        updated++;
+      }
+    } else if (task.title) {
+      // Create new — find/create milestone if specified
+      let mid = task.milestone_id || null;
+      if (!mid && task.milestone_name) {
+        const existing = getScoped(req, "SELECT id FROM project_milestones WHERE project_id = :pid AND name = :name AND org_id = :org_id",
+          { ':pid': pid, ':name': task.milestone_name });
+        if (existing) mid = existing.id;
+        else mid = insertScoped(req, "INSERT INTO project_milestones (project_id, name, org_id) VALUES (:pid, :name, :org_id)",
+          { ':pid': pid, ':name': task.milestone_name });
+      }
+      insertScoped(req, "INSERT INTO project_tasks (project_id, milestone_id, title, status, priority, org_id) VALUES (:pid, :mid, :title, :status, :pri, :org_id)",
+        { ':pid': pid, ':mid': mid, ':title': task.title, ':status': task.status || 'todo', ':pri': task.priority || 0 });
+      created++;
+    }
+  }
+  res.json({ ok: true, updated, created });
+});
+
+// DELETE /dashboard/api/projects/:id/all-tasks — delete all tasks (and optionally milestones) for a project
+router.delete('/api/projects/:id/all-tasks', (req, res) => {
+  const pid = parseInt(req.params.id);
+  const deleteMilestones = req.query.milestones === 'true';
+  const taskCount = getScoped(req, "SELECT COUNT(*) as c FROM project_tasks WHERE project_id = :pid AND org_id = :org_id", { ':pid': pid });
+  runScoped(req, "DELETE FROM project_tasks WHERE project_id = :pid AND org_id = :org_id", { ':pid': pid });
+  if (deleteMilestones) {
+    runScoped(req, "DELETE FROM project_milestones WHERE project_id = :pid AND org_id = :org_id", { ':pid': pid });
+  }
+  res.json({ ok: true, deleted: taskCount?.c || 0, milestones_deleted: deleteMilestones });
+});
+
+// DELETE /dashboard/api/projects/:id — unlink a project from Phoenix (removes DB records + .phoenix file, does NOT delete project files)
+router.delete('/api/projects/:id', (req, res) => {
+  const pid = parseInt(req.params.id);
+  const proj = getScoped(req, "SELECT * FROM projects WHERE id = :pid AND org_id = :org_id", { ':pid': pid });
+  if (!proj) return res.status(404).json({ error: 'Project not found' });
+
+  // Remove all Phoenix data for this project (nullify session links, don't delete history)
+  runScoped(req, "UPDATE sessions SET project_id = NULL WHERE project_id = :pid AND org_id = :org_id", { ':pid': pid });
+  runScoped(req, "DELETE FROM section_items WHERE project_id = :pid AND org_id = :org_id", { ':pid': pid });
+  runScoped(req, "DELETE FROM project_tasks WHERE project_id = :pid AND org_id = :org_id", { ':pid': pid });
+  runScoped(req, "DELETE FROM project_milestones WHERE project_id = :pid AND org_id = :org_id", { ':pid': pid });
+  runScoped(req, "DELETE FROM project_sections WHERE project_id = :pid AND org_id = :org_id", { ':pid': pid });
+  runScoped(req, "DELETE FROM open_tabs WHERE project_id = :pid AND org_id = :org_id", { ':pid': pid });
+  runScoped(req, "DELETE FROM projects WHERE id = :pid AND org_id = :org_id", { ':pid': pid });
+
+  // Remove .phoenix file so sync doesn't re-add it
+  try {
+    const phoenixFile = join(proj.path, '.phoenix');
+    if (existsSync(phoenixFile)) unlinkSync(phoenixFile);
+  } catch (e) {
+    console.log(`[Phoenix] Could not remove .phoenix file: ${e.message}`);
+  }
+
+  console.log(`[Phoenix] Unlinked project: ${proj.name} (${proj.path})`);
+  res.json({ ok: true, name: proj.name });
+});
+
+// GET /dashboard/api/tasks/search — search tasks across all projects
+router.get('/api/tasks/search', (req, res) => {
+  const q = req.query.q || '';
+  const status = req.query.status || null;
+  let where = ['t.org_id = :org_id'];
+  let params = {};
+  if (q) { where.push('t.title LIKE :q'); params[':q'] = `%${q}%`; }
+  if (status) { where.push('t.status = :status'); params[':status'] = status; }
+  const tasks = allScoped(req, `SELECT t.*, p.name as project_name, m.name as milestone_name
+    FROM project_tasks t
+    JOIN projects p ON p.id = t.project_id
+    LEFT JOIN project_milestones m ON m.id = t.milestone_id
+    WHERE ${where.join(' AND ')}
+    ORDER BY t.priority DESC, t.created_at DESC
+    LIMIT 100`, params);
+  res.json(tasks);
+});
+
+// POST /dashboard/api/open-tabs — save all open tabs (upsert, mark missing as closed)
+router.post('/api/open-tabs', (req, res) => {
+  const { tabs } = req.body;
+  if (!tabs || !Array.isArray(tabs)) return res.status(400).json({ error: 'tabs array required' });
+
+  const openIds = tabs.filter(t => t.session_id).map(t => t.session_id);
+
+  // Mark tabs not in the list as closed (instead of deleting)
+  if (openIds.length > 0) {
+    const params = {};
+    const placeholders = openIds.map((id, i) => { params[`:s${i}`] = id; return `:s${i}`; }).join(',');
+    runScoped(req, `UPDATE open_tabs SET closed_at = datetime('now','localtime') WHERE session_id NOT IN (${placeholders}) AND closed_at IS NULL AND org_id = :org_id`, params);
+  } else {
+    runScoped(req, "UPDATE open_tabs SET closed_at = datetime('now','localtime') WHERE closed_at IS NULL AND org_id = :org_id");
+  }
+
+  // Upsert each open tab — reuse closed tabs with same name+project instead of creating duplicates
+  for (let i = 0; i < tabs.length; i++) {
+    const tab = tabs[i];
+    if (!tab.session_id) continue;
+    const existing = getScoped(req, "SELECT id FROM open_tabs WHERE session_id = :sid AND org_id = :org_id", { ':sid': tab.session_id });
+    if (existing) {
+      // Merge claude_session_ids: union of existing DB value + incoming, so the
+      // frontend (which often doesn't track Claude UUIDs) can't wipe what the
+      // server-side watchdog discovered. Source of truth is whatever has data.
+      let mergedCsids;
+      try {
+        const dbRow = getScoped(req, "SELECT claude_session_ids FROM open_tabs WHERE session_id = :sid AND org_id = :org_id", { ':sid': tab.session_id });
+        const dbArr = JSON.parse(dbRow?.claude_session_ids || '[]');
+        const incomingRaw = tab.claude_session_ids;
+        const incomingArr = Array.isArray(incomingRaw)
+          ? incomingRaw
+          : (typeof incomingRaw === 'string' ? JSON.parse(incomingRaw || '[]') : []);
+        mergedCsids = JSON.stringify(Array.from(new Set([...dbArr, ...incomingArr])));
+      } catch {
+        mergedCsids = (typeof tab.claude_session_ids === 'string') ? tab.claude_session_ids : JSON.stringify(tab.claude_session_ids || []);
+      }
+      runScoped(req,
+        `UPDATE open_tabs SET tab_name = :name, project_id = :pid, cwd = :cwd, tab_index = :idx,
+         claude_session_ids = :csids, closed_at = NULL, last_active = datetime('now','localtime')
+         WHERE session_id = :sid AND org_id = :org_id`,
+        { ':sid': tab.session_id, ':name': tab.tab_name || '', ':pid': tab.project_id || null,
+          ':cwd': tab.cwd || null, ':idx': i, ':csids': mergedCsids }
+      );
+    } else {
+      // Check for a closed tab with the same name+project — reuse it instead of creating a duplicate
+      const closedDupe = tab.project_id
+        ? getScoped(req, "SELECT id FROM open_tabs WHERE tab_name = :name AND project_id = :pid AND closed_at IS NOT NULL AND org_id = :org_id ORDER BY last_active DESC LIMIT 1",
+            { ':name': tab.tab_name || '', ':pid': tab.project_id })
+        : null;
+      if (closedDupe) {
+        // Reuse the closed row: update session_id and reopen
+        runScoped(req,
+          `UPDATE open_tabs SET session_id = :sid, tab_name = :name, project_id = :pid, cwd = :cwd, tab_index = :idx,
+           claude_session_ids = :csids, closed_at = NULL, last_active = datetime('now','localtime')
+           WHERE id = :id AND org_id = :org_id`,
+          { ':id': closedDupe.id, ':sid': tab.session_id, ':name': tab.tab_name || '', ':pid': tab.project_id || null,
+            ':cwd': tab.cwd || null, ':idx': i, ':csids': tab.claude_session_ids || '[]' }
+        );
+        // Purge any other closed duplicates with same name+project
+        runScoped(req, "DELETE FROM open_tabs WHERE tab_name = :name AND project_id = :pid AND closed_at IS NOT NULL AND org_id = :org_id",
+          { ':name': tab.tab_name || '', ':pid': tab.project_id });
+      } else {
+        insertScoped(req,
+          `INSERT INTO open_tabs (session_id, tab_name, project_id, cwd, tab_index, claude_session_ids, org_id)
+           VALUES (:sid, :name, :pid, :cwd, :idx, :csids, :org_id)`,
+          { ':sid': tab.session_id, ':name': tab.tab_name || '', ':pid': tab.project_id || null,
+            ':cwd': tab.cwd || null, ':idx': i, ':csids': tab.claude_session_ids || '[]' }
+        );
+      }
+    }
+  }
+  res.json({ ok: true, saved: tabs.length });
+});
+
+// PUT /dashboard/api/open-tabs/:sessionId — upsert a single tab (create or update)
+router.put('/api/open-tabs/:sessionId', (req, res) => {
+  const sessionId = req.params.sessionId;
+  const { tab_name, project_id, cwd, tab_index, claude_session_ids } = req.body;
+  const existing = getScoped(req, "SELECT * FROM open_tabs WHERE session_id = :sid AND org_id = :org_id", { ':sid': sessionId });
+  if (existing) {
+    const updates = [];
+    const params = { ':sid': sessionId };
+    if (tab_name !== undefined) { updates.push("tab_name = :name"); params[':name'] = tab_name; }
+    if (project_id !== undefined) { updates.push("project_id = :pid"); params[':pid'] = project_id; }
+    if (cwd !== undefined) { updates.push("cwd = :cwd"); params[':cwd'] = cwd; }
+    if (tab_index !== undefined) { updates.push("tab_index = :idx"); params[':idx'] = tab_index; }
+    if (claude_session_ids !== undefined) {
+      // Merge with existing DB value so callers who only know a partial list
+      // (e.g. frontend sending []) can't wipe server-discovered UUIDs.
+      let dbArr = [];
+      try { dbArr = JSON.parse(existing.claude_session_ids || '[]'); } catch {}
+      const incomingArr = Array.isArray(claude_session_ids)
+        ? claude_session_ids
+        : (typeof claude_session_ids === 'string' ? (() => { try { return JSON.parse(claude_session_ids); } catch { return []; } })() : []);
+      const merged = Array.from(new Set([...dbArr, ...incomingArr]));
+      updates.push("claude_session_ids = :csids");
+      params[':csids'] = JSON.stringify(merged);
+    }
+    updates.push("last_active = datetime('now','localtime')");
+    if (updates.length > 0) runScoped(req, `UPDATE open_tabs SET ${updates.join(', ')} WHERE session_id = :sid AND org_id = :org_id`, params);
+    res.json({ ok: true, action: 'updated' });
+  } else {
+    // Check for closed tab with same name+project to reuse
+    const closedDupe = project_id
+      ? getScoped(req, "SELECT id FROM open_tabs WHERE tab_name = :name AND project_id = :pid AND closed_at IS NOT NULL AND org_id = :org_id ORDER BY last_active DESC LIMIT 1",
+          { ':name': tab_name || '', ':pid': project_id })
+      : null;
+    if (closedDupe) {
+      runScoped(req,
+        `UPDATE open_tabs SET session_id = :sid, tab_name = :name, project_id = :pid, cwd = :cwd, tab_index = :idx,
+         claude_session_ids = :csids, closed_at = NULL, last_active = datetime('now','localtime')
+         WHERE id = :id AND org_id = :org_id`,
+        { ':id': closedDupe.id, ':sid': sessionId, ':name': tab_name || '', ':pid': project_id || null,
+          ':cwd': cwd || null, ':idx': tab_index || 0, ':csids': JSON.stringify(claude_session_ids || []) }
+      );
+      runScoped(req, "DELETE FROM open_tabs WHERE tab_name = :name AND project_id = :pid AND closed_at IS NOT NULL AND org_id = :org_id",
+        { ':name': tab_name || '', ':pid': project_id });
+      res.json({ ok: true, action: 'reused' });
+    } else {
+      insertScoped(req,
+        `INSERT INTO open_tabs (session_id, tab_name, project_id, cwd, tab_index, claude_session_ids, org_id)
+         VALUES (:sid, :name, :pid, :cwd, :idx, :csids, :org_id)`,
+        { ':sid': sessionId, ':name': tab_name || '', ':pid': project_id || null, ':cwd': cwd || null,
+          ':idx': tab_index || 0, ':csids': JSON.stringify(claude_session_ids || []) }
+      );
+      res.json({ ok: true, action: 'created' });
+    }
+  }
+});
+
+// PATCH /dashboard/api/open-tabs/:sessionId/rename — rename a tab
+router.patch('/api/open-tabs/:sessionId/rename', (req, res) => {
+  const { name } = req.body;
+  if (name === undefined) return res.status(400).json({ error: 'name required' });
+  runScoped(req, "UPDATE open_tabs SET tab_name = :name, last_active = datetime('now','localtime') WHERE session_id = :sid AND org_id = :org_id",
+    { ':name': name, ':sid': req.params.sessionId });
+  // Rename the per-tab transcript file to match the new tab name
+  try { setSessionName(req.params.sessionId, name); } catch {}
+  res.json({ ok: true });
+});
+
+// DELETE /dashboard/api/open-tabs/:sessionId — mark tab as closed (never delete)
+router.delete('/api/open-tabs/:sessionId', (req, res) => {
+  runScoped(req, "UPDATE open_tabs SET closed_at = datetime('now','localtime') WHERE session_id = :sid AND org_id = :org_id", { ':sid': req.params.sessionId });
+  res.json({ ok: true });
+});
+
+// DELETE /dashboard/api/open-tabs/:id/purge — permanently delete a closed tab
+router.delete('/api/open-tabs/:id/purge', (req, res) => {
+  const id = parseInt(req.params.id);
+  runScoped(req, "DELETE FROM open_tabs WHERE id = :id AND closed_at IS NOT NULL AND org_id = :org_id", { ':id': id });
+  res.json({ ok: true });
+});
+
+// Custom sections per project
+router.get('/api/projects/:id/sections', (req, res) => {
+  const pid = parseInt(req.params.id);
+  const sections = allScoped(req, "SELECT * FROM project_sections WHERE project_id = :pid AND org_id = :org_id ORDER BY sort_order, name", { ':pid': pid });
+  const result = sections.map(s => {
+    const items = allScoped(req, "SELECT * FROM section_items WHERE section_id = :sid AND org_id = :org_id ORDER BY sort_order", { ':sid': s.id });
+    return { ...s, items };
+  });
+  res.json(result);
+});
+
+router.post('/api/projects/:id/sections', (req, res) => {
+  const pid = parseInt(req.params.id);
+  const { name } = req.body;
+  if (!name) return res.status(400).json({ error: 'name required' });
+  const maxOrder = getScoped(req, "SELECT MAX(sort_order) as m FROM project_sections WHERE project_id = :pid AND org_id = :org_id", { ':pid': pid });
+  const id = insertScoped(req,
+    "INSERT INTO project_sections (project_id, name, sort_order, org_id) VALUES (:pid, :name, :order, :org_id)",
+    { ':pid': pid, ':name': name, ':order': (maxOrder?.m || 0) + 1 }
+  );
+  res.json({ id, name });
+});
+
+router.delete('/api/sections/:id', (req, res) => {
+  const id = parseInt(req.params.id);
+  runScoped(req, "DELETE FROM section_items WHERE section_id = :id AND org_id = :org_id", { ':id': id });
+  runScoped(req, "DELETE FROM project_sections WHERE id = :id AND org_id = :org_id", { ':id': id });
+  res.json({ ok: true });
+});
+
+router.post('/api/sections/:id/items', (req, res) => {
+  const sid = parseInt(req.params.id);
+  const section = getScoped(req, "SELECT * FROM project_sections WHERE id = :id AND org_id = :org_id", { ':id': sid });
+  if (!section) return res.status(404).json({ error: 'section not found' });
+  const { content } = req.body;
+  if (!content) return res.status(400).json({ error: 'content required' });
+  const id = insertScoped(req,
+    "INSERT INTO section_items (section_id, project_id, content, org_id) VALUES (:sid, :pid, :content, :org_id)",
+    { ':sid': sid, ':pid': section.project_id, ':content': content }
+  );
+  res.json({ id, content });
+});
+
+router.put('/api/section-items/:id', (req, res) => {
+  const id = parseInt(req.params.id);
+  const { status, content } = req.body;
+  const updates = [];
+  const params = { ':id': id };
+  if (status !== undefined) { updates.push("status = :status"); params[':status'] = status; }
+  if (content !== undefined) { updates.push("content = :content"); params[':content'] = content; }
+  if (updates.length === 0) return res.json({ ok: true });
+  runScoped(req, `UPDATE section_items SET ${updates.join(', ')} WHERE id = :id AND org_id = :org_id`, params);
+  res.json({ ok: true });
+});
+
+router.delete('/api/section-items/:id', (req, res) => {
+  runScoped(req, "DELETE FROM section_items WHERE id = :id AND org_id = :org_id", { ':id': parseInt(req.params.id) });
+  res.json({ ok: true });
+});
+
+// GET /dashboard/api/open-tabs — get all open (not closed) tabs for session restore
+router.get('/api/open-tabs', (req, res) => {
+  const tabs = allScoped(req, `
+    SELECT ot.*, p.name as project_name, p.path as project_path
+    FROM open_tabs ot
+    LEFT JOIN projects p ON p.id = ot.project_id
+    WHERE ot.closed_at IS NULL AND ot.org_id = :org_id
+    ORDER BY ot.tab_index
+  `);
+  res.json(tabs);
+});
+
+// GET /dashboard/api/all-tabs — get ALL tabs (open + closed) for a project
+router.get('/api/all-tabs', (req, res) => {
+  const projectId = req.query.project_id;
+  let tabs;
+  if (projectId) {
+    tabs = allScoped(req, `
+      SELECT ot.*, p.name as project_name, p.path as project_path
+      FROM open_tabs ot
+      LEFT JOIN projects p ON p.id = ot.project_id
+      WHERE ot.project_id = :pid AND ot.org_id = :org_id
+      ORDER BY ot.closed_at IS NULL DESC, ot.last_active DESC
+    `, { ':pid': projectId });
+  } else {
+    tabs = allScoped(req, `
+      SELECT ot.*, p.name as project_name, p.path as project_path
+      FROM open_tabs ot
+      LEFT JOIN projects p ON p.id = ot.project_id
+      WHERE ot.org_id = :org_id
+      ORDER BY ot.closed_at IS NULL DESC, ot.last_active DESC
+    `);
+  }
+  res.json(tabs);
+});
+
+// POST /dashboard/api/open-tabs/:id/reopen — reopen a closed tab
+router.post('/api/open-tabs/:id/reopen', (req, res) => {
+  const id = parseInt(req.params.id);
+  const tab = getScoped(req, "SELECT * FROM open_tabs WHERE id = :id AND org_id = :org_id", { ':id': id });
+  if (!tab) return res.status(404).json({ error: 'tab not found' });
+  runScoped(req, "UPDATE open_tabs SET closed_at = NULL, last_active = datetime('now','localtime') WHERE id = :id AND org_id = :org_id", { ':id': id });
+  res.json({ ok: true, tab });
+});
+
+// ==================== ALERTS ====================
+
+// Alert type registry — single source of truth for all alert types in the system.
+// Every createAlert() call must use a type from this registry.
+// Frontend uses this to populate filter dropdowns and show type metadata.
+const ALERT_TYPES = {
+  orphan_processes:     { label: 'Orphan Processes',     category: 'process',   defaultSeverity: 'warning',  source: 'steward',  description: 'Claude CLI processes detected without a tracked PTY parent' },
+  service_crash:        { label: 'Service Crash',        category: 'service',   defaultSeverity: 'critical', source: 'steward',  description: 'A service failed too many restart cycles and gave up' },
+  uncaught_exception:   { label: 'Uncaught Exception',   category: 'server',    defaultSeverity: 'critical', source: 'server',   description: 'Unhandled JS error caught by process handler' },
+  unhandled_rejection:  { label: 'Unhandled Rejection',  category: 'server',    defaultSeverity: 'warning',  source: 'server',   description: 'Unhandled Promise rejection caught by process handler' },
+  pty_crash:            { label: 'PTY Crash',            category: 'terminal',  defaultSeverity: 'critical', source: 'terminal', description: 'A PTY process exited unexpectedly' },
+  health_check_fail:    { label: 'Health Check Failed',  category: 'service',   defaultSeverity: 'warning',  source: 'steward',  description: 'A service health check failed' },
+  startup_error:        { label: 'Startup Error',        category: 'server',    defaultSeverity: 'critical', source: 'server',   description: 'Error during server boot sequence' },
+  transcript_error:     { label: 'Transcript Error',     category: 'terminal',  defaultSeverity: 'warning',  source: 'terminal', description: 'Transcript read/write or watcher failure' },
+  claude_cli_exit:      { label: 'Claude CLI Exit',      category: 'terminal',  defaultSeverity: 'warning',  source: 'terminal', description: 'Claude CLI process exited inside PTY (shell still alive)' },
+  audit_chain_broken:   { label: 'Audit Chain Broken',   category: 'security',  defaultSeverity: 'critical', source: 'server',   description: 'HMAC audit chain verification failed — potential tampering detected' },
+  context_bloat:        { label: 'Context Bloat',        category: 'usage',     defaultSeverity: 'warning',  source: 'hooks',    description: 'CLAUDE.md or injected context exceeds size threshold — burns tokens every message' },
+  high_burn_rate:       { label: 'High Burn Rate',       category: 'usage',     defaultSeverity: 'warning',  source: 'hooks',    description: 'Session is consuming tokens faster than expected per message' },
+  dashboard_render:     { label: 'Dashboard Render',     category: 'ui',        defaultSeverity: 'warning',  source: 'dashboard-render-health', description: 'A dashboard widget reported state=empty/error/stale for too long (L3 of self-heal stack)' },
+  ai_backend_degraded:  { label: 'AI Backend Degraded',  category: 'service',   defaultSeverity: 'critical', source: 'scout',    description: 'A configured cloud model (e.g. voice reasoning_cloud) is no longer in the provider\'s live model list — retired/404' },
+  vision_failed:        { label: 'Vision Analysis Failed', category: 'service',  defaultSeverity: 'warning',  source: 'vision',   description: 'A user photo got no answer — the mini PC Ollama vision model was unreachable/too slow and no cloud vision fallback (Claude/Gemini) was available' },
+  voice_failed:         { label: 'Voice Turn Failed',     category: 'service',   defaultSeverity: 'warning',  source: 'router',   description: 'A voice/router turn could not be answered — all AI backends (Cerebras → Claude → local Ollama) failed to produce a response' },
+  service_down:         { label: 'Service Down',          category: 'service',   defaultSeverity: 'critical', source: 'steward',  description: 'A monitored service failed its health check and transitioned to DOWN — includes the mini PC Ollama going unreachable, which underlies vision/embeddings/intuition' },
+  memory_critical:      { label: 'Memory Critical',       category: 'resource',  defaultSeverity: 'critical', source: 'server',   description: 'Craft heap exceeded the critical threshold — risk of GC stalls / OOM' },
+  memory_high:          { label: 'Memory High',           category: 'resource',  defaultSeverity: 'warning',  source: 'steward',  description: 'Process RSS is elevated — worth watching before it becomes critical' },
+  memory_warning:       { label: 'Memory Warning',        category: 'resource',  defaultSeverity: 'warning',  source: 'server',   description: 'Craft heap crossed the warning threshold' },
+  client_restart_failed:{ label: 'Client Restart Failed', category: 'service',   defaultSeverity: 'warning',  source: 'client',   description: 'A remote phoenix-client device could not be restarted after going unreachable' },
+  smart_steward:        { label: 'Smart Steward',         category: 'service',   defaultSeverity: 'warning',  source: 'smart-steward', description: 'The Smart Steward flagged a concern about a service or subsystem' },
+};
+
+// GET /dashboard/api/alerts/types — registry of all known alert types (for dropdowns)
+router.get('/api/alerts/types', (req, res) => {
+  const types = Object.entries(ALERT_TYPES).map(([id, meta]) => ({ id, ...meta }));
+  res.json(types);
+});
+
+// GET /dashboard/api/alerts — list alerts (default: open only)
+// Query params: status (open|acknowledged|resolved|dismissed|all), type (alert_type filter), limit
+router.get('/api/alerts', (req, res) => {
+  const status = req.query.status || 'open';
+  const type = req.query.type || null;
+  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+
+  const conditions = ['org_id = :org_id'];
+  const params = {};
+  if (status !== 'all') { conditions.push('status = :status'); params[':status'] = status; }
+  if (type) { conditions.push('alert_type = :type'); params[':type'] = type; }
+
+  const where = `WHERE ${conditions.join(' AND ')}`;
+  const alerts = allScoped(req, `SELECT * FROM alerts ${where} ORDER BY created_at DESC LIMIT ${limit}`, params);
+  res.json(alerts);
+});
+
+// GET /dashboard/api/alerts/count — count open alerts (for badge)
+router.get('/api/alerts/count', (req, res) => {
+  const row = getScoped(req, "SELECT COUNT(*) as count FROM alerts WHERE status = 'open' AND org_id = :org_id");
+  res.json({ count: row?.count || 0 });
+});
+
+// GET /dashboard/api/alerts/:id — single alert detail
+router.get('/api/alerts/:id', (req, res) => {
+  const alert = getScoped(req, "SELECT * FROM alerts WHERE id = :id AND org_id = :org_id", { ':id': parseInt(req.params.id) });
+  if (!alert) return res.status(404).json({ error: 'alert not found' });
+  res.json(alert);
+});
+
+// POST /dashboard/api/alerts — create a new alert
+router.post('/api/alerts', (req, res) => {
+  const { alert_type, severity, title, detail } = req.body;
+  if (!alert_type || !title) return res.status(400).json({ error: 'alert_type and title required' });
+  const id = insertScoped(req,
+    `INSERT INTO alerts (alert_type, severity, title, detail, org_id) VALUES (:type, :sev, :title, :detail, :org_id)`,
+    { ':type': alert_type, ':sev': severity || 'warning', ':title': title, ':detail': detail || '' }
+  );
+  try { broadcastNotification('widget_update', { widget: 'alerts' }); } catch {}
+  res.json({ ok: true, id });
+});
+
+// PATCH /dashboard/api/alerts/:id — update alert status (acknowledge, resolve, dismiss)
+router.patch('/api/alerts/:id', (req, res) => {
+  const id = parseInt(req.params.id);
+  const alert = getScoped(req, "SELECT * FROM alerts WHERE id = :id AND org_id = :org_id", { ':id': id });
+  if (!alert) return res.status(404).json({ error: 'alert not found' });
+
+  const { status, resolution, resolved_by } = req.body;
+  if (!status) return res.status(400).json({ error: 'status required' });
+
+  const validStatuses = ['open', 'acknowledged', 'resolved', 'dismissed'];
+  if (!validStatuses.includes(status)) return res.status(400).json({ error: `status must be one of: ${validStatuses.join(', ')}` });
+
+  const resolvedAt = (status === 'resolved' || status === 'dismissed') ? "datetime('now','localtime')" : 'NULL';
+  runScoped(req,
+    `UPDATE alerts SET status = :status, resolution = :resolution, resolved_by = :resolved_by,
+     updated_at = datetime('now','localtime'), resolved_at = ${resolvedAt} WHERE id = :id AND org_id = :org_id`,
+    { ':id': id, ':status': status, ':resolution': resolution || null, ':resolved_by': resolved_by || 'user' }
+  );
+  try { broadcastNotification('widget_update', { widget: 'alerts' }); } catch {}
+  res.json({ ok: true });
+});
+
+// Helper: create alert from server code (exported for use by steward, terminal, etc.)
+// Uses ALERT_TYPES registry for validation and default severity.
+export function createAlert({ alert_type, severity, title, detail = '', org_id = 1 }) {
+  const typeMeta = ALERT_TYPES[alert_type];
+  if (!typeMeta) {
+    console.warn(`[Alerts] Unknown alert_type "${alert_type}" — add it to ALERT_TYPES in dashboard.js`);
+  }
+  const sev = severity || typeMeta?.defaultSeverity || 'warning';
+  const result = insert(
+    `INSERT INTO alerts (alert_type, severity, title, detail, org_id) VALUES (:type, :sev, :title, :detail, :org_id)`,
+    { ':type': alert_type, ':sev': sev, ':title': title, ':detail': detail, ':org_id': org_id }
+  );
+  // Push to all connected dashboard clients so alerts panel updates instantly
+  try { broadcastNotification('widget_update', { widget: 'alerts' }); } catch {}
+  return result;
+}
+
+// Generic widget update broadcast — call from any subsystem when data changes.
+// The dashboard client listens for these and refetches only the affected widget.
+export function broadcastWidgetUpdate(widget) {
+  try { broadcastNotification('widget_update', { widget }); } catch {}
+}
+
+export { ALERT_TYPES };
+
+export default router;

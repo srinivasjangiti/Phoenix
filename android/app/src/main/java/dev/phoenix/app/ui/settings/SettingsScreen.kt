@@ -1,0 +1,590 @@
+package dev.phoenix.app.ui.settings
+
+import android.app.Activity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
+import androidx.hilt.navigation.compose.hiltViewModel
+import kotlinx.coroutines.launch
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun SettingsScreen(
+    onBack: () -> Unit,
+    viewModel: SettingsViewModel = hiltViewModel()
+) {
+    val deviceName by viewModel.deviceName.collectAsState()
+    val serverUrl by viewModel.serverUrl.collectAsState()
+    val beepEnabled by viewModel.beepEnabled.collectAsState()
+    val vibrationEnabled by viewModel.vibrationEnabled.collectAsState()
+    val voiceResponseEnabled by viewModel.voiceResponseEnabled.collectAsState()
+    val deviceTarget by viewModel.deviceTarget.collectAsState()
+    val devices by viewModel.devices.collectAsState()
+    val preferredMusicApp by viewModel.preferredMusicApp.collectAsState()
+    val preferredMessagingApp by viewModel.preferredMessagingApp.collectAsState()
+    val selectedLlmModel by viewModel.selectedLlmModel.collectAsState()
+    val classifierModel by viewModel.classifierModel.collectAsState()
+    val conversationModel by viewModel.conversationModel.collectAsState()
+    val llmStatus by viewModel.llmStatus.collectAsState()
+    val llmDownloadProgress by viewModel.llmDownloadProgress.collectAsState()
+    val remoteAccessEnabled by viewModel.remoteAccessEnabled.collectAsState()
+    val remoteAccessStatus by viewModel.remoteAccessStatus.collectAsState()
+    val remoteAccessIp by viewModel.remoteAccessIp.collectAsState()
+    val isServerConnected by viewModel.isServerConnected.collectAsState()
+    val downloadingId by viewModel.downloadingId.collectAsState()
+    val geminiKey by viewModel.geminiKey.collectAsState()
+    val personality by viewModel.personality.collectAsState()
+    val incognitoMode by viewModel.incognitoMode.collectAsState()
+    val incognitoAllowed by viewModel.incognitoAllowed.collectAsState()
+    val toastMessage by viewModel.toastMessage.collectAsState()
+    val updateChecking by viewModel.updateChecking.collectAsState()
+    val scope = rememberCoroutineScope()
+    val context = LocalContext.current
+    val snackbarHostState = remember { SnackbarHostState() }
+
+    // Show toast messages from ViewModel
+    LaunchedEffect(toastMessage) {
+        toastMessage?.let {
+            snackbarHostState.showSnackbar(it)
+            viewModel.clearToast()
+        }
+    }
+
+    // VPN consent launcher
+    val vpnLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            viewModel.enableRemoteAccess(true)
+        }
+    }
+
+    Scaffold(
+        snackbarHost = { SnackbarHost(snackbarHostState) },
+        topBar = {
+            TopAppBar(
+                title = { Text("Settings") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                }
+            )
+        }
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .padding(16.dp)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            // Device
+            Text("Device", style = MaterialTheme.typography.titleMedium)
+
+            OutlinedTextField(
+                value = deviceName,
+                onValueChange = { viewModel.setDeviceName(it) },
+                label = { Text("Device Name") },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true
+            )
+            Text("How this phone appears in the Phoenix network",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+
+            HorizontalDivider()
+
+            // Connection
+            Text("Connection", style = MaterialTheme.typography.titleMedium)
+
+            val activeUrl = viewModel.getRemoteProxyUrl() ?: serverUrl
+            OutlinedTextField(
+                value = activeUrl,
+                onValueChange = { },
+                label = { Text("Phoenix Server (via Tailscale)") },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                readOnly = true
+            )
+            val proxyUrl = viewModel.getRemoteProxyUrl()
+            Text(
+                if (proxyUrl != null) "Connected via Tailscale proxy"
+                else "Tailscale proxy not ready — connecting...",
+                style = MaterialTheme.typography.bodySmall,
+                color = if (proxyUrl != null) MaterialTheme.colorScheme.primary
+                       else MaterialTheme.colorScheme.error
+            )
+
+            HorizontalDivider()
+
+            // Secure Connection (always on — Tailscale/WireGuard)
+            Text("Secure Connection", style = MaterialTheme.typography.titleMedium)
+            Text(
+                if (remoteAccessEnabled && remoteAccessStatus == "Connected")
+                    "Connected via Tailscale${if (remoteAccessIp.isNotEmpty()) " — $remoteAccessIp" else ""}"
+                else if (remoteAccessEnabled)
+                    remoteAccessStatus
+                else
+                    "Connecting...",
+                style = MaterialTheme.typography.bodySmall,
+                color = if (remoteAccessStatus == "Connected") MaterialTheme.colorScheme.primary
+                       else MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text("All traffic is encrypted via WireGuard tunnel. This connects automatically on startup.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+
+            HorizontalDivider()
+
+            // Feedback
+            Text("Feedback", style = MaterialTheme.typography.titleMedium)
+
+            SettingToggle(
+                title = "Voice Responses",
+                description = "Phoenix speaks responses aloud via TTS",
+                checked = voiceResponseEnabled,
+                onToggle = { viewModel.setVoiceResponse(it) }
+            )
+
+            // Voice Quality dropdown
+            var voiceExpanded by remember { mutableStateOf(false) }
+            var currentVoice by remember { mutableStateOf(
+                context.getSharedPreferences("pan_tts_prefs", android.content.Context.MODE_PRIVATE)
+                    .getString("voice_quality", "android") ?: "android"
+            ) }
+            var voiceStatus by remember { mutableStateOf("") }
+            val voiceOptions = listOf(
+                "android" to "Default (Android)",
+                "low" to "Piper Low (15MB)",
+                "medium" to "Piper Medium (60MB)",
+                "high" to "Piper High (110MB)"
+            )
+            ExposedDropdownMenuBox(
+                expanded = voiceExpanded,
+                onExpandedChange = { voiceExpanded = it }
+            ) {
+                OutlinedTextField(
+                    value = voiceOptions.firstOrNull { it.first == currentVoice }?.second ?: "Default",
+                    onValueChange = {},
+                    readOnly = true,
+                    label = { Text("Voice Quality") },
+                    trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = voiceExpanded) },
+                    modifier = Modifier.menuAnchor().fillMaxWidth()
+                )
+                ExposedDropdownMenu(
+                    expanded = voiceExpanded,
+                    onDismissRequest = { voiceExpanded = false }
+                ) {
+                    voiceOptions.forEach { (id, label) ->
+                        DropdownMenuItem(
+                            text = { Text(label) },
+                            onClick = {
+                                currentVoice = id
+                                voiceExpanded = false
+                                context.getSharedPreferences("pan_tts_prefs", android.content.Context.MODE_PRIVATE)
+                                    .edit().putString("voice_quality", id).apply()
+                                if (id != "android") {
+                                    voiceStatus = "Downloading..."
+                                    scope.launch {
+                                        val piper = dev.phoenix.app.tts.PiperTtsEngine(context)
+                                        if (!piper.isFullyReady(id)) {
+                                            val ok = piper.downloadVoice(id)
+                                            voiceStatus = if (ok) "Ready — restart app to activate" else "Download failed"
+                                        } else {
+                                            voiceStatus = "Ready — restart app to activate"
+                                        }
+                                    }
+                                } else {
+                                    voiceStatus = ""
+                                }
+                            }
+                        )
+                    }
+                }
+            }
+            if (voiceStatus.isNotEmpty()) {
+                Text(voiceStatus, style = MaterialTheme.typography.bodySmall,
+                    color = if (voiceStatus.contains("Ready")) MaterialTheme.colorScheme.primary
+                           else MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+
+            SettingToggle(
+                title = "Sound Effects",
+                description = "Audio tone when a command is detected",
+                checked = beepEnabled,
+                onToggle = { viewModel.setBeep(it) }
+            )
+
+            SettingToggle(
+                title = "Vibration",
+                description = "Haptic feedback on commands",
+                checked = vibrationEnabled,
+                onToggle = { viewModel.setVibration(it) }
+            )
+
+            HorizontalDivider()
+
+            // Device Preference
+            Text("Device Preference", style = MaterialTheme.typography.titleMedium)
+            Text("Where should Phoenix execute actions by default?",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+
+            val deviceOptions = listOf(
+                "auto" to "Auto (Nearest Device)",
+                "phone" to deviceName
+            ) + devices.filter { it.device_type != "phone" }
+                .map { it.hostname to "${it.name} (${it.device_type.replaceFirstChar { c -> c.uppercase() }})" }
+
+            deviceOptions.forEach { (value, label) ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    RadioButton(
+                        selected = deviceTarget == value,
+                        onClick = { viewModel.setDeviceTarget(value) }
+                    )
+                    Text(label, modifier = Modifier.padding(start = 8.dp))
+                }
+            }
+
+            HorizontalDivider()
+
+            // App Preferences
+            Text("App Preferences", style = MaterialTheme.typography.titleMedium)
+
+            SettingDropdown(
+                title = "Music App",
+                description = "Preferred app for playing music",
+                selected = preferredMusicApp,
+                options = listOf("Auto", "Spotify", "YouTube", "YouTube Music"),
+                onSelect = { viewModel.setPreferredMusicApp(it) }
+            )
+
+            SettingDropdown(
+                title = "Messaging App",
+                description = "Preferred app for sending messages",
+                selected = preferredMessagingApp,
+                options = listOf("Auto", "SMS", "WhatsApp", "Instagram", "Telegram"),
+                onSelect = { viewModel.setPreferredMessagingApp(it) }
+            )
+
+            val queryAnswerSource by viewModel.queryAnswerSource.collectAsState()
+            SettingDropdown(
+                title = "Query Answers",
+                description = "How to answer questions (Local = on-device, Cloud = API)",
+                selected = queryAnswerSource,
+                options = listOf("Cloud", "Local", "Auto"),
+                onSelect = { viewModel.setQueryAnswerSource(it) }
+            )
+
+            HorizontalDivider()
+
+            // Local LLM
+            Text("Local AI Model", style = MaterialTheme.typography.titleMedium)
+
+            // Status indicator
+            val statusColor = when (llmStatus) {
+                "loaded" -> MaterialTheme.colorScheme.primary
+                "downloaded" -> MaterialTheme.colorScheme.tertiary
+                "downloading" -> MaterialTheme.colorScheme.secondary
+                else -> MaterialTheme.colorScheme.error
+            }
+            val statusText = when (llmStatus) {
+                "loaded" -> "Installed & Running"
+                "downloaded" -> "Installed (not loaded)"
+                "downloading" -> "Downloading... ${(llmDownloadProgress * 100).toInt()}%"
+                "not_downloaded" -> "Not installed"
+                else -> llmStatus
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Surface(
+                    shape = MaterialTheme.shapes.small,
+                    color = statusColor.copy(alpha = 0.15f),
+                    modifier = Modifier.padding(end = 8.dp)
+                ) {
+                    Text(
+                        statusText,
+                        color = statusColor,
+                        style = MaterialTheme.typography.labelMedium,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                    )
+                }
+            }
+
+            // Progress bar when downloading
+            if (llmStatus == "downloading") {
+                LinearProgressIndicator(
+                    progress = { llmDownloadProgress },
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
+                )
+            }
+
+            // AI runs on server via Cerebras/Gemini through Tailscale
+            Text("AI Backend: Server (Cerebras)", style = MaterialTheme.typography.bodyMedium)
+            Text("All AI processing via Tailscale — ~580ms responses, free",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.primary)
+
+            // Custom model input
+            var showCustom by remember { mutableStateOf(false) }
+            var customName by remember { mutableStateOf("") }
+            var customUrl by remember { mutableStateOf("") }
+
+            if (showCustom) {
+                OutlinedTextField(
+                    value = customName,
+                    onValueChange = { customName = it },
+                    label = { Text("Model Name") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+                OutlinedTextField(
+                    value = customUrl,
+                    onValueChange = { customUrl = it },
+                    label = { Text("GGUF URL (HuggingFace)") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = {
+                            if (customName.isNotBlank() && customUrl.isNotBlank()) {
+                                viewModel.addCustomModel(customName, customUrl)
+                                showCustom = false
+                                customName = ""
+                                customUrl = ""
+                            }
+                        }
+                    ) { Text("Add Model") }
+                    TextButton(onClick = { showCustom = false }) { Text("Cancel") }
+                }
+            } else {
+                TextButton(onClick = { showCustom = true }) {
+                    Text("+ Add Custom Model")
+                }
+            }
+
+            HorizontalDivider()
+
+            HorizontalDivider()
+
+            // Incognito mode + service controls — top of the list because the
+            // user explicitly asked for these to be discoverable.
+            Text("Privacy & Service", style = MaterialTheme.typography.titleMedium)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        "Incognito Mode",
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = if (incognitoAllowed) MaterialTheme.colorScheme.onSurface
+                                else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        when {
+                            !incognitoAllowed -> "Disabled by your organization's policy."
+                            incognitoMode -> "ON — phone events go to a separate database. Toggle off to wipe."
+                            else -> "Routes all phone-originated events to a separate, wipeable database."
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Switch(
+                    checked = incognitoMode,
+                    onCheckedChange = { viewModel.setIncognitoMode(it) },
+                    enabled = incognitoAllowed
+                )
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                OutlinedButton(
+                    onClick = { viewModel.stopPanService() },
+                    modifier = Modifier.weight(1f)
+                ) { Text("Stop Phoenix Service") }
+                Button(
+                    onClick = { viewModel.forceRestartApp() },
+                    modifier = Modifier.weight(1f)
+                ) { Text("Force Restart") }
+            }
+            Text(
+                "Stop = kills the foreground service (voice triggers, log shipping). " +
+                "Force Restart = stop service, kill process, cold-start the app.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            // Personality (Phoenix voice/character — empty = default/off)
+            Text("Personality", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "Describe how Phoenix should talk. Leave empty for the default Phoenix voice (no personality).",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            var personalityInput by remember(personality) { mutableStateOf(personality) }
+            OutlinedTextField(
+                value = personalityInput,
+                onValueChange = { personalityInput = it },
+                label = { Text("Personality prompt") },
+                placeholder = { Text("e.g. Sarcastic, witty, like Tony Stark") },
+                modifier = Modifier.fillMaxWidth(),
+                minLines = 2,
+                maxLines = 5
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                if (personalityInput != personality) {
+                    Button(
+                        onClick = { viewModel.setPersonality(personalityInput) },
+                        modifier = Modifier.weight(1f)
+                    ) { Text("Save") }
+                }
+                if (personality.isNotEmpty() || personalityInput.isNotEmpty()) {
+                    OutlinedButton(
+                        onClick = {
+                            personalityInput = ""
+                            viewModel.clearPersonality()
+                        },
+                        modifier = Modifier.weight(1f)
+                    ) { Text("Turn Off") }
+                }
+            }
+
+            // Gemini API Key
+            Text("Gemini API Key", style = MaterialTheme.typography.titleMedium)
+            Text("Optional — for Google Gemini as AI backend",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+
+            var geminiKeyInput by remember { mutableStateOf(geminiKey) }
+            OutlinedTextField(
+                value = geminiKeyInput,
+                onValueChange = { geminiKeyInput = it },
+                label = { Text("API Key") },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true
+            )
+            if (geminiKeyInput != geminiKey) {
+                Button(
+                    onClick = { viewModel.setGeminiKey(geminiKeyInput) },
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("Save Key") }
+            }
+
+            HorizontalDivider()
+
+            // App Updates — manual OTA pull. The app auto-checks ~8s after
+            // launch; this button lets the user pull the update immediately.
+            Text("App Updates", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "Version ${dev.phoenix.app.BuildConfig.VERSION_NAME} (${dev.phoenix.app.BuildConfig.VERSION_CODE})",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Button(
+                onClick = { viewModel.checkForUpdate() },
+                enabled = !updateChecking,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(if (updateChecking) "Checking…" else "Check for updates")
+            }
+            Text(
+                "Pulls the latest APK from the Phoenix server. If an update is found, " +
+                "the system installer dialog will appear.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun SettingDropdown(
+    title: String,
+    description: String,
+    selected: String,
+    options: List<String>,
+    onSelect: (String) -> Unit
+) {
+    var expanded by remember { mutableStateOf(false) }
+
+    Column {
+        Text(title, style = MaterialTheme.typography.bodyLarge)
+        Text(description,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant)
+        ExposedDropdownMenuBox(
+            expanded = expanded,
+            onExpandedChange = { expanded = !expanded }
+        ) {
+            OutlinedTextField(
+                value = selected,
+                onValueChange = {},
+                readOnly = true,
+                modifier = Modifier.menuAnchor().fillMaxWidth(),
+                trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) }
+            )
+            ExposedDropdownMenu(
+                expanded = expanded,
+                onDismissRequest = { expanded = false }
+            ) {
+                options.forEach { option ->
+                    DropdownMenuItem(
+                        text = { Text(option) },
+                        onClick = {
+                            onSelect(option)
+                            expanded = false
+                        }
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun SettingToggle(
+    title: String,
+    description: String,
+    checked: Boolean,
+    onToggle: (Boolean) -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(title, style = MaterialTheme.typography.bodyLarge)
+            Text(description,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Switch(
+            checked = checked,
+            onCheckedChange = onToggle
+        )
+    }
+}

@@ -1,0 +1,47 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Phoenix Installer Test — Clean Ubuntu
+# Simulates a fresh Linux machine with zero dev tools installed.
+# Verifies the installer handles everything from scratch.
+#
+# Build:  docker build -f Dockerfile.ubuntu -t phoenix-test-ubuntu ../..
+# Run:    docker run --rm phoenix-test-ubuntu
+# ═══════════════════════════════════════════════════════════════════════════
+FROM ubuntu:24.04
+
+# Simulate a real user (not root)
+RUN useradd -m -s /bin/bash commander && \
+    apt-get update -qq && \
+    apt-get install -y -qq curl sudo && \
+    echo "commander ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+USER commander
+WORKDIR /home/commander
+
+# Copy the Phoenix source (installer needs the service/ directory)
+COPY --chown=commander:commander . /home/commander/phoenix
+
+# Set test mode so installer doesn't prompt for input
+ENV PHOENIX_TEST=1
+ENV HOME=/home/commander
+
+# Run the installer
+RUN cd /home/commander/phoenix/installer && \
+    chmod +x install.sh && \
+    bash install.sh --no-service --no-desktop 2>&1 | tee /home/commander/install.log
+
+# Verify installation
+RUN echo "=== Verification ===" && \
+    echo "Node:" && /home/commander/.local/share/phoenix/node/bin/node --version && \
+    echo "Phoenix dir:" && ls /home/commander/.local/share/phoenix/service/src/server.js && \
+    echo "Data dir:" && ls /home/commander/.local/share/phoenix/data/phoenix.key && \
+    echo "Launcher:" && ls /home/commander/.local/bin/phoenix && \
+    echo "node_modules:" && ls /home/commander/.local/share/phoenix/service/node_modules/.package-lock.json && \
+    echo "=== All checks passed ==="
+
+# Health check: start Phoenix server and verify it responds
+# (runs as foreground process, checks health, then exits)
+COPY --chown=commander:commander installer/test/health-check.sh /home/commander/health-check.sh
+RUN chmod +x /home/commander/health-check.sh
+
+CMD ["/home/commander/health-check.sh"]

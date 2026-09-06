@@ -1,0 +1,629 @@
+// Phoenix Hybrid Memory Search
+//
+// Combines SQLite FTS5 (lexical) with sqlite-vec (semantic vector search)
+// over the events table, then fuses the two ranked lists with Reciprocal
+// Rank Fusion (RRF). This is the same recipe production RAG systems use.
+//
+// FTS5 catches exact matches: names, IDs, file paths, "did I ever say X".
+// Vector search catches meaning: "find conversations LIKE this one".
+// Neither covers both. Both together = production hybrid retrieval.
+//
+// Scoping: every call accepts a `scope` parameter that's resolved through
+// db-registry.js. Today only `main` exists. Tomorrow `incognito`, `org-*`,
+// `phone-*`, etc. will plug in with zero changes here.
+
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+const sqliteVec = require('sqlite-vec');
+
+import { getDb } from './db-registry.js';
+import { get as _settingsGet } from './db.js';
+import { embed, embedForWrite, toBlob, EMBED_DIM, EMBED_MODEL } from './memory/embeddings.js';
+import { privatizeSearch } from './privacy.js';
+
+// Track which DB handles already have the vec extension loaded + tables
+// initialized. Loading the extension twice is harmless but slow; the table
+// creation is idempotent. We cache the init so search calls are cheap.
+const initialized = new WeakSet();
+
+/**
+ * Version-gated embedding table migration.
+ *
+ * Stores embedding_dim + embedding_model in the settings table as a version
+ * stamp. On boot:
+ *   - If no stamp exists (first tracked boot): probe-insert a 0-vector to
+ *     detect whether the existing vec table is dimensionally compatible.
+ *     Incompatible (or missing) → drop + recreate + write stamp.
+ *     Compatible → no-op + write stamp.
+ *   - If stamp exists and matches current config: nothing to do.
+ *   - If stamp exists but config has drifted (dim or model changed): drop +
+ *     recreate + update stamp. Old vectors are semantically meaningless across
+ *     model boundaries anyway.
+ *
+ * Returns true if the table was (re)built and a backfill is needed.
+ */
+function migrateEmbeddingTable(db) {
+  const storedDim   = db.prepare(`SELECT value FROM settings WHERE key = 'embedding_dim'`).get();
+  const storedModel = db.prepare(`SELECT value FROM settings WHERE key = 'embedding_model'`).get();
+  const currentDim   = String(EMBED_DIM);
+  const currentModel = EMBED_MODEL;
+
+  // ── First-time setup: migration tracking not yet written ─────────────────
+  if (!storedDim || !storedModel) {
+    // Check table existence first — "missing" and "wrong dim" are distinct states
+    // that warrant different log messages and have different row counts.
+    const tableExists = db.prepare(
+      `SELECT name FROM sqlite_master WHERE type='table' AND name='event_embeddings'`
+    ).get();
+
+    // Only probe if the table actually exists — probing a missing table would
+    // throw "no such table" which is NOT a dimension error and shouldn't be
+    // caught as one.
+    let tableCompatible = false;
+    if (tableExists) {
+      try {
+        const testVec = new Float32Array(EMBED_DIM).fill(0);
+        db.prepare(`INSERT INTO event_embeddings(rowid, embedding) VALUES (-1, ?)`)
+          .run(Buffer.from(testVec.buffer));
+        db.prepare(`DELETE FROM event_embeddings WHERE rowid = -1`).run();
+        tableCompatible = true;
+      } catch (err) {
+        if (!/dimension/i.test(err.message)) throw err;
+        tableCompatible = false; // dimension mismatch — table exists but wrong dim
+      }
+    }
+    // tableCompatible=false covers both: table missing (tableExists=falsy) and
+    // table exists with wrong dimension.
+
+    if (!tableCompatible) {
+      const existingCount = tableExists
+        ? (db.prepare(`SELECT COUNT(*) as c FROM event_embeddings`).get()?.c ?? 0)
+        : 0;
+      if (existingCount > 0) {
+        console.warn(`[Phoenix MemorySearch] migration: dimension mismatch on first-tracked boot — dropping ${existingCount} stale rows (incompatible with ${currentModel}@${currentDim})`);
+      } else if (tableExists) {
+        console.log(`[Phoenix MemorySearch] migration: empty vec table with wrong dim — rebuilding for ${currentModel}@${currentDim}`);
+      } else {
+        console.log(`[Phoenix MemorySearch] migration: no vec table yet — creating for ${currentModel}@${currentDim}`);
+      }
+      db.exec(`DROP TABLE IF EXISTS event_embeddings`);
+      db.exec(`CREATE VIRTUAL TABLE event_embeddings USING vec0(embedding float[${EMBED_DIM}])`);
+    }
+    // If tableCompatible=true the table already exists with the right dim — nothing to do.
+
+    // Write version stamp so future boots skip the probe entirely
+    db.prepare(`INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('embedding_dim',   ?, datetime('now','localtime'))`).run(currentDim);
+    db.prepare(`INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('embedding_model', ?, datetime('now','localtime'))`).run(currentModel);
+    return !tableCompatible; // true = needs backfill
+  }
+
+  // ── Subsequent boots: check for config drift ──────────────────────────────
+  if (storedDim.value !== currentDim || storedModel.value !== currentModel) {
+    let existingCount = 0;
+    try { existingCount = db.prepare(`SELECT COUNT(*) as c FROM event_embeddings`).get()?.c ?? 0; } catch {}
+    console.warn(`[Phoenix MemorySearch] migration: embedding config changed — ${storedModel.value}@${storedDim.value} → ${currentModel}@${currentDim}. Dropping ${existingCount} rows and rebuilding.`);
+    db.exec(`DROP TABLE IF EXISTS event_embeddings`);
+    db.exec(`CREATE VIRTUAL TABLE event_embeddings USING vec0(embedding float[${EMBED_DIM}])`);
+    db.prepare(`UPDATE settings SET value = ?, updated_at = datetime('now','localtime') WHERE key = 'embedding_dim'`).run(currentDim);
+    db.prepare(`UPDATE settings SET value = ?, updated_at = datetime('now','localtime') WHERE key = 'embedding_model'`).run(currentModel);
+    return true; // needs backfill
+  }
+
+  return false; // no migration needed — table and stamp match current config
+}
+
+/**
+ * Idempotent: load sqlite-vec into this DB handle, run embedding migration,
+ * and ensure the event_embeddings vec0 virtual table exists and is correctly
+ * dimensioned. Safe to call repeatedly — only runs once per DB handle.
+ */
+function ensureInitialized(db) {
+  if (initialized.has(db)) return;
+  try {
+    sqliteVec.load(db);
+  } catch (err) {
+    // Already loaded for this connection — extensions can throw on re-load.
+    if (!/already loaded|already exists/i.test(err.message)) throw err;
+  }
+  // Version-gated migration. Handles: fresh DB, stale dim, model change.
+  // After this returns, event_embeddings is guaranteed to exist and match EMBED_DIM.
+  const needsBackfill = migrateEmbeddingTable(db);
+  initialized.add(db);
+  if (needsBackfill) {
+    // Fire backfill in the background — don't block server boot or the
+    // calling insert/search path. Progress logged every 200 embeddings.
+    setImmediate(() => backfillEmbeddings().catch(err => {
+      console.error('[Phoenix MemorySearch] backfill error:', err.message);
+    }));
+  }
+}
+
+/**
+ * Pull the searchable text out of an event row. Mirrors what `extractEventText`
+ * does in db.js but kept here so memory-search can be self-contained.
+ */
+function eventText(row) {
+  if (!row) return '';
+  const data = row.data || '';
+  // Most events store JSON in `data`. Try to grab a meaningful field.
+  try {
+    const obj = JSON.parse(data);
+    if (typeof obj === 'string') return obj;
+    if (obj.prompt) return String(obj.prompt);
+    if (obj.text) return String(obj.text);
+    if (obj.message) return String(obj.message);
+    if (obj.content) return String(obj.content);
+    return JSON.stringify(obj).slice(0, 2000);
+  } catch {
+    return String(data).slice(0, 2000);
+  }
+}
+
+// Sentinel blob for events with no embeddable text. Inserted into event_embeddings
+// so the backfill query never re-visits them. Unit vector on dim 0 — valid in
+// vec0 (non-zero, L2-normalised), but won't match any real semantic embedding.
+const _SENTINEL_VEC = new Float32Array(EMBED_DIM);
+_SENTINEL_VEC[0] = 1.0;
+const _SENTINEL_BLOB = Buffer.from(_SENTINEL_VEC.buffer);
+
+/**
+ * Embed a single event into the vec0 table. Idempotent: replaces an existing
+ * embedding for the same rowid. Called from indexEvent() below and from the
+ * backfill job.
+ * Returns:
+ *   true    — real embedding written
+ *   'skip'  — no embeddable content; sentinel written so backfill skips this row in future
+ *   false   — Ollama unavailable; nothing written
+ */
+async function embedEvent(db, eventRow) {
+  ensureInitialized(db);
+  const id = parseInt(eventRow.id, 10);
+  if (!Number.isInteger(id)) throw new Error('embedEvent: bad event id ' + eventRow.id);
+  // vec0 doesn't support UPSERT — delete-then-insert is the documented pattern.
+  // vec0 also rejects bound parameters for the rowid column (sqlite-vec quirk:
+  // "Only integers are allowed for primary key values"), even when the JS
+  // value IS an integer. Workaround: inline the rowid into the SQL. eventRow.id
+  // comes from a trusted internal SELECT against our own table, so injection
+  // is not a concern — but we still hard-cast to integer for safety.
+  const text = eventText(eventRow);
+  if (!text || text.length < 4) {
+    // No meaningful content — write sentinel so backfill never re-processes this event.
+    db.prepare(`DELETE FROM event_embeddings WHERE rowid = ${id}`).run();
+    db.prepare(`INSERT INTO event_embeddings(rowid, embedding) VALUES (${id}, ?)`).run(_SENTINEL_BLOB);
+    return 'skip';
+  }
+  const vec = await embedForWrite(text);
+  if (!vec) return false;  // Ollama unavailable — skip, never write keyword fallback to vec table
+  const blob = toBlob(vec);
+  db.prepare(`DELETE FROM event_embeddings WHERE rowid = ${id}`).run();
+  db.prepare(`INSERT INTO event_embeddings(rowid, embedding) VALUES (${id}, ?)`).run(blob);
+  return true;
+}
+
+/**
+ * Background-friendly backfill: walks events that don't yet have an embedding
+ * and embeds them in batches. Safe to call on startup; it short-circuits when
+ * everything is already indexed. Designed to NOT block server boot — caller
+ * should kick this off in a setImmediate / async tick.
+ */
+let _backfillAborted = false;
+let _backfillRunning = false; // legacy — only the unused _mainThread fn reads this
+function abortBackfill() {
+  _backfillAborted = true;     // legacy path
+  if (_backfillWorker) {
+    try { _backfillWorker.postMessage({ type: 'abort' }); }
+    catch (e) { console.warn('[Phoenix MemorySearch] failed to send abort to worker:', e.message); }
+  }
+}
+
+// Worker-thread backfill — see memory-search-worker.js for the full loop.
+//
+// Before this refactor the backfill ran on the MAIN Node thread. Every
+// vec0 vector-index INSERT was a synchronous 100-500ms CPU burst (HNSW
+// graph maintenance over 200k+ vectors) that froze the HTTP server, the
+// WebSocket layer, Carrier's perf probes, and everything else. Dashboards
+// went unresponsive even though Ollama itself was on a separate machine —
+// the bottleneck was the local index write, not the embedding compute.
+//
+// Now: backfillEmbeddings spawns a Worker thread that opens its own
+// better-sqlite3 connection and does the writes on a separate Node event
+// loop. SQLite is in WAL mode (see db-registry.js), which lets the worker
+// (writer) and the main thread (readers serving HTTP) touch the database
+// simultaneously without lock contention. Dashboard endpoints stay
+// responsive even during 24/7 backfill.
+//
+// The worker also lets us keep going from where it left off across Craft
+// swaps — the existing event_embeddings rows persist, and the next worker
+// start just picks up the remaining unindexed events.
+let _backfillWorker = null;
+let _backfillLastStats = { indexed: 0, total: 0, added: 0, rate: 0, etaMin: null };
+
+async function backfillEmbeddings(scope = 'main', concurrency = 1) {
+  if (_backfillWorker) {
+    console.log('[Phoenix MemorySearch] backfill: worker already running — skipping duplicate invocation');
+    return null;
+  }
+  // Persistent disable — survives Craft swaps. Set via:
+  //   UPDATE settings SET value = 'true' WHERE key = 'embeddings_backfill_disabled'
+  // or POST /api/v1/memory/backfill-disable. Until cleared, the backfill
+  // never runs even though it's auto-scheduled on Craft boot.
+  try {
+    const disabledRow = _settingsGet(`SELECT value FROM settings WHERE key = 'embeddings_backfill_disabled'`);
+    if (disabledRow && /^"?true"?$/i.test(disabledRow.value)) {
+      console.log('[Phoenix MemorySearch] backfill: skipped — embeddings_backfill_disabled setting is true');
+      return { indexed: 0, total: 0, added: 0, skipped: 'disabled_via_setting' };
+    }
+  } catch {}
+
+  const { Worker } = await import('node:worker_threads');
+  const { fileURLToPath } = await import('node:url');
+  const workerUrl = new URL('./memory-search-worker.js', import.meta.url);
+
+  return new Promise((resolve, reject) => {
+    let resolved = false;
+    _backfillWorker = new Worker(fileURLToPath(workerUrl), {
+      workerData: { scope, concurrency },
+    });
+
+    _backfillWorker.on('message', (msg) => {
+      if (msg?.type === 'progress' && msg.stats) {
+        _backfillLastStats = { ...msg.stats, running: true };
+      } else if (msg?.type === 'log') {
+        console.log(`[${msg.tag}] ${msg.message}`);
+      } else if (msg?.type === 'done') {
+        _backfillLastStats = { ...(msg.result || {}), rate: 0, etaMin: 0, running: false };
+        if (!resolved) { resolved = true; resolve(msg.result); }
+      } else if (msg?.type === 'error') {
+        console.error('[Phoenix MemorySearch] worker error:', msg.error);
+        if (!resolved) { resolved = true; reject(new Error(msg.error)); }
+      }
+    });
+
+    _backfillWorker.on('error', (err) => {
+      console.error('[Phoenix MemorySearch] worker crashed:', err.message);
+      if (!resolved) { resolved = true; reject(err); }
+    });
+
+    _backfillWorker.on('exit', (code) => {
+      if (code !== 0) console.warn(`[Phoenix MemorySearch] worker exited with code ${code}`);
+      _backfillWorker = null;
+      if (!resolved) {
+        resolved = true;
+        resolve(_backfillLastStats);
+      }
+    });
+  });
+}
+
+// Original main-thread backfill code preserved below for reference, but
+// the export now goes through the worker. Don't call _backfillEmbeddings_mainThread
+// directly — it will block the event loop for hours.
+// eslint-disable-next-line no-unused-vars
+async function _backfillEmbeddings_mainThread(scope = 'main', concurrency = 1) {
+  if (_backfillRunning) {
+    console.log('[Phoenix MemorySearch] backfill: already running — skipping duplicate invocation');
+    return null;
+  }
+  _backfillAborted = false;
+  _backfillRunning = true;
+  try {
+  const db = getDb(scope);
+  ensureInitialized(db);
+
+  const totalEvents = db.prepare('SELECT COUNT(*) as c FROM events').get().c;
+  const indexedStart = db.prepare('SELECT COUNT(*) as c FROM event_embeddings').get().c;
+  if (indexedStart >= totalEvents) {
+    console.log(`[Phoenix MemorySearch] backfill: ${indexedStart}/${totalEvents} — already complete`);
+    return { indexed: indexedStart, total: totalEvents, added: 0 };
+  }
+
+  const needed = totalEvents - indexedStart;
+  console.log(`[Phoenix MemorySearch] backfill starting: ${indexedStart}/${totalEvents} indexed, ${needed} to embed (concurrency=${concurrency})`);
+
+  let added = 0;
+  // Pool-level failure tracking — shared across all workers so 5 failures
+  // anywhere in the pool trigger the backoff, not per-worker independently.
+  let poolConsecFails = 0;
+  let poolBackoffUntil = 0;
+  let poolBackoffTier = 0;
+  const POOL_FAIL_LIMIT = 5;
+  // Exponential-tier backoff. The previous flat 30s meant a fresh wave of
+  // 5 Ollama failures fired every 30 seconds whenever Ollama was offline,
+  // and with a 19k-event backlog that meant constant CPU + log churn that
+  // wedged the dashboard. New schedule: 30s → 2min → 10min → 30min →
+  // 30min (capped). Resets to tier 0 on the first successful embed.
+  const POOL_BACKOFF_TIERS_MS = [30_000, 120_000, 600_000, 1_800_000];
+
+  // Rate tracking — one log line per minute with actual embeds/sec.
+  let rateWindowStart = Date.now();
+  let rateWindowAdded = 0;
+  const RATE_LOG_MS = 60_000;
+
+  function logRate() {
+    const elapsed = (Date.now() - rateWindowStart) / 1000;
+    if (elapsed < 1) return;
+    const rate = rateWindowAdded / elapsed;
+    const remaining = needed - added;
+    const etaMin = rate > 0 ? Math.round(remaining / rate / 60) : Infinity;
+    console.log(
+      `[Phoenix MemorySearch] backfill: ${rate.toFixed(1)}/sec — ` +
+      `${indexedStart + added}/${totalEvents} embedded ` +
+      `(ETA ~${etaMin === Infinity ? '∞' : etaMin + 'min'})`
+    );
+    rateWindowStart = Date.now();
+    rateWindowAdded = 0;
+  }
+
+  function _triggerPoolBackoff() {
+    const tierIdx = Math.min(poolBackoffTier, POOL_BACKOFF_TIERS_MS.length - 1);
+    const backoffMs = POOL_BACKOFF_TIERS_MS[tierIdx];
+    poolBackoffUntil = Date.now() + backoffMs;
+    poolBackoffTier++;
+    const human = backoffMs >= 60_000 ? `${Math.round(backoffMs/60_000)}min` : `${Math.round(backoffMs/1000)}s`;
+    console.warn(`[Phoenix MemorySearch] backfill: pool paused ${human} after ${POOL_FAIL_LIMIT} consecutive Ollama failures (tier ${tierIdx + 1}/${POOL_BACKOFF_TIERS_MS.length})`);
+    poolConsecFails = 0;
+  }
+
+  async function processRow(row) {
+    try {
+      const ok = await embedEvent(db, row);
+      if (ok === true) {
+        added++;
+        rateWindowAdded++;
+        poolConsecFails = 0;
+        poolBackoffTier = 0; // Ollama is back — reset the escalation
+      } else if (ok === 'skip') {
+        // No-content event — sentinel written, not an Ollama failure
+        poolConsecFails = 0;
+      } else {
+        // false = embedForWrite returned null — Ollama unavailable on write path
+        poolConsecFails++;
+        if (poolConsecFails >= POOL_FAIL_LIMIT) {
+          _triggerPoolBackoff();
+        }
+      }
+    } catch (err) {
+      console.warn(`[Phoenix MemorySearch] backfill embed failed for event ${row.id}:`, err.message);
+      poolConsecFails++;
+      if (poolConsecFails >= POOL_FAIL_LIMIT) {
+        _triggerPoolBackoff();
+        return;
+      }
+    }
+  }
+
+  // Fetch rows in DB batches; process each batch as concurrent chunks of
+  // `concurrency` rows. Workers share poolConsecFails so any worker's failure
+  // counts toward the pool-wide backoff threshold.
+  const DB_BATCH = concurrency * 10;
+  while (true) {
+    if (_backfillAborted) {
+      console.log('[Phoenix MemorySearch] backfill aborted');
+      break;
+    }
+
+    // Pool-level backoff: pause before issuing any new work to Ollama.
+    const now = Date.now();
+    if (now < poolBackoffUntil) {
+      const wait = poolBackoffUntil - now;
+      console.log(`[Phoenix MemorySearch] backfill: pool backing off ${Math.ceil(wait / 1000)}s`);
+      await new Promise(r => setTimeout(r, wait));
+      poolConsecFails = 0;
+    }
+
+    const batch = db.prepare(`
+      SELECT id, event_type, data
+      FROM events
+      WHERE id NOT IN (SELECT rowid FROM event_embeddings)
+      ORDER BY id ASC
+      LIMIT ?
+    `).all(DB_BATCH);
+    if (batch.length === 0) break;
+
+    for (let i = 0; i < batch.length; i += concurrency) {
+      if (_backfillAborted) break;
+      // Mid-batch backoff check: failures in the current chunk may have
+      // set poolBackoffUntil — break out and let the outer loop wait.
+      if (Date.now() < poolBackoffUntil) break;
+
+      const chunk = batch.slice(i, i + concurrency);
+      await Promise.all(chunk.map(row => processRow(row)));
+
+      if (Date.now() - rateWindowStart >= RATE_LOG_MS) logRate();
+    }
+
+    // Yield between DB batches so the event loop stays responsive.
+    await new Promise(r => setImmediate(r));
+  }
+
+  if (added > 0) logRate();
+  console.log(`[Phoenix MemorySearch] backfill complete: +${added} embeddings (${indexedStart + added}/${totalEvents} total)`);
+  return { indexed: indexedStart + added, total: totalEvents, added };
+  } finally {
+    _backfillRunning = false;
+  }
+}
+
+/**
+ * Hybrid search. Runs FTS5 and vector search in parallel, then fuses the
+ * two ranked lists with reciprocal rank fusion.
+ *
+ *   RRF(d) = Σ 1 / (k + rank_i(d))
+ *
+ * RRF is parameter-free, well-studied, and beats nearly every weighted
+ * combination scheme without tuning. k=60 is the standard from the original
+ * Cormack et al. paper.
+ *
+ * @param {string} query - free-form search text
+ * @param {object} opts
+ * @param {string} opts.scope - DB scope tag (default 'main')
+ * @param {number} opts.limit - max results returned (default 20)
+ * @param {number} opts.candidates - per-method candidate pool size (default 60)
+ * @returns {Promise<Array>} merged + ranked results with event metadata
+ */
+async function searchMemory(query, opts = {}) {
+  const scope = opts.scope || 'main';
+  const limit = Math.max(1, Math.min(100, opts.limit || 20));
+  const candidates = Math.max(limit, opts.candidates || 60);
+  const db = getDb(scope);
+  ensureInitialized(db);
+
+  if (!query || !query.trim()) return [];
+  const q = query.trim();
+
+  // ---------- FTS5 (lexical) ----------
+  // Sanitize the query for FTS5: strip characters that would break the
+  // MATCH grammar, fall back to a phrase query if a token starts with a
+  // special character. We OR the tokens for recall.
+  let ftsRows = [];
+  try {
+    const ftsQuery = q
+      .replace(/["()*]/g, ' ')
+      .split(/\s+/)
+      .filter(Boolean)
+      .map(t => t.length > 1 ? `"${t}"*` : `"${t}"`)
+      .join(' OR ');
+    if (ftsQuery) {
+      ftsRows = db.prepare(`
+        SELECT events_fts.rowid AS id, bm25(events_fts) AS score
+        FROM events_fts
+        WHERE events_fts MATCH ?
+        ORDER BY score
+        LIMIT ?
+      `).all(ftsQuery, candidates);
+    }
+  } catch (err) {
+    console.warn('[Phoenix MemorySearch] FTS5 query failed:', err.message);
+  }
+
+  // ---------- Vector (semantic) ----------
+  // Bug #461: embed() goes through Ollama and can hang for 10-20s when the
+  // embeddings service is degraded — which silently stalls every voice prompt
+  // because routeStream awaits searchMemory. Wrap the embed call in a hard
+  // timeout (default 500ms) so we degrade to FTS5-only instead of hanging.
+  // RRF below will still produce a reasonable ranking from FTS hits alone.
+  // Caller can override via opts.embedTimeoutMs (e.g. consolidation jobs that
+  // can afford to wait longer).
+  const embedTimeoutMs = opts.embedTimeoutMs ?? 500;
+  let vecRows = [];
+  try {
+    const qVec = await Promise.race([
+      embed(q),
+      new Promise((_, reject) =>
+        setTimeout(
+          () => reject(new Error(`embed timeout >${embedTimeoutMs}ms — ollama likely degraded`)),
+          embedTimeoutMs
+        )
+      ),
+    ]);
+    const blob = toBlob(qVec);
+    vecRows = db.prepare(`
+      SELECT rowid AS id, distance
+      FROM event_embeddings
+      WHERE embedding MATCH ?
+      ORDER BY distance
+      LIMIT ?
+    `).all(blob, candidates);
+  } catch (err) {
+    // Fall through to FTS5-only ranking — the function still returns useful
+    // results from lexical hits. Logged at warn level so the degradation is
+    // visible in console without crashing the search path.
+    console.warn(`[Phoenix MemorySearch] vec query failed (FTS-only fallback for caller=${opts.caller || 'search'}):`, err.message);
+  }
+
+  // ---------- Reciprocal Rank Fusion ----------
+  const RRF_K = 60;
+  const fused = new Map(); // id -> { id, rrf, ftsRank, vecRank }
+  ftsRows.forEach((row, i) => {
+    const cur = fused.get(row.id) || { id: row.id, rrf: 0, ftsRank: null, vecRank: null };
+    cur.rrf += 1 / (RRF_K + (i + 1));
+    cur.ftsRank = i + 1;
+    fused.set(row.id, cur);
+  });
+  vecRows.forEach((row, i) => {
+    const cur = fused.get(row.id) || { id: row.id, rrf: 0, ftsRank: null, vecRank: null };
+    cur.rrf += 1 / (RRF_K + (i + 1));
+    cur.vecRank = i + 1;
+    fused.set(row.id, cur);
+  });
+
+  if (fused.size === 0) return [];
+
+  // ---------- Hydrate top-N with full event rows ----------
+  const ranked = Array.from(fused.values()).sort((a, b) => b.rrf - a.rrf).slice(0, limit);
+  const ids = ranked.map(r => r.id);
+  const placeholders = ids.map(() => '?').join(',');
+  const rows = db.prepare(`
+    SELECT id, session_id, event_type, data, created_at, trust_origin, context_safe
+    FROM events
+    WHERE id IN (${placeholders}) AND context_safe = 1
+  `).all(...ids);
+  const byId = Object.fromEntries(rows.map(r => [r.id, r]));
+
+  const results = ranked.map(r => {
+    const ev = byId[r.id] || null;
+    return {
+      id: r.id,
+      score: r.rrf,
+      ftsRank: r.ftsRank,
+      vecRank: r.vecRank,
+      hit: r.ftsRank && r.vecRank ? 'both' : r.ftsRank ? 'fts' : 'vec',
+      event: ev,
+      preview: ev ? eventText(ev).slice(0, 280) : '',
+    };
+  });
+
+  // Apply differential privacy — noise scores and perturb ranking
+  return privatizeSearch(results, opts.caller || 'search');
+}
+
+/**
+ * Index a freshly inserted event for vector search. Called from db.logEvent()
+ * via a hook so new events become searchable as soon as they're written.
+ * Async + non-blocking: errors are logged, never thrown into the insert path.
+ */
+function indexEventForSearch(scope, eventId) {
+  // Fire-and-forget. The caller is the synchronous insert path; we don't
+  // want to block writes on Ollama embedding latency.
+  setImmediate(async () => {
+    try {
+      const db = getDb(scope);
+      const row = db.prepare('SELECT id, event_type, data FROM events WHERE id = ?').get(eventId);
+      if (row) await embedEvent(db, row);
+    } catch (err) {
+      console.warn(`[Phoenix MemorySearch] indexEventForSearch failed for ${eventId}:`, err.message);
+    }
+  });
+}
+
+function backfillStatus(scope = 'main') {
+  try {
+    const db = getDb(scope);
+    const total = db.prepare('SELECT COUNT(*) as c FROM events').get().c;
+    const indexed = db.prepare('SELECT COUNT(*) as c FROM event_embeddings').get().c;
+    // running reflects whether the worker thread is alive. Live rate + ETA
+    // come from the worker's last 'progress' postMessage.
+    return {
+      total,
+      indexed,
+      remaining: total - indexed,
+      running: _backfillWorker !== null,
+      worker_thread: true,
+      rate_per_sec: _backfillLastStats?.rate ?? 0,
+      eta_min: _backfillLastStats?.etaMin ?? null,
+      added_this_run: _backfillLastStats?.added ?? 0,
+    };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+export {
+  ensureInitialized,
+  searchMemory,
+  embedEvent,
+  backfillEmbeddings,
+  backfillStatus,
+  abortBackfill,
+  indexEventForSearch,
+};

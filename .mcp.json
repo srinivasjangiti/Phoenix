@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "phoenix": {
+      "command": "node",
+      "args": ["service/src/mcp-server.js"],
+      "env": {
+        "PHOENIX_BASE_URL": "http://minipc-phoenix-hub:7777"
+      }
+    },
+    "quality-log": {
+      "command": "node",
+      "args": ["service/src/quality-log-mcp.js"],
+      "env": {
+        "PHOENIX_BASE_URL": "http://minipc-phoenix-hub:7777"
+      }
+    }
+  }
+}

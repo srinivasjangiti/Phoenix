@@ -1,0 +1,288 @@
+package dev.phoenix.app.network.dto
+
+// Tier 0: /api/v1/auth/me response
+data class OrgInfo(
+    val id: String,
+    val slug: String,
+    val name: String,
+    val color_primary: String? = null,
+    val color_secondary: String? = null,
+    val logo_url: String? = null,
+)
+
+data class MeResponse(
+    val id: Int,
+    val email: String,
+    val display_name: String,
+    val display_nickname: String? = null,
+    val role: String? = null,
+    val org: OrgInfo? = null,
+)
+
+// Tier 0 Phase 4: /api/v1/org/policy response
+data class OrgPolicyResponse(
+    val org_id: String,
+    val org_slug: String,
+    val org_name: String,
+    val incognito_allowed: Boolean = true,
+    val blackout_allowed: Boolean = true,
+    val data_retention_days: Int? = null,
+)
+
+data class AudioUpload(
+    val transcript: String,
+    val timestamp: Long,
+    val duration_ms: Long,
+    val source: String = "phone_mic" // or "Pandant_mic"
+)
+
+data class PhotoUpload(
+    val jpeg_base64: String,
+    val timestamp: Long,
+    val source: String = "Pandant_camera"
+)
+
+data class SensorUpload(
+    val sensor_type: String,
+    val values: Map<String, Double>,
+    val timestamp: Long
+)
+
+data class QueryRequest(
+    val text: String,
+    val context: String? = null,
+    val intent_hint: String? = null,
+    val sensors: String? = null  // JSON string of sensor envelope
+)
+
+data class Action(
+    val target: String,          // "device", "server", "user", "org"
+    val device_id: String? = null,
+    val device_type: String? = null,
+    val type: String,            // "play_music", "navigate", "run_command", "terminal", "show_notification"
+    val args: Map<String, String>? = null
+)
+
+data class QueryResponse(
+    val response_text: String,
+    val audio_url: String? = null,
+    val route: String? = null,
+    val query: String? = null,
+    val response_time_ms: Long? = null,
+    val intent: String? = null,
+    val actions: List<Action>? = null
+)
+
+data class DeviceRegisterRequest(
+    val device_id: String,
+    val device_name: String,
+    val device_type: String = "phone",
+    val user_id: String? = null  // links device to a user in multi-user orgs
+)
+
+data class HistoryRequest(val role: String, val text: String, val device_id: String)
+
+data class HistoryTurn(val role: String, val text: String, val created_at: String)
+
+data class HistoryResponse(val turns: List<HistoryTurn>)
+
+data class SyncBatch(
+    val uploads: List<PendingItem>
+)
+
+data class PendingItem(
+    val type: String, // "audio", "photo", "sensor"
+    val payload: String // JSON string
+)
+
+data class ServerStatus(
+    val status: String,
+    val timestamp: String
+)
+
+data class VisionRequest(
+    val image_base64: String,
+    val question: String
+)
+
+data class VisionResponse(
+    val description: String
+)
+
+data class ConversationSearchResponse(
+    val conversations: List<ConversationItem>,
+    val total: Int
+)
+
+data class ConversationItem(
+    val id: Long,
+    val event_type: String,
+    val created_at: String,
+    val transcript: String,
+    val response: String,
+    val route: String
+)
+
+data class TerminalSendRequest(
+    val text: String,
+    val session_id: String? = null
+)
+
+data class TerminalSendResponse(
+    val ok: Boolean,
+    val session: String? = null
+)
+
+data class PermissionsResponse(
+    val permissions: List<PermissionPrompt>
+)
+
+data class PermissionPrompt(
+    val id: Long,
+    val session_id: String,
+    val project: String?,
+    val prompt: String,
+    val timestamp: String
+)
+
+data class PermissionRespondRequest(
+    val response: String,
+    val perm_id: Long
+)
+
+data class TerminalWaitResponse(
+    val ok: Boolean,
+    val response: String?,
+    val error: String?
+)
+
+// Shared inbound-notification queue the phone polls for.
+// Server enqueues on POST /api/v1/slack/inbound (+ other kinds); phone drains
+// them on GET /api/v1/slack/pending. Every item carries a `type`:
+//   type == "slack"  → RemoteInput reply notification (slack fields populated)
+//   type == "meeting" (or any non-slack) → plain alert notification (title/body)
+// The queue is SHARED across kinds and ids are one monotonic sequence, so the
+// same high-water dedup covers all types.
+data class SlackPendingResponse(
+    val ok: Boolean = true,
+    val notifications: List<SlackNotify> = emptyList()
+)
+
+// Tolerant of BOTH queue shapes. Slack items fill channelId/sender/text/…;
+// meeting/alert items fill title/body/data. All are nullable so Gson parses
+// either shape without crashing (and it silently ignores unknown fields too).
+data class SlackNotify(
+    val id: Long,                 // server-assigned queue id (monotonic) — used for dedup
+    val type: String? = null,     // "slack" | "meeting" | … (absent on legacy slack items)
+    // ── Slack shape ──
+    val channelId: String? = null,// Slack channel id — echoed back on reply
+    val channel: String? = null,  // human-readable channel name (e.g. "#general")
+    val sender: String? = null,   // display name of who sent it
+    val text: String? = null,     // message body
+    val kind: String? = null,     // dm / channel / mention (optional)
+    val received: String? = null,
+    // ── Generic alert shape (meeting, etc.) ──
+    val title: String? = null,    // alert headline
+    val body: String? = null,     // alert body text
+    val data: Map<String, Any>? = null // arbitrary extra payload (unused for display)
+)
+
+// Sensor config DTOs
+data class SensorDefinition(
+    val id: String,
+    val name: String,
+    val category: String,
+    val description: String?,
+    val icon: String?,
+    val sort_order: Int = 0
+)
+
+data class DeviceSensorConfig(
+    val id: String,
+    val name: String,
+    val category: String,
+    val description: String?,
+    val icon: String?,
+    val available: Int,
+    val muted: Int,
+    val enabled: Boolean = true,
+    val policy: String? = null,        // null=user control, "force_on", "force_off"
+    val policy_reason: String? = null,
+    val locked: Boolean = false,       // true if org policy overrides user toggle
+    val attachments: Map<String, Boolean> = emptyMap()
+)
+
+data class DeviceSensorsResponse(
+    val device: DeviceSensorDevice,
+    val sensors: List<DeviceSensorConfig>
+)
+
+data class DeviceSensorDevice(
+    val id: Int,
+    val name: String,
+    val device_type: String
+)
+
+data class SensorUpdateRequest(
+    val enabled: Boolean
+)
+
+data class SensorAttachRequest(
+    val enabled: Boolean
+)
+
+// Telemetry log entry — matches server's /api/v1/logs schema
+data class LogEntry(
+    val device_id: String,
+    val device_type: String = "phone",
+    val level: String = "info",
+    val source: String = "app",
+    val message: String,
+    val meta: Map<String, String>? = null
+)
+
+data class LogInsertResponse(
+    val ok: Boolean,
+    val inserted: Int
+)
+
+// Intuition snapshot DTOs — /api/v1/intuition/current
+data class IntuitionNow(
+    val where: String? = null,
+    val activity: String? = null,
+    val social: List<String>? = null,
+    val focus: String? = null,
+    val mood: String? = null,
+    val mood_detail: String? = null,
+    val urgency: String? = null,
+    val direction: String? = null,
+    val need: String? = null,
+    val engagement: String? = null,
+    val complexity: String? = null,
+    val recent_topics: List<String>? = null,
+    val last_heard: String? = null,
+    val last_seen: String? = null
+)
+
+data class IntuitionPanService(
+    val name: String,
+    val status: String
+)
+
+data class IntuitionPan(
+    val services: List<IntuitionPanService>? = null,
+    val status: String? = null
+)
+
+data class IntuitionSnapshot(
+    val commander: String? = null,
+    val as_of: Long? = null,
+    val now: IntuitionNow? = null,
+    val pan: IntuitionPan? = null
+)
+
+data class IntuitionResponse(
+    val ok: Boolean,
+    val snapshot: IntuitionSnapshot? = null,
+    val as_of: Long? = null
+)

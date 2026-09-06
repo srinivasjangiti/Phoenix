@@ -1,0 +1,246 @@
+// Terminal Bridge — provides the same API as terminal.js but routes calls
+// through IPC to the Carrier process when running as a Craft child.
+//
+// When PHOENIX_CRAFT=1 (or legacy PAN_CRAFT=1): all terminal operations go via process.send() → Carrier
+// When running standalone: imports terminal.js directly (no bridge needed)
+//
+// This lets hooks.js, steward.js, and server.js use the same import regardless
+// of whether they're in Carrier mode or standalone mode.
+
+const IS_CRAFT = process.env.PHOENIX_CRAFT === '1';
+
+let directTerminal = null;
+
+// IPC request/reply tracking
+let ipcIdCounter = 0;
+const ipcPending = new Map(); // id → { resolve, timer }
+
+if (IS_CRAFT) {
+  // Listen for IPC replies from Carrier
+  process.on('message', (msg) => {
+    if (!msg?.id || !msg?.type?.endsWith(':reply')) return;
+    const pending = ipcPending.get(msg.id);
+    if (pending) {
+      clearTimeout(pending.timer);
+      ipcPending.delete(msg.id);
+      pending.resolve(msg.result);
+    }
+  });
+}
+
+function ipcRequest(type, data = {}, timeoutMs = 5000) {
+  return new Promise((resolve, reject) => {
+    const id = ++ipcIdCounter;
+    const timer = setTimeout(() => {
+      ipcPending.delete(id);
+      reject(new Error(`IPC timeout: ${type}`));
+    }, timeoutMs);
+    ipcPending.set(id, { resolve, timer });
+    process.send({ type, id, ...data });
+  });
+}
+
+function ipcFire(type, data = {}) {
+  // Fire-and-forget — no reply expected
+  try { process.send({ type, ...data }); } catch {}
+}
+
+async function getTerminal() {
+  if (!directTerminal) {
+    directTerminal = await import('./terminal.js');
+  }
+  return directTerminal;
+}
+
+// ==================== Exported API ====================
+// Each function checks IS_CRAFT to decide: IPC or direct call
+
+export async function startTerminalServer(httpServer) {
+  if (IS_CRAFT) return; // Carrier owns terminal — Craft does nothing
+  const t = await getTerminal();
+  return t.startTerminalServer(httpServer);
+}
+
+export async function startDevTerminalServer(httpServer) {
+  if (IS_CRAFT) return;
+  const t = await getTerminal();
+  return t.startDevTerminalServer(httpServer);
+}
+
+export async function listSessions() {
+  if (IS_CRAFT) return ipcRequest('terminal:listSessions').catch(() => []);
+  const t = await getTerminal();
+  return t.listSessions() || [];
+}
+
+export async function getActivePtyPids() {
+  if (IS_CRAFT) return ipcRequest('terminal:getActivePtyPids');
+  const t = await getTerminal();
+  return t.getActivePtyPids() || [];
+}
+
+// #982 — `source` is provenance of the input: 'user_keyboard', 'voice_pipeline',
+// 'test_harness', 'agent_handoff', 'mcp_tool', 'steward', 'system', 'unknown'.
+// Every caller MUST pass a source; defaulting to 'unknown' makes phantom-prompt
+// debugging possible (we log every pty_input event with this tag).
+export function sendToSession(sessionId, text, source = 'unknown') {
+  if (IS_CRAFT) return ipcFire('terminal:sendToSession', { sessionId, text, source });
+  return directTerminal?.sendToSession(sessionId, text, undefined, source);
+}
+
+export function broadcastToSession(sessionId, messageType, data) {
+  if (IS_CRAFT) return ipcFire('terminal:broadcastToSession', { sessionId, messageType, data });
+  return directTerminal?.broadcastToSession(sessionId, messageType, data);
+}
+
+export async function broadcastNotification(notificationType, data) {
+  if (IS_CRAFT) return ipcFire('terminal:broadcastNotification', { notificationType, data });
+  // Use getTerminal() to ensure the module is loaded — directTerminal may be null
+  // if this is called before startTerminalServer (e.g. from createAlert during boot)
+  const t = await getTerminal();
+  return t.broadcastNotification(notificationType, data);
+}
+
+// Targeted chat_update: sends only to the tab that owns this Claude session.
+// Falls back to broadcast-all if no owner found yet.
+export async function broadcastChatUpdate(data) {
+  if (IS_CRAFT) return ipcFire('terminal:broadcastChatUpdate', { data });
+  const t = await getTerminal();
+  return t.broadcastChatUpdate(data);
+}
+
+export function killSession(sessionId) {
+  if (IS_CRAFT) return ipcFire('terminal:killSession', { sessionId });
+  return directTerminal?.killSession(sessionId);
+}
+
+export async function killAllSessions() {
+  if (IS_CRAFT) return ipcRequest('terminal:killAllSessions', {}, 10000);
+  return directTerminal?.killAllSessions();
+}
+
+export function setInFlightTool(cwd, tool, summary, claudeSessionId, isSubagent) {
+  if (IS_CRAFT) return ipcFire('terminal:setInFlightTool', { cwd, tool, summary, claudeSessionId, isSubagent });
+  return directTerminal?.setInFlightTool(cwd, tool, summary, claudeSessionId, isSubagent);
+}
+
+export function clearInFlightTool(cwd, claudeSessionId) {
+  if (IS_CRAFT) return ipcFire('terminal:clearInFlightTool', { cwd, claudeSessionId });
+  return directTerminal?.clearInFlightTool(cwd, claudeSessionId);
+}
+
+export function getInFlightTool(cwd) {
+  if (IS_CRAFT) return ipcRequest('terminal:getInFlightTool', { cwd });
+  return directTerminal?.getInFlightTool(cwd);
+}
+
+export function getPendingPermissions() {
+  if (IS_CRAFT) return ipcRequest('terminal:getPendingPermissions').catch(() => []);
+  return directTerminal?.getPendingPermissions() || [];
+}
+
+export function clearPermission(permissionId) {
+  if (IS_CRAFT) return ipcFire('terminal:clearPermission', { permissionId });
+  return directTerminal?.clearPermission(permissionId);
+}
+
+export function addPendingPermission(permission) {
+  if (IS_CRAFT) return ipcFire('terminal:addPendingPermission', { permission });
+  return directTerminal?.addPendingPermission(permission);
+}
+
+export function respondToPermission(permissionId, response) {
+  if (IS_CRAFT) return ipcFire('terminal:respondToPermission', { permissionId, response });
+  return directTerminal?.respondToPermission(permissionId, response);
+}
+
+// Functions that only exist in direct mode (not needed by Craft)
+export function getTerminalProjects() {
+  if (IS_CRAFT) return ipcRequest('terminal:getTerminalProjects');
+  return directTerminal?.getTerminalProjects() || [];
+}
+
+// Re-export for compatibility — listDevSessions/killDevSession only matter in standalone
+export function listDevSessions() {
+  return directTerminal?.listDevSessions?.() || [];
+}
+export function killDevSession(id) {
+  return directTerminal?.killDevSession?.(id);
+}
+
+// Process registry — tracks all PIDs spawned by Phoenix
+export async function getProcessRegistry() {
+  if (IS_CRAFT) return ipcRequest('terminal:getProcessRegistry');
+  const t = await getTerminal();
+  return t.getProcessRegistry() || [];
+}
+
+export function registerProcess(info) {
+  if (IS_CRAFT) return ipcFire('terminal:registerProcess', info);
+  return directTerminal?.registerProcess(info);
+}
+
+export function deregisterProcess(pid, exitCode) {
+  if (IS_CRAFT) return ipcFire('terminal:deregisterProcess', { pid, exitCode });
+  return directTerminal?.deregisterProcess(pid, exitCode);
+}
+
+// Find which PTY session owns a given Claude session ID
+export function findSessionByClaudeId(claudeSessionId) {
+  if (IS_CRAFT) return ipcRequest('terminal:findSessionByClaudeId', { claudeSessionId });
+  return directTerminal?.findSessionByClaudeId(claudeSessionId) || null;
+}
+
+// Pipe mode: send message to session's LLM adapter
+// Uses ipcFire (fire-and-forget) because Carrier's handler doesn't reply.
+// The message IS sent successfully — we just can't confirm it over IPC.
+// Returns true immediately so the HTTP endpoint clears the input.
+export async function pipeSend(sessionId, text) {
+  if (IS_CRAFT) {
+    ipcFire('terminal:pipeSend', { sessionId, text });
+    return true; // fire-and-forget — message will be delivered
+  }
+  const t = await getTerminal();
+  return t.pipeSend(sessionId, text);
+}
+
+// Get transcript messages for a session (HTTP fallback for page load)
+export async function getSessionMessages(sessionId) {
+  if (IS_CRAFT) return ipcRequest('terminal:getSessionMessages', { sessionId });
+  const t = await getTerminal();
+  return t.getSessionMessages(sessionId);
+}
+
+// Pipe mode: interrupt current LLM query
+export async function pipeInterrupt(sessionId) {
+  if (IS_CRAFT) return ipcFire('terminal:pipeInterrupt', { sessionId });
+  const t = await getTerminal();
+  return t.pipeInterrupt(sessionId);
+}
+
+export async function pipeSetModel(sessionId, modelId) {
+  if (IS_CRAFT) return ipcFire('terminal:pipeSetModel', { sessionId, modelId });
+  const t = await getTerminal();
+  return t.pipeSetModel(sessionId, modelId);
+}
+
+// Reset a session's LLM adapter — clears broken state (frozen session.messages, stuck
+// claudeRunning, etc.) so the next message creates a fresh adapter that resumes from JSONL.
+export async function pipeResetAdapter(sessionId) {
+  if (IS_CRAFT) return ipcRequest('terminal:pipeResetAdapter', { sessionId });
+  const t = await getTerminal();
+  return t.pipeResetAdapter(sessionId);
+}
+
+export async function createPipeSession(sessionId, opts = {}) {
+  if (IS_CRAFT) return ipcRequest('terminal:createPipeSession', { sessionId, opts });
+  const t = await getTerminal();
+  return t.createPipeSession(sessionId, opts);
+}
+
+// Debug: stream buffer size per session — used by p1 regression test (#437)
+export async function getSessionBufferSize(sessionId) {
+  if (IS_CRAFT) return ipcRequest('terminal:getSessionBufferSize', { sessionId });
+  const t = await getTerminal();
+  return t.getSessionBufferSize(sessionId);
+}

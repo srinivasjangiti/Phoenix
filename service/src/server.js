@@ -1,0 +1,6664 @@
+// Phoenix Service — the core server running on port 7777
+//
+// Runs as a Windows service (WinSW via daemon/phoenix.exe), auto-starts on boot.
+// Uses local Claude Code CLI for AI (no API key needed — claude-runner.cjs
+// shells out to `claude -p` which uses the user's Claude Code subscription).
+//
+// On startup: syncs project DB with disk reality (scans for .phoenix / .phoenix files),
+// then re-syncs every 10 minutes to pick up renames, new projects, deletions.
+//
+// Routes:
+//   /hooks          - Claude Code session hooks (SessionStart/SessionEnd)
+//   /api/v1         - Phone/Pandant API (audio, photos, queries, actions)
+//   /api/v1/devices - Device registry and command queue
+//   /dashboard      - Web UI dashboard + API
+//   /health         - Health check
+
+import express from 'express';
+import { join, dirname, resolve as pathResolve, basename } from 'path';
+import { fileURLToPath } from 'url';
+import hooksRouter, { injectSessionContext } from './routes/hooks.js';
+import apiRouter from './routes/api.js';
+import authRouter from './routes/auth.js';
+import devicesRouter from './routes/devices.js';
+import dashboardRouter, { createAlert } from './routes/dashboard.js';
+import sensorsRouter, { seedSensors } from './routes/sensors.js';
+import runnerRouter from './routes/runner.js';
+import incognitoRouter, { cleanupExpiredIncognito } from './routes/incognito.js';
+import auditRouter from './routes/audit.js';
+import replicationRouter from './routes/replication.js';
+import zonesRouter, { getActiveZones, findZonesForPoint } from './routes/zones.js';
+import qualityLogRouter from './routes/quality-log.js';
+import homeAssistantRouter from './routes/homeassistant.js';
+import mcpQualityLogRouter from './routes/mcp-quality-log.js';
+import mcpPhoenixRouter from './routes/mcp-phoenix.js';
+import captureRouter from './routes/capture.js';
+import dashboardsRouter from './routes/dashboards.js';
+import exchangeRouter from './routes/exchange.js';
+import { applyCaptureConsentAtBoot, isCaptureOn } from './capture-consent.js';
+import identityRouter, { observeFace, observeVoice } from './routes/identity.js';
+import syncRouter, { startPersonalSync, stopPersonalSync } from './routes/sync.js';
+import orgsRouter from './routes/orgs.js';
+import chatRouter, { ensureChatSchema } from './routes/chat.js';
+import emailRouter, { initEmail } from './routes/email.js';
+import teamsRouter from './routes/teams.js';
+import wrapRouter, { ensureWrapSchema } from './routes/wrap.js';
+import messagingPrefsRouter, { ensureMessagingPrefsSchema } from './routes/messaging-prefs.js';
+import intuitionRouter from './routes/intuition.js';
+import preferencesRouter from './routes/preferences.js';
+import { benchmarkApiRouter, benchmarkDashRouter } from './routes/benchmark.js';
+import { registerVoiceRoutes } from './routes/voice.js';
+import { ensureIntuitionSchema } from './intuition.js';
+import { ensureOwnershipSchema } from './schema/ownership.js';
+import { writeThought, recentThoughts } from './thoughts.js';
+import * as needs from './intuition/needs.js';
+import { currentUserId as needsCurrentUser } from './intuition/nourishment.js';
+import { recentInterjections, recordFeedback } from './intuition/action.js';
+import { startScreenWatcher, startBurst, resetBackoff, getScreenWatcherStatus } from './screen-watcher.js';
+import { startWebcamWatcher, getWebcamStatus, getWebcamContext } from './webcam-watcher.js';
+import { startConvStateWatcher, noteUtterance as noteConvUtterance, getConversationState, getConvStateStatus, getConversationBuffer } from './conv-state-watcher.js';
+import { startWatchdog, notifyDashboardLoaded } from './dashboard-watchdog.js';
+import guardianRouter from './routes/guardian.js';
+import { guardianMiddleware } from './guardian.js';
+import { privacyMiddleware } from './privacy.js';
+import privacyRouter from './routes/privacy.js';
+import { extractUser, setImpersonation, clearImpersonation, getImpersonation } from './middleware/auth.js';
+import { requireFeature, requireNotChild, getPermissionsMatrix } from './permissions.js';
+import { requireOrg, auditLog, verifyAllAuditChains, resignAuditChain } from './middleware/org-context.js';
+import { evolve } from './evolution/engine.js';
+import { buildContext as buildMemoryContext } from './memory/index.js';
+import { getConfig as getAutoDevConfig, saveConfig as saveAutoDevConfig, getAutoDevLog } from './autodev.js';
+import { getAllStacks, scanStacks, getProjectBriefing, getEnvironmentBriefing } from './stack-scanner.js';
+import { bootAll, shutdownAll, getAtlasData, getServiceStatus, reportServiceRun } from './steward.js';
+import { startCloudflareTunnel, stopCloudflareTunnel, getTunnelURL } from './cloudflare-tunnel.js';
+export { getTunnelURL }; // re-export so client.js can import it
+import { startDiscovery, stopDiscovery } from './discovery.js';
+import { PHOENIX_MODE, IS_USER_MODE, IS_SERVICE_MODE, MODE_INFO } from './mode.js';
+import { getDataDir } from './platform.js';
+import { syncProjects, get, all, insert, run, indexEventFTS, db, getOllamaUrl, logDecision } from './db.js';
+import { searchMemory, backfillEmbeddings, backfillStatus, abortBackfill } from './memory-search.js';
+import { listScopes, wipeScope } from './db-registry.js';
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync } from 'fs';
+import { createHash } from 'crypto';
+import https from 'https';
+import http from 'node:http';
+import { execFileSync, execSync, execFile, exec, spawn as spawnChild } from 'child_process';
+import { startTerminalServer, startDevTerminalServer, listSessions, killSession, killAllSessions, getActivePtyPids, getTerminalProjects, sendToSession, broadcastToSession, broadcastNotification, getPendingPermissions, clearPermission, respondToPermission, getProcessRegistry, pipeSend, pipeInterrupt, pipeSetModel, pipeResetAdapter, getSessionMessages, createPipeSession, getSessionBufferSize } from './terminal-bridge.js';
+import { startClientServer, sendToClient as sendToClientDevice, getConnectedClients, checkInviteToken } from './client-manager.js';
+import { WebSocketServer as WsServer } from 'ws';
+import clientRouter from './routes/client.js';
+import activityRouter from './routes/activity.js';
+import { startActivityTracker } from './activity-tracker.js';
+const IS_CRAFT = process.env.PHOENIX_CRAFT === '1';
+import { hostname, homedir } from 'os';
+import { PROFILE, featureEnabled, profileSummary } from './profiles.js';
+import { redactSettings, getSecret } from './secrets.js';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+const PORT = parseInt(process.env.PHOENIX_PORT) || 7777;
+const HOST = '0.0.0.0'; // Listen on all interfaces (phone needs LAN access)
+// Dev mode: PAN_DEV=1 runs server on a separate port with no side-effects.
+// Skips steward, device registration, service boots — just
+// Express + API + DB (read-safe via WAL) + test runner. Safe to run alongside prod.
+const IS_DEV = process.env.PHOENIX_DEV === '1' || process.env.PHOENIX_DEV === 'true';
+
+// ── Per-device push WebSocket registry ───────────────────────────────────────
+// Devices connect to WS /api/v1/device/push?device_id=X for real-time action delivery.
+export const devicePushSockets = new Map(); // device_id → WebSocket
+
+export function pushToDevice(device_id, payload) {
+  const ws = devicePushSockets.get(device_id);
+  if (ws && ws.readyState === 1) { // OPEN
+    ws.send(JSON.stringify(payload));
+    return true;
+  }
+  return false;
+}
+
+export function pushToDeviceType(device_type, org_id, payload) {
+  let sent = 0;
+  for (const [, ws] of devicePushSockets) {
+    if (ws.deviceType === device_type && ws.orgId === org_id && ws.readyState === 1) {
+      ws.send(JSON.stringify(payload));
+      sent++;
+    }
+  }
+  return sent;
+}
+
+const app = express();
+app.use(express.json({ limit: '10mb' }));
+
+// ==================== API Performance Tracking ====================
+// Tracks request latency per route for the /dashboard/api/perf endpoint.
+const _perfStats = { requests: 0, slowRequests: 0, totalMs: 0, slowest: [] };
+const _perfByRoute = new Map(); // route → { count, totalMs, maxMs }
+
+// ==================== Event-Loop Lag Monitor ====================
+//
+// Why: when the user reports "dashboard tab takes 60+ seconds to load even
+// though the route handler is a pure in-memory read," the only possible
+// explanation is that the Node event loop was BLOCKED between accept and
+// dispatch. The handler ran fast — it just got dispatched 60 seconds late
+// because some synchronous code (sync SQLite, JSON.parse on huge buffer,
+// execSync, etc.) was hogging the thread.
+//
+// What this does:
+//   - perf_hooks.monitorEventLoopDelay() runs a hi-res histogram in the libuv
+//     thread, sampling every 20ms. We read max/p99/mean every 5s and keep a
+//     rolling 60-sample buffer (= 5 min of history at 5s cadence).
+//   - A setImmediate-based heartbeat detects single blocks > 1500ms. When it
+//     fires, we log the block duration AND the active timer/handle count so
+//     we can correlate the block with what was running.
+//
+// Surface: /dashboard/api/perf gets new fields:
+//   event_loop_lag_ms.{max, p99, mean, current}
+//   recent_blocks: [{ duration_ms, at, handles }] — last 20 detected blocks
+//
+// Read first. Optimize second.
+import { monitorEventLoopDelay } from 'perf_hooks';
+const _loopMonitor = monitorEventLoopDelay({ resolution: 20 });
+_loopMonitor.enable();
+const _recentBlocks = []; // [{ duration_ms, at_iso, handles }]
+const _BLOCK_THRESHOLD_MS = 1500;
+const _BLOCK_HISTORY = 20;
+let _loopHeartbeatLast = performance.now();
+function _loopHeartbeat() {
+  const now = performance.now();
+  const elapsed = now - _loopHeartbeatLast;
+  // Expected: ~50ms (setImmediate fires roughly that fast under no load).
+  // If elapsed >> 50ms, the previous tick blocked the loop.
+  if (elapsed > _BLOCK_THRESHOLD_MS) {
+    const handles = process._getActiveHandles?.().length ?? -1;
+    const requests = process._getActiveRequests?.().length ?? -1;
+    const entry = {
+      duration_ms: Math.round(elapsed),
+      at_iso: new Date().toISOString(),
+      handles,
+      requests,
+    };
+    _recentBlocks.push(entry);
+    if (_recentBlocks.length > _BLOCK_HISTORY) _recentBlocks.shift();
+    // Also write to stderr so it shows up in carrier-piped logs immediately
+    console.warn(`[loop-block] ${entry.duration_ms}ms · handles=${handles} reqs=${requests} at ${entry.at_iso}`);
+  }
+  _loopHeartbeatLast = now;
+  setImmediate(_loopHeartbeat);
+}
+setImmediate(_loopHeartbeat);
+
+function _getLoopStats() {
+  const ns_to_ms = 1e6;
+  return {
+    max:  +(_loopMonitor.max  / ns_to_ms).toFixed(1),
+    p99:  +(_loopMonitor.percentile(99) / ns_to_ms).toFixed(1),
+    p95:  +(_loopMonitor.percentile(95) / ns_to_ms).toFixed(1),
+    mean: +(_loopMonitor.mean / ns_to_ms).toFixed(1),
+    min:  +(_loopMonitor.min  / ns_to_ms).toFixed(1),
+    stddev: +(_loopMonitor.stddev / ns_to_ms).toFixed(1),
+  };
+}
+function _resetLoopStats() { _loopMonitor.reset(); }
+app.use((req, res, next) => {
+  const start = performance.now();
+  const original = res.end;
+  res.end = function (...args) {
+    const ms = +(performance.now() - start).toFixed(1);
+    const route = req.route?.path || req.path;
+    _perfStats.requests++;
+    _perfStats.totalMs += ms;
+    if (ms > 2000) _perfStats.slowRequests++;
+    // Track per-route stats
+    let r = _perfByRoute.get(route);
+    if (!r) { r = { count: 0, totalMs: 0, maxMs: 0 }; _perfByRoute.set(route, r); }
+    r.count++;
+    r.totalMs += ms;
+    if (ms > r.maxMs) r.maxMs = ms;
+    // Keep top 10 slowest requests (rolling)
+    if (_perfStats.slowest.length < 10 || ms > _perfStats.slowest[_perfStats.slowest.length - 1].ms) {
+      _perfStats.slowest.push({ route, ms, ts: Date.now() });
+      _perfStats.slowest.sort((a, b) => b.ms - a.ms);
+      if (_perfStats.slowest.length > 10) _perfStats.slowest.length = 10;
+    }
+    return original.apply(this, args);
+  };
+  next();
+});
+
+// Auto-register/update phone device from any route (phone sends X-Device-Name + X-Device-Id headers)
+// Uses X-Device-Id as stable key (survives app reinstall) instead of IP-based hostnames
+// CRITICAL: Must use canonical phone-<id> format and properly scope to org_id
+app.use((req, res, next) => {
+  const ip = req.ip || req.connection?.remoteAddress || 'unknown';
+  const deviceName = req.headers['x-device-name'];
+  const deviceId = req.headers['x-device-id'];
+  const tailscaleHost = req.headers['x-tailscale-hostname'];
+  const orgId = req.org_id || 'org_personal';
+
+  if (deviceName && ip !== '127.0.0.1' && ip !== '::1' && !ip.endsWith('127.0.0.1')) {
+    // Use stable device ID if available, fall back to IP-based
+    // CANONICAL FORM: must be phone-<id> (never phone-phone-id or bare id)
+    let phoneHost;
+    if (deviceId) {
+      phoneHost = deviceId.startsWith('phone-') ? deviceId : `phone-${deviceId}`;
+    } else {
+      phoneHost = `phone-${ip.replace(/[^0-9.]/g, '')}`;
+    }
+
+    const existing = get("SELECT * FROM devices WHERE hostname = :h AND org_id = :org_id",
+      { ':h': phoneHost, ':org_id': orgId });
+    if (existing) {
+      run("UPDATE devices SET name = :name, last_seen = datetime('now','localtime') WHERE hostname = :h AND org_id = :org_id",
+        { ':name': deviceName, ':h': phoneHost, ':org_id': orgId });
+      // Track Tailscale hostname changes — if it changed, the old node is stale
+      if (tailscaleHost && existing.tailscale_hostname && tailscaleHost !== existing.tailscale_hostname) {
+        console.log(`[Phoenix Device] Tailscale hostname changed: ${existing.tailscale_hostname} → ${tailscaleHost} — cleaning up stale node`);
+        cleanupStaleTailscaleNode(existing.tailscale_hostname);
+      }
+      if (tailscaleHost && tailscaleHost !== existing.tailscale_hostname) {
+        run("UPDATE devices SET tailscale_hostname = :ts WHERE hostname = :h AND org_id = :org_id",
+          { ':ts': tailscaleHost, ':h': phoneHost, ':org_id': orgId });
+      }
+    } else if (deviceId) {
+      // Check for legacy IP-based records for this device and migrate
+      // Also handle phantom bare-form rows that might exist from pre-canonicalization code
+      const legacyIpHost = `phone-${ip.replace(/[^0-9.]/g, '')}`;
+      const bareId = deviceId.startsWith('phone-') ? deviceId.slice(6) : deviceId;
+
+      // Check legacy IP-based first
+      let legacy = get("SELECT * FROM devices WHERE hostname = :h AND org_id = :org_id",
+        { ':h': legacyIpHost, ':org_id': orgId });
+
+      // If not found by IP, check for bare device_id form (old Android convention)
+      if (!legacy && bareId && bareId !== legacyIpHost) {
+        legacy = get("SELECT * FROM devices WHERE hostname = :h AND org_id = :org_id",
+          { ':h': bareId, ':org_id': orgId });
+      }
+
+      if (legacy) {
+        run("UPDATE devices SET hostname = :newH, name = :name, tailscale_hostname = :ts, last_seen = datetime('now','localtime') WHERE hostname = :h AND org_id = :org_id",
+          { ':newH': phoneHost, ':name': deviceName, ':ts': tailscaleHost || null, ':h': legacy.hostname, ':org_id': orgId });
+        console.log(`[#681] Migrated legacy device ${legacy.hostname} → ${phoneHost}`);
+      } else {
+        try {
+          insert(`INSERT INTO devices (hostname, name, device_type, capabilities, tailscale_hostname, last_seen, org_id)
+            VALUES (:h, :name, 'phone', '["mic","camera","sensors","gps"]', :ts, datetime('now','localtime'), :org_id)`, {
+            ':h': phoneHost, ':name': deviceName, ':ts': tailscaleHost || null, ':org_id': orgId
+          });
+          console.log(`[Phoenix Device] Registered phone: ${phoneHost} (${deviceName})`);
+        } catch(e) { /* UNIQUE constraint — already exists */ }
+      }
+    }
+  }
+  next();
+});
+
+// Cleanup stale Tailscale nodes — uses local tailscale CLI (full permissions on this machine)
+// then falls back to Tailscale API if available
+async function cleanupStaleTailscaleNode(staleHostname) {
+  try {
+    // Get full peer list from tailscale status --json
+    let statusJson;
+    try {
+      statusJson = execFileSync('C:\\Program Files\\Tailscale\\tailscale.exe',
+        ['status', '--json'], { timeout: 5000, encoding: 'utf8', windowsHide: true });
+    } catch {
+      try {
+        statusJson = execFileSync('tailscale',
+          ['status', '--json'], { timeout: 5000, encoding: 'utf8', windowsHide: true });
+      } catch { return; }
+    }
+
+    const status = JSON.parse(statusJson);
+    const peers = status.Peer || {};
+    const staleNodes = Object.entries(peers)
+      .filter(([_, v]) => v.HostName === staleHostname && !v.Online)
+      .map(([k, v]) => ({ nodekey: k, hostname: v.HostName, ip: (v.TailscaleIPs || [])[0] }));
+
+    if (staleNodes.length === 0) {
+      console.log(`[Phoenix Device] No stale nodes found for hostname: ${staleHostname}`);
+      return;
+    }
+
+    // Try Tailscale API to delete (needs API key with devices:write scope)
+    // env-first (PAN_TAILSCALE_OAUTH_CLIENT_ID / _SECRET), db as fallback
+    const clientId = getSecret('tailscale_oauth_client_id');
+    const clientSecret = getSecret('tailscale_oauth_client_secret');
+    if (clientId && clientSecret) {
+      const auth = 'Basic ' + Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+      const listRes = await fetch('https://api.tailscale.com/api/v2/tailnet/-/devices', {
+        headers: { 'Authorization': auth }
+      });
+      if (listRes.ok) {
+        const data = await listRes.json();
+        const apiDevices = (data.devices || []).filter(d =>
+          d.hostname === staleHostname && !d.online
+        );
+        for (const dev of apiDevices) {
+          console.log(`[Phoenix Device] Removing stale node via API: ${dev.hostname} (${dev.id})`);
+          const delRes = await fetch(`https://api.tailscale.com/api/v2/device/${dev.id}`, {
+            method: 'DELETE', headers: { 'Authorization': auth }
+          });
+          console.log(`[Phoenix Device] Delete result: ${delRes.status}`);
+        }
+        return;
+      }
+    }
+
+    // Fallback: log the stale nodes so the user knows (API doesn't have permissions)
+    for (const node of staleNodes) {
+      console.warn(`[Phoenix Device] Stale Tailscale node detected: ${node.hostname} (${node.ip}) — remove manually at https://login.tailscale.com/admin/machines`);
+    }
+  } catch (e) {
+    console.warn(`[Phoenix Device] Tailscale cleanup failed: ${e.message}`);
+  }
+}
+
+// Auth routes (some endpoints skip auth — login-related stuff)
+app.use('/api/v1/auth', (req, res, next) => {
+  const publicPaths = ['/oauth', '/google-callback', '/github-callback', '/dev-token'];
+  if (publicPaths.includes(req.path)) return next();
+  // GET /users is public (list users for login chooser), mutations need auth
+  if (req.path === '/users' && req.method === 'GET') return next();
+  // GET /providers is public (login page needs it), POST needs auth
+  if (req.path === '/providers' && req.method === 'GET') return next();
+  // Auto-auth for localhost/Tailscale (same as general middleware)
+  const ip = req.ip || req.connection?.remoteAddress || 'unknown';
+  const isLocalhost = ip === '127.0.0.1' || ip === '::1' || ip.endsWith('127.0.0.1') || ip === '::ffff:127.0.0.1';
+  const isTailscale = ip.startsWith('100.') || ip.startsWith('::ffff:100.');
+  if (isLocalhost || isTailscale) {
+    req.user = { id: 1, email: 'owner@localhost', display_name: 'Owner', role: 'owner' };
+    return next();
+  }
+  extractUser(req, res, next);
+}, authRouter);
+
+// Phone screenshot upload — saves image to temp file so Claude Code can view it
+// Phone sends base64 image data. Returns the local file path for Claude to read.
+// Also stores the latest screenshot path in settings so Claude can find it.
+app.post('/api/v1/screenshot/upload', async (req, res) => {
+  try {
+    const { data, mimeType, source } = req.body;
+    if (!data) return res.status(400).json({ ok: false, error: 'No image data' });
+    const ext = (mimeType || 'image/png').split('/')[1] || 'png';
+    const filename = `screenshot_${source || 'phone'}_${Date.now()}.${ext}`;
+    const dir = join(process.env.TEMP || '/tmp', 'phoenix-screenshots');
+    mkdirSync(dir, { recursive: true });
+    const filePath = join(dir, filename);
+    writeFileSync(filePath, Buffer.from(data, 'base64'));
+    // Store path so Claude can reference it
+    run("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('last_screenshot', :path, datetime('now','localtime'))", { ':path': JSON.stringify(filePath) });
+    console.log(`[Phoenix Screenshot] Saved: ${filePath} (${Math.round(data.length / 1024)}KB base64)`);
+    res.json({ ok: true, path: filePath, filename });
+  } catch (err) {
+    console.error('[Phoenix Screenshot] Error:', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// GET /api/v1/screenshot/latest — returns path to most recent screenshot
+app.get('/api/v1/screenshot/latest', (req, res) => {
+  try {
+    const row = get("SELECT value FROM settings WHERE key = 'last_screenshot'");
+    if (!row) return res.json({ ok: false, error: 'No screenshots uploaded yet' });
+    const filePath = row.value.replace(/^"|"$/g, '');
+    if (!existsSync(filePath)) return res.json({ ok: false, error: 'Screenshot file missing', path: filePath });
+    res.json({ ok: true, path: filePath });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// GET /api/v1/screenshot/view — serve the actual image file
+app.get('/api/v1/screenshot/view', (req, res) => {
+  try {
+    const filePath = req.query.path;
+    if (!filePath || !existsSync(filePath)) return res.status(404).json({ error: 'Not found' });
+    // Security: only serve from phoenix-screenshots dir
+    if (!filePath.includes('phoenix-screenshots') && !filePath.includes('pan-screenshots')) return res.status(403).json({ error: 'Forbidden' });
+    const ext = filePath.split('.').pop();
+    const mimeMap = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp' };
+    res.setHeader('Content-Type', mimeMap[ext] || 'image/png');
+    res.send(readFileSync(filePath));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// List all screenshots
+app.get('/api/v1/screenshot/list', (req, res) => {
+  try {
+    const dir = join(process.env.TEMP || '/tmp', 'phoenix-screenshots');
+    if (!existsSync(dir)) return res.json({ screenshots: [] });
+    const files = readdirSync(dir)
+      .filter(f => /\.(png|jpg|jpeg|webp)$/i.test(f))
+      .map(f => ({ filename: f, path: join(dir, f), created: statSync(join(dir, f)).mtimeMs }))
+      .sort((a, b) => b.created - a.created)
+      .slice(0, 50);
+    res.json({ screenshots: files });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Clipboard image upload — saves pasted image to temp file, returns path (no auth — local only)
+app.post('/api/v1/clipboard-image', async (req, res) => {
+  try {
+    const { data, mimeType } = req.body;
+    if (!data) return res.status(400).json({ ok: false, error: 'No image data' });
+    const ext = (mimeType || 'image/png').split('/')[1] || 'png';
+    const filename = `clipboard_${Date.now()}.${ext}`;
+    const { join } = await import('path');
+    const { writeFileSync, mkdirSync, readdirSync, statSync, unlinkSync } = await import('fs');
+    const dir = join(process.env.TEMP || '%USERPROFILE%\\AppData\\Local\\Temp', 'phoenix-clipboard');
+    mkdirSync(dir, { recursive: true });
+
+    // Purge clipboard files older than 2 hours to prevent accumulation
+    try {
+      const cutoff = Date.now() - 2 * 60 * 60 * 1000;
+      for (const f of readdirSync(dir)) {
+        if (!/^clipboard_\d+\.\w+$/.test(f)) continue;
+        const fp = join(dir, f);
+        if (statSync(fp).mtimeMs < cutoff) { try { unlinkSync(fp); } catch {} }
+      }
+    } catch {}
+
+    const filePath = join(dir, filename);
+    writeFileSync(filePath, Buffer.from(data, 'base64'));
+    res.json({ ok: true, path: filePath });
+  } catch (err) {
+    console.error('[Phoenix Clipboard] Error:', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Setup status — no auth required (first-run needs this before they have a token)
+app.get('/api/setup-status', async (req, res) => {
+  const result = { configured: false, model: null, provider: null, error: null };
+
+  // Check if a Server API Model is set
+  try {
+    const row = get("SELECT value FROM settings WHERE key = 'ai_model'");
+    if (row) {
+      const model = row.value.replace(/^"|"$/g, '');
+      if (model) {
+        result.model = model;
+        result.configured = true;
+      }
+    }
+  } catch {}
+
+  // Also check if a CLI Provider is set (e.g. "claude" uses Claude Code subscription directly)
+  if (!result.configured) {
+    try {
+      const row = get("SELECT value FROM settings WHERE key = 'terminal_ai'");
+      if (row) {
+        const ta = JSON.parse(row.value);
+        const provider = ta.provider || '';
+        if (provider) {
+          result.model = provider + ' (CLI)';
+          result.configured = true;
+        }
+      }
+    } catch {}
+  }
+
+  // Default: Phoenix always has Claude CLI available via subscription
+  if (!result.configured) {
+    result.model = 'claude (CLI)';
+    result.configured = true;
+  }
+
+  if (result.configured) {
+    // If using CLI provider, just mark as working — no API test needed
+    if (result.model && result.model.endsWith('(CLI)')) {
+      result.provider = 'working';
+    } else {
+      try {
+        const { claude } = await import('./claude.js');
+        const test = await claude('Say "ok" and nothing else.', { timeout: 10000, maxTokens: 10, caller: 'setup-check' });
+        if (test) result.provider = 'working';
+      } catch (e) {
+        result.error = e.message;
+        result.configured = false;
+      }
+    }
+  }
+
+  try {
+    const row = get("SELECT value FROM settings WHERE key = 'custom_models'");
+    if (row) {
+      const models = JSON.parse(row.value);
+      if (models.length > 0) result.has_custom_models = true;
+    }
+  } catch {}
+
+  res.json(result);
+});
+
+// System health check — tests every service, used by setup wizard and monitoring
+app.get('/api/system-check', async (req, res) => {
+  const checks = {};
+
+  // 1. Database
+  try {
+    get("SELECT 1");
+    checks.database = { ok: true, status: 'Running' };
+  } catch (e) {
+    checks.database = { ok: false, status: 'Down', error: e.message };
+  }
+
+  // 2. AI provider
+  try {
+    const row = get("SELECT value FROM settings WHERE key = 'ai_model'");
+    const model = row?.value?.replace(/^"|"$/g, '') || 'claude (CLI)';
+    checks.ai = { ok: true, status: 'Configured', model };
+  } catch {
+    checks.ai = { ok: false, status: 'Not Configured' };
+  }
+
+  // 3. Memory pipeline (check tables exist and have data)
+  try {
+    const eventCount = get("SELECT COUNT(*) as c FROM events")?.c || 0;
+    const memCount = get("SELECT COUNT(*) as c FROM memory_items")?.c || 0;
+    checks.memory = { ok: eventCount > 0, status: eventCount > 0 ? 'Active' : 'Empty', events: eventCount, memories: memCount };
+  } catch (e) {
+    checks.memory = { ok: false, status: 'Error', error: e.message };
+  }
+
+  // 4. Steward (check for recent heartbeat)
+  try {
+    const hb = get("SELECT value FROM settings WHERE key = 'steward_heartbeat'");
+    const ts = hb ? (JSON.parse(hb.value).timestamp || 0) : 0;
+    if (ts) {
+      const age = Date.now() - ts;
+      checks.steward = { ok: age < 120000, status: age < 120000 ? 'Running' : 'Stale', last_heartbeat_ms: age };
+    } else {
+      checks.steward = { ok: false, status: 'No Heartbeats' };
+    }
+  } catch {
+    checks.steward = { ok: false, status: 'Error' };
+  }
+
+  // 5. Intuition — check via JSON file or API, not DB (table may use different connection)
+  try {
+    const fs = await import('fs');
+    const { getDataDir } = await import('./platform.js');
+    const intuitionPath = (await import('path')).join(getDataDir(), 'intuition.json');
+    if (fs.existsSync(intuitionPath)) {
+      const raw = JSON.parse(fs.readFileSync(intuitionPath, 'utf8'));
+      const age = Date.now() - (raw.as_of || 0);
+      checks.intuition = { ok: age < 120000, status: age < 120000 ? 'Running' : 'Stale', age_ms: age };
+    } else {
+      checks.intuition = { ok: false, status: 'No Snapshots' };
+    }
+  } catch {
+    checks.intuition = { ok: false, status: 'Not Available' };
+  }
+
+  // 6. Encryption
+  try {
+    const fs = await import('fs');
+    const { getDataDir } = await import('./platform.js');
+    const pathMod = await import('path');
+    const keyPath = pathMod.join(getDataDir(), 'phoenix.key');
+    const legacyKeyPath = pathMod.join(getDataDir(), 'pan.key');
+    const hasKey = fs.existsSync(keyPath) || fs.existsSync(legacyKeyPath);
+    checks.encryption = { ok: hasKey, status: hasKey ? 'Active' : 'No Key' };
+  } catch {
+    checks.encryption = { ok: false, status: 'Error' };
+  }
+
+  // 7. Terminal/PTY
+  try {
+    const sessions = get("SELECT COUNT(*) as c FROM (SELECT 1 LIMIT 1)");
+    // Terminal is always available if server is running
+    checks.terminal = { ok: true, status: 'Available' };
+  } catch {
+    checks.terminal = { ok: false, status: 'Error' };
+  }
+
+  // 8. Modules
+  try {
+    const { getModulesStatus } = await import('./modules.js');
+    const mods = getModulesStatus();
+    checks.modules = { ok: true, status: `${mods.filter(m => m.loaded).length}/${mods.length} Loaded`, modules: mods };
+  } catch {
+    checks.modules = { ok: true, status: '0 Loaded' };
+  }
+
+  // Summary
+  const allOk = Object.values(checks).every(c => c.ok);
+  const failedCount = Object.values(checks).filter(c => !c.ok).length;
+
+  res.json({
+    ok: allOk,
+    failed: failedCount,
+    total: Object.keys(checks).length,
+    checks,
+  });
+});
+
+// Auth middleware — all other /api routes get req.user
+// Tailscale or localhost requests with X-Device-Name header auto-authenticate
+app.use('/api', (req, res, next) => {
+  // Bootstrap endpoints skip auth
+  if (req.path === '/v1/tailscale/auto-auth' || req.path === '/v1/tailscale/status') {
+    req.user = { id: 1, email: 'bootstrap@localhost', display_name: 'Bootstrap', role: 'owner' };
+    return next();
+  }
+  const ip = req.ip || req.connection?.remoteAddress || 'unknown';
+  const deviceName = req.headers['x-device-name'];
+  const isLocalhost = ip === '127.0.0.1' || ip === '::1' || ip.endsWith('127.0.0.1') || ip === '::ffff:127.0.0.1';
+  const isTailscale = ip.startsWith('100.') || ip.startsWith('::ffff:100.');
+  const isLan = ip.startsWith('192.168.') || ip.startsWith('10.') || ip.startsWith('172.');
+  if (deviceName && (isLocalhost || isTailscale || isLan)) {
+    const imp = getImpersonation();
+    req.user = { id: 1, email: 'owner@localhost', display_name: 'Owner', role: 'owner',
+      realPower: 100, power: imp !== null ? imp.power : 100, isImpersonating: imp !== null, impersonation: imp };
+    return next();
+  }
+  if (isLocalhost || isTailscale) {
+    // Tailscale connections are trusted — already behind WireGuard mesh VPN.
+    // Browser dashboard on phone doesn't send X-Device-Name header.
+    const imp = getImpersonation();
+    req.user = { id: 1, email: 'owner@localhost', display_name: 'Owner', role: 'owner',
+      realPower: 100, power: imp !== null ? imp.power : 100, isImpersonating: imp !== null, impersonation: imp };
+    return next();
+  }
+  extractUser(req, res, next);
+});
+
+// Tier 0 — attach org context to every /api request (after auth sets req.user)
+app.use('/api', requireOrg);
+
+// Hook events from Claude Code
+app.use('/hooks', hooksRouter);
+
+// Phoenix Process Scanner
+const PHOENIX_SIGNATURES = [
+  { pattern: 'phoenix.js start', name: 'Phoenix Server', vital: true },
+  { pattern: 'phoenix.js start', name: 'Phoenix Server', vital: true },
+  { pattern: 'phoenix-atc.js', name: 'ATC', vital: true },
+  { pattern: 'phoenix-atc.js', name: 'ATC', vital: true },
+  { pattern: 'mcp-server.js', name: 'MCP Server', vital: true },
+  { pattern: 'dev-server.js', name: 'Dev Server', vital: false },
+  { pattern: 'vosk-server', name: 'Vosk STT', vital: true },
+  { pattern: 'claude-code/cli.js', name: 'Claude Session', vital: false },
+  { pattern: 'chrome-devtools-mcp', name: 'Chrome MCP', vital: false },
+  { pattern: 'vite', name: 'Vite Dev', vital: false },
+  { pattern: 'wrapper.js', name: 'Service Wrapper', vital: true },
+];
+const PAN_SIGNATURES = PHOENIX_SIGNATURES;
+
+// Performance metrics endpoint — API latency, heap, DB, connections
+app.get('/dashboard/api/perf', async (req, res) => {
+  const mem = process.memoryUsage();
+  const avgMs = _perfStats.requests ? +( _perfStats.totalMs / _perfStats.requests).toFixed(1) : 0;
+  // Top 10 slowest routes by max latency
+  const topRoutes = [..._perfByRoute.entries()]
+    .map(([route, s]) => ({ route, count: s.count, avgMs: +(s.totalMs / s.count).toFixed(1), maxMs: +s.maxMs.toFixed(1) }))
+    .sort((a, b) => b.maxMs - a.maxMs)
+    .slice(0, 10);
+  // WebSocket connection count
+  let wsConnections = 0;
+  try {
+    const sessions = await listSessions();
+    wsConnections = sessions.reduce((sum, s) => sum + (s.clients || 0), 0);
+  } catch {}
+  res.json({
+    total_requests: _perfStats.requests,
+    slow_requests: _perfStats.slowRequests,
+    avg_ms: avgMs,
+    slowest: _perfStats.slowest,
+    top_routes: topRoutes,
+    heap_mb: Math.round(mem.heapUsed / 1048576),
+    heap_total_mb: Math.round(mem.heapTotal / 1048576),
+    rss_mb: Math.round(mem.rss / 1048576),
+    external_mb: Math.round((mem.external || 0) / 1048576),
+    ws_connections: wsConnections,
+    uptime_s: Math.round(process.uptime()),
+    event_loop_lag_ms: _getLoopStats(),
+    recent_blocks: _recentBlocks.slice().reverse(), // newest first
+    scanned_at: new Date().toISOString(),
+  });
+});
+
+// Reset event-loop histogram — useful when investigating a specific
+// time window (clear, wait 30s, re-read). POST so it doesn't get hit by
+// stray probes.
+app.post('/dashboard/api/perf/reset-loop', (_req, res) => {
+  _resetLoopStats();
+  _recentBlocks.length = 0;
+  res.json({ ok: true });
+});
+
+app.get('/dashboard/api/processes', async (req, res) => {
+  // Single source of truth: the steward service registry. Each registered
+  // Phoenix service either runs in the main phoenix-server process (interval/function
+  // health checks) or as its own OS process (port/process health checks).
+  // We resolve OS-process services to real PIDs by matching the Windows
+  // process list against each service's port or processName, and surface
+  // Anything Node/Python eating >10% CPU that ISN'T a Phoenix service shows up
+  // in a small `other` list so the user can still spot zombie hogs without
+  // them polluting the main Phoenix process panel.
+  try {
+    const raw = await new Promise((resolve, reject) => {
+      exec(
+        "powershell -NoProfile -Command \"Get-CimInstance Win32_Process | Where-Object {$_.Name -in @('node.exe','python.exe','python3.exe','AutoHotkey64.exe','tailscaled.exe','ollama.exe','claude.exe')} | Select-Object ProcessId, Name, CommandLine, CreationDate, KernelModeTime, UserModeTime, WorkingSetSize | ConvertTo-Json -Depth 2\"",
+        { encoding: 'utf8', timeout: 10000, windowsHide: true },
+        (err, stdout) => err ? reject(err) : resolve(stdout)
+      );
+    });
+    const parsed = JSON.parse(raw || '[]');
+    const procList = Array.isArray(parsed) ? parsed : [parsed];
+    const now = Date.now();
+    const enriched = procList.map(p => {
+      const cmd = p.CommandLine || '';
+      const cpuSec = ((p.KernelModeTime || 0) + (p.UserModeTime || 0)) / 10000000;
+      const memMB = Math.round((p.WorkingSetSize || 0) / 1048576);
+      let uptimeHrs = 0, createdAt = null;
+      if (p.CreationDate) {
+        const m = String(p.CreationDate).match(/\/Date\((\d+)[+-]/);
+        if (m) { createdAt = new Date(parseInt(m[1])).toISOString(); uptimeHrs = +((now - parseInt(m[1])) / 3600000).toFixed(1); }
+      }
+      return { pid: p.ProcessId, exe: p.Name, cmd, cpuSec: +cpuSec.toFixed(1), memMB, uptimeHrs, createdAt };
+    });
+
+    // Match a steward service to a Windows process. Returns the matching
+    // enriched proc or null if not found.
+    function matchProcForService(svc) {
+      // 1. Self — phoenix-server is THIS node process (server.js).
+      if (svc.id === 'phoenix-server') {
+        return enriched.find(p => p.exe === 'node.exe' && /server\.js/i.test(p.cmd)) || null;
+      }
+      // 2. processName-based services (AHK, Tailscale).
+      if (svc.processName) {
+        const candidates = enriched.filter(p => p.exe.toLowerCase() === svc.processName.toLowerCase());
+        if (svc.processCmdLineMatch) {
+          const re = new RegExp(svc.processCmdLineMatch.replace(/\\\\/g, '\\\\'), 'i');
+          return candidates.find(p => re.test(p.cmd)) || candidates[0] || null;
+        }
+        return candidates[0] || null;
+      }
+      // 3. Port-based services. Match by port appearing in the command line —
+      // works for whisper-server.py (port 7782) and ollama (port 11434).
+      // Less reliable than netstat but doesn't require admin or extra calls.
+      if (svc.port) {
+        const portStr = String(svc.port);
+        const byCmd = enriched.find(p => p.cmd.includes(portStr));
+        if (byCmd) return byCmd;
+        // Ollama special-case: it's `ollama.exe`, no port in cmdline.
+        if (svc.id === 'ollama') return enriched.find(p => p.exe === 'ollama.exe') || null;
+        return null;
+      }
+      // 4. In-process services (interval/function health checks). They share
+      // the main phoenix-server process — return null so the UI knows to mark
+      // them as "in-process" rather than missing.
+      return null;
+    }
+
+    // Inject Super-Carrier + Carrier at the top — they live outside the Atlas
+    // registry but are the most critical processes in the stack.
+    const layerEntries = [];
+    try {
+      const hRes = await fetch('http://127.0.0.1:7777/health', { signal: AbortSignal.timeout(1500) });
+      if (hRes.ok) {
+        const hData = await hRes.json();
+        if (hData.superCarrier && hData.superCarrierPid) {
+          const scProc = enriched.find(p => p.pid === hData.superCarrierPid);
+          layerEntries.push({
+            id: 'super-carrier', name: 'Super-Carrier', status: 'running',
+            role: 'Immortal process · owns :7777 + browser connections',
+            port: 7777, pid: hData.superCarrierPid,
+            cpuSec: scProc?.cpuSec ?? null, memMB: scProc?.memMB ?? null,
+            uptimeHrs: scProc?.uptimeHrs ?? null, createdAt: scProc?.createdAt || null,
+            inProcess: false, modelTierLabel: null,
+          });
+        }
+        if (hData.carrierPid) {
+          const cProc = enriched.find(p => p.pid === hData.carrierPid);
+          layerEntries.push({
+            id: 'carrier', name: 'Carrier', status: 'running',
+            role: 'Hot-swap coordinator · PTY + WebSocket',
+            port: 17760, pid: hData.carrierPid,
+            cpuSec: cProc?.cpuSec ?? null, memMB: cProc?.memMB ?? null,
+            uptimeHrs: cProc?.uptimeHrs ?? null, createdAt: cProc?.createdAt || null,
+            inProcess: false, modelTierLabel: null,
+          });
+        }
+        // Craft = this process (server.js)
+        const craftProc = enriched.find(p => p.exe === 'node.exe' && /server\.js/i.test(p.cmd));
+        layerEntries.push({
+          id: 'craft', name: 'Craft', status: 'running',
+          role: 'HTTP server · all routes + API',
+          port: 17700, pid: process.pid,
+          cpuSec: craftProc?.cpuSec ?? null, memMB: craftProc?.memMB ?? null,
+          uptimeHrs: craftProc?.uptimeHrs ?? null, createdAt: craftProc?.createdAt || null,
+          inProcess: false, modelTierLabel: null,
+        });
+      }
+    } catch {}
+
+    const atlas = getAtlasData();
+    const services = [
+      ...layerEntries,
+      ...(atlas.services || []).map(svc => {
+        const proc = matchProcForService(svc);
+        const inProcess = !proc && (svc.healthCheck === 'interval' || svc.healthCheck === 'function');
+        return {
+          id: svc.id,
+          name: svc.name,
+          status: svc.status,
+          lastError: svc.lastError,
+          lastRun: svc.lastRun,
+          port: svc.port,
+          modelTier: svc.modelTier,
+          modelTierLabel: svc.modelTierLabel,
+          pid: proc?.pid || null,
+          cpuSec: proc?.cpuSec ?? null,
+          memMB: proc?.memMB ?? null,
+          uptimeHrs: proc?.uptimeHrs ?? null,
+          createdAt: proc?.createdAt || null,
+          inProcess,
+        };
+      }),
+    ];
+
+    // Anything else eating >10% CPU that ISN'T claimed by a Phoenix service —
+    // surfaced separately as "other" so zombie processes are visible without
+    // muddying the canonical Phoenix list.
+    const claimedPids = new Set(services.map(s => s.pid).filter(Boolean));
+    const other = enriched
+      .filter(p => !claimedPids.has(p.pid) && p.cpuSec > 10)
+      .map(p => ({
+        pid: p.pid,
+        exe: p.exe,
+        cmd: p.cmd.length > 120 ? p.cmd.substring(0, 117) + '...' : p.cmd,
+        cpuSec: p.cpuSec,
+        memMB: p.memMB,
+        uptimeHrs: p.uptimeHrs,
+      }))
+      .sort((a, b) => b.cpuSec - a.cpuSec);
+
+    // Legacy `processes` field kept for backwards compat with the existing
+    // dashboard widget — flat list of just the running Phoenix services with
+    // real PIDs, sorted by CPU. The new `services` and `other` fields are
+    // the preferred shape for the rebuilt panel.
+    const processes = services
+      .filter(s => s.pid)
+      .map(s => ({ pid: s.pid, name: s.name, vital: true, cpuSec: s.cpuSec, memMB: s.memMB, uptimeHrs: s.uptimeHrs, createdAt: s.createdAt, isPhoenix: true, isPan: true, isZombie: false, cmd: '' }))
+      .sort((a, b) => (b.cpuSec || 0) - (a.cpuSec || 0));
+
+    res.json({ ok: true, services, other, processes, scannedAt: new Date().toISOString() });
+  } catch (err) {
+    res.json({ ok: false, error: err.message, services: [], other: [], processes: [] });
+  }
+});
+
+app.post('/dashboard/api/processes/kill', async (req, res) => {
+  const { pid } = req.body;
+  if (!pid) return res.status(400).json({ ok: false, error: 'No PID' });
+  // Protect PTY pids — never let dashboard kill a terminal session process
+  const ptyPids = new Set(await getActivePtyPids());
+  if (ptyPids.has(pid)) {
+    return res.status(403).json({ ok: false, error: 'Cannot kill active PTY process — use session kill instead' });
+  }
+  try { process.kill(pid, 'SIGTERM'); res.json({ ok: true, killed: pid }); }
+  catch (err) { res.json({ ok: false, error: err.message }); }
+});
+
+// API for Android app / Pandant data
+app.use('/api/v1', apiRouter);
+
+// Device management
+app.use('/api/v1/devices', devicesRouter);
+
+// ── Profile-gated route groups (SHIP-PLAN.md Phase 1) ────────────────────────
+// In the `core` profile these mounts are skipped — endpoints 404 — while the
+// modules themselves stay statically imported (several export helpers the
+// boot path uses; see profiles.js header). `full` mounts everything.
+
+// Sensor management API
+if (featureEnabled('routes_sensors')) app.use('/api/sensors', sensorsRouter);
+
+// Project Runner — start/stop/monitor project services
+if (featureEnabled('routes_runner')) app.use('/api/v1/runner', runnerRouter);
+
+// Incognito mode (Tier 0 Phase 4)
+if (featureEnabled('routes_incognito')) app.use('/api/v1/incognito', incognitoRouter);
+
+// Audit chain + Replication (Tier 0 Phase 6)
+if (featureEnabled('routes_audit')) app.use('/api/v1/audit', auditRouter);
+if (featureEnabled('routes_replication')) app.use('/api/v1/replication', replicationRouter);
+
+// Geofencing + Zones (Tier 0 Phase 7)
+if (featureEnabled('routes_zones')) app.use('/api/v1/zones', zonesRouter);
+
+// Paean Records — Quality Log (MCDA scoring for songs, art, mechanics).
+// Math lives in routes/quality-log.js; the `quality-log` MCP server is a
+// thin HTTP proxy over these endpoints.
+if (featureEnabled('routes_quality_log')) app.use('/api/v1/quality-log', qualityLogRouter);
+// Home Assistant. Always mounted — every endpoint returns "not configured"
+// until hass_token is set, so this costs nothing on a hub with no smart home.
+app.use('/api/v1/ha', homeAssistantRouter);
+
+// Same MCP server exposed over Streamable HTTP for the Claude desktop app,
+// Claude in Chrome, Claude.ai, and Cowork. Users paste this URL into
+// Settings → Customize → Connectors → Add custom connector → Remote MCP
+// server URL. See routes/mcp-quality-log.js for the per-network URL guide.
+if (featureEnabled('routes_quality_log')) app.use('/mcp/quality-log', mcpQualityLogRouter);
+
+// THE umbrella Phoenix MCP — every Phoenix tool over HTTP.
+app.use('/mcp/phoenix', mcpPhoenixRouter);
+
+// Capture-consent control plane (SHIP-PLAN Phase 4) — ALWAYS mounted in every
+// profile. The user must be able to see + toggle camera/screen/activity
+// capture. Backs the /privacy page.
+app.use('/api/v1/capture', captureRouter);
+
+// Dashboard registry — the purpose-built HTML monitoring pages Phoenix knows about
+// (WoE, ServiceNow, ops, …), each on its own host/port and fed by its own push
+// scripts. Always mounted, every profile: it's how Phoenix knows the user's
+// monitoring surfaces + renders them on the phone. See routes/dashboards.js.
+app.use('/api/v1/dashboards', dashboardsRouter);
+
+// ServiceNow assist loop — DRAFTING BRAIN only (Phoenix never sends; the bridge
+// dashboard sends on the user's click). Reverse-push: the bridge watcher POSTs
+// a Slack conversation, gets a drafted reply back. Stateless. Body:
+// {channel, recent:[{sender,text}]} or {channel, sender, text}. Returns {ok, draft, skip}.
+app.post('/api/v1/sn-loop/draft', async (req, res) => {
+  try {
+    const { draftForConversation } = await import('./servicenow-loop.js');
+    const r = await draftForConversation(req.body || {});
+    res.json({ ok: true, ...r });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// Tailscale peer status straight from the hub's own tailscaled (SYSTEM context).
+// This is how Phoenix "sees" whether each machine is on the tailnet — no per-machine
+// beacon needed, works for every device, authoritative.
+app.get('/api/v1/tailscale/peers', async (req, res) => {
+  try {
+    const { spawn } = await import('child_process');
+    const out = await new Promise((resolve) => {
+      const p = spawn('C:\\Program Files\\Tailscale\\tailscale.exe', ['status', '--json'], { windowsHide: true });
+      let o = ''; p.stdout.on('data', d => o += d); p.on('close', () => resolve(o)); p.on('error', () => resolve(''));
+      setTimeout(() => { try { p.kill(); } catch {} resolve(o); }, 8000);
+    });
+    const j = JSON.parse(out || '{}');
+    const peers = Object.values(j.Peer || {}).map(p => ({
+      host: p.HostName, online: !!p.Online, lastSeen: p.LastSeen || null,
+      os: p.OS || null, ip: (p.TailscaleIPs || [])[0] || null,
+    })).sort((a, b) => (a.host || '').localeCompare(b.host || ''));
+    res.json({ ok: true, self: j.Self?.HostName || null, backendState: j.BackendState || null, peers });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// Cloud-Claude exchange write-back (SHIP-PLAN Phase 2) — the pan_log_exchange
+// MCP tool POSTs conversation exchanges here so non-CLI Claudes land in the DB
+// and become searchable like CLI sessions. Always mounted (capture is core).
+app.use('/api/v1/exchange', exchangeRouter);
+
+// T3 — Identity → user binding
+app.use('/api/v1/identity', identityRouter);
+
+// Personal Data Sync (Tier 0 Phase 8)
+if (featureEnabled('routes_sync')) app.use('/api/v1/sync', syncRouter);
+
+// Org Management (Phase 2)
+if (featureEnabled('routes_orgs')) app.use('/api/v1/orgs', orgsRouter);
+
+// Guardian Guillotine — content security scanner
+app.use('/api/v1/guardian', guardianRouter);
+
+// Differential Privacy — budget tracking and config
+app.use('/api/v1/privacy', privacyRouter);
+
+// ── Voice/text chat front door ───────────────────────────────────────────────
+// POST /api/v1/chat lives in routes/api.js (router.post('/chat', ...) mounted
+// at /api/v1 above on the `apiRouter` line). It accepts { message, source?,
+// thread_id?, org_id?, project_id? } and returns
+// { response, intent, action?, user_message_id, pan_message_id, _diag_marker }.
+// When thread_id is provided (Comms popout voice-call loop, terminal chat) it
+// also persists both sides to chat_messages so the conversation shows up in
+// the thread UI and survives reloads.
+//
+// History: this handler was originally defined here, but apiRouter is mounted
+// at /api/v1 earlier (see `app.use('/api/v1', apiRouter)` above), so Express
+// dispatched POST /api/v1/chat to api.js first and the handler here never ran.
+// All chat logic now lives in api.js to keep the routing match consistent.
+// Chat — text messaging, contacts, calls (POST / lives in api.js, see above)
+app.use('/api/v1/chat', chatRouter);
+
+// Email — universal IMAP/SMTP integration
+if (featureEnabled('routes_email')) app.use('/api/v1/email', emailRouter);
+
+// Teams — groups within orgs, task assignment
+if (featureEnabled('routes_teams')) app.use('/api/v1/teams', teamsRouter);
+
+// Wrap — Tauri webview wrappers around third-party apps (Discord, Slack, etc.)
+if (featureEnabled('routes_wrap')) app.use('/api/v1/wrap', wrapRouter);
+
+// Messaging preferences — per-user / per-org channel routing (Discord vs SMS vs email…)
+if (featureEnabled('routes_messaging_prefs')) app.use('/api/v1/messaging-prefs', messagingPrefsRouter);
+
+// Intuition — live situational state daemon (read by Phoenix voice, Forge, Atlas)
+app.use('/api/v1/intuition', intuitionRouter);
+
+// Action preferences — remember which device+app handles each action type
+app.use('/api/v1/preferences', preferencesRouter);
+
+// Screen-watcher burst mode — called by carrier after a craft swap to get rapid
+// screenshots (every 5s for 60s) so intuition sees the swap stages in real time.
+// GET /api/v1/webcam-watcher/status
+app.get('/api/v1/webcam-watcher/status', (req, res) => {
+  res.json({ ok: true, ...getWebcamStatus() });
+});
+
+// POST /api/v1/webcam-watcher/force — trigger immediate capture, return result.
+// Hard-gated on the identity opt-in: when identity is off (the default), this
+// refuses rather than opening the camera for a one-shot frame. "Identity off"
+// must mean Phoenix cannot touch the camera by any server path, not just that the
+// polling loop is stopped.
+app.post('/api/v1/webcam-watcher/force', async (req, res) => {
+  if (!isCaptureOn('identity')) {
+    return res.status(403).json({ ok: false, error: 'camera/identity is off — turn it on at /privacy (or set PAN_ENABLE_IDENTITY=1)' });
+  }
+  const { forceCapture } = await import('./webcam-watcher.js');
+  const result = await forceCapture();
+  res.json(result);
+});
+
+app.post('/api/v1/screen-watcher/burst', (req, res) => {
+  const duration = Math.min(parseInt(req.body?.duration_ms) || 60_000, 300_000);
+  const interval = Math.min(parseInt(req.body?.interval_ms) || 5_000, 30_000);
+  startBurst(duration, interval); // startBurst now resets backoff internally
+  res.json({ ok: true, duration_ms: duration, interval_ms: interval });
+});
+
+app.get('/api/v1/screen-watcher/status', (req, res) => {
+  res.json(getScreenWatcherStatus());
+});
+
+app.post('/api/v1/screen-watcher/reset-backoff', (req, res) => {
+  resetBackoff();
+  res.json({ ok: true });
+});
+
+// Benchmark — AI model scoring suite (Intuition: Hearing/Reflex/Clarity/Reasoning/Memory/Voice)
+if (featureEnabled('routes_benchmark')) app.use('/api/v1/ai', benchmarkApiRouter);
+
+// Voice — Whisper STT + speaker ID (resemblyzer)
+registerVoiceRoutes(app);
+
+// Phoenix Client — manages connected phoenix-client processes on other machines
+app.use('/api/v1/client', clientRouter);
+
+// Activity — foreground window tracking + app usage preferences
+app.use('/api/v1/activity', activityRouter);
+
+// ── Phoenix Client install scripts ────────────────────────────────────────────────
+// Secondary computers fetch these via: irm http://hub:7777/install/TOKEN | iex
+//                                  or: curl -s http://hub:7777/install/TOKEN | bash
+// The route auto-detects OS from User-Agent and returns the right script.
+// phoenix-client.js is served from /client/phoenix-client.js for the script to download.
+
+app.get('/client/phoenix-client.js', (req, res) => {
+  const clientFile = join(__dirname, '../../phoenix-client/phoenix-client.js');
+  res.setHeader('Content-Type', 'text/javascript');
+  res.sendFile(clientFile);
+});
+
+// Tray + status window scripts (PowerShell, Windows-only).
+app.get('/client/PHOENIX-tray.ps1', (req, res) => {
+  const f = join(__dirname, '../../phoenix-client/PHOENIX-tray.ps1');
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.sendFile(f);
+});
+app.get('/client/PHOENIX-status.ps1', (req, res) => {
+  const f = join(__dirname, '../../phoenix-client/PHOENIX-status.ps1');
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.sendFile(f);
+});
+
+app.get('/install/:token', (req, res) => {
+  const { token } = req.params;
+  if (!checkInviteToken(token)) {
+    // Browser gets a nice error page
+    const ua = (req.headers['user-agent'] || '').toLowerCase();
+    const isBrowser = ua.includes('mozilla');
+    if (isBrowser) {
+      return res.status(403).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Phoenix — Invalid Token</title>
+<style>body{background:#0a0a0f;color:#cdd6f4;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
+.box{text-align:center;padding:40px}.icon{font-size:48px}.title{font-size:22px;color:#f38ba8;margin:16px 0 8px}
+.sub{color:#a6adc8;font-size:15px}</style></head>
+<body><div class="box"><div class="icon">⛔</div>
+<div class="title">Invalid or expired install token</div>
+<div class="sub">This link has already been used or has expired.<br>Generate a new one from your Phoenix dashboard.</div>
+</div></body></html>`);
+    }
+    return res.status(403).send('# Invalid or expired install token\n');
+  }
+
+  // x-forwarded-host is set by super-carrier to preserve the original client-facing host
+  // (super-carrier rewrites host: to 127.0.0.1:17760 for internal routing)
+  const host = req.headers['x-forwarded-host'] || req.headers.host || `127.0.0.1:${PORT}`;
+  const isHttpsReq = req.secure
+    || req.headers['x-forwarded-proto'] === 'https'
+    || host.includes('trycloudflare.com')
+    || host.includes('ts.net');
+  const proto = isHttpsReq ? 'https' : 'http';
+  const wsProto = isHttpsReq ? 'wss' : 'ws';
+  const hubWs  = `${wsProto}://${host}`;
+  const clientJsUrl = `${proto}://${host}/client/phoenix-client.js`;
+  const installUrl = `${proto}://${host}/install/${token}`;
+
+  const ua = (req.headers['user-agent'] || '').toLowerCase();
+  const isPowerShell = ua.includes('powershell');
+  const isBrowser = ua.includes('mozilla') && !isPowerShell; // PowerShell UA also has 'mozilla'
+  const isWindows = ua.includes('windows');
+  const isMac = ua.includes('mac');
+
+  // Browser → serve HTML landing page
+  if (isBrowser) {
+    const osLabel = isWindows ? 'Windows' : isMac ? 'macOS' : 'Linux';
+    const hubDisplayName = get("SELECT value FROM settings WHERE key = 'display_name'")?.value || hostname();
+    const installCmd = isWindows
+      ? `irm ${proto}://${host}/install/${token} | iex`
+      : `curl -s ${proto}://${host}/install/${token} | bash`;
+
+    // Hub-served download: personalised per invite — hub URL + token baked into filename
+    const dlUrl  = `${proto}://${host}/install/${token}/download`;
+    const dlName = isWindows ? 'phoenix-installer.bat' : 'phoenix-installer-linux';
+    const dlHint = isWindows
+      ? 'If browser warns, click <strong>Keep</strong> → then double-click to run'
+      : isMac
+        ? 'After downloading: <code>chmod +x ~/Downloads/phoenix-installer-linux && ~/Downloads/phoenix-installer-linux</code>'
+        : 'After downloading: <code>chmod +x phoenix-installer-linux && ./phoenix-installer-linux</code>';
+
+    // Fallback terminal steps (shown in the "Advanced" section)
+    const advSteps = isWindows ? `
+      <div class="adv-step"><span class="adv-num">1</span> Click <strong>Copy command</strong> below</div>
+      <div class="adv-step"><span class="adv-num">2</span> Press <kbd>⊞ Win</kbd>+<kbd>R</kbd> → type <strong>powershell</strong> → Enter</div>
+      <div class="adv-step"><span class="adv-num">3</span> Press <kbd>Ctrl</kbd>+<kbd>V</kbd> then <kbd>Enter</kbd></div>` : isMac ? `
+      <div class="adv-step"><span class="adv-num">1</span> Click <strong>Copy command</strong> below</div>
+      <div class="adv-step"><span class="adv-num">2</span> Press <kbd>⌘</kbd>+<kbd>Space</kbd> → type <strong>Terminal</strong> → Enter</div>
+      <div class="adv-step"><span class="adv-num">3</span> Paste with <kbd>⌘</kbd>+<kbd>V</kbd> and press Enter</div>` : `
+      <div class="adv-step"><span class="adv-num">1</span> Click <strong>Copy command</strong> below</div>
+      <div class="adv-step"><span class="adv-num">2</span> Open a Terminal and paste, then press Enter</div>`;
+
+    return res.send(`<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Connect to Phoenix</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0a0a0f;color:#cdd6f4;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+.card{background:#181825;border:1px solid #313244;border-radius:16px;padding:36px 32px;max-width:480px;width:100%}
+.logo{font-size:36px;letter-spacing:4px;color:#89b4fa;font-weight:700;text-align:center;margin-bottom:2px}
+.tagline{color:#6c7086;font-size:12px;text-align:center;margin-bottom:28px}
+h2{font-size:18px;margin-bottom:6px;text-align:center;color:#cdd6f4}
+.sub{font-size:13px;color:#6c7086;text-align:center;margin-bottom:24px}
+
+/* Primary download block */
+.dl-box{background:#0d2137;border:2px solid #89b4fa;border-radius:12px;padding:20px;margin-bottom:20px;text-align:center}
+.dl-btn{display:inline-block;background:#89b4fa;color:#0a0a0f;text-decoration:none;border-radius:8px;padding:14px 28px;font-size:16px;font-weight:800;margin-bottom:12px;transition:background 0.15s;cursor:pointer}
+.dl-btn:hover{background:#b4d0ff}
+.dl-hint{font-size:12px;color:#6c7086;line-height:1.5}
+.dl-hint strong{color:#a6adc8}
+.dl-hint code{background:#313244;padding:1px 5px;border-radius:3px;font-size:11px}
+
+/* Invite link box */
+.link-box{background:#11111b;border:1px solid #313244;border-radius:10px;padding:14px 16px;margin-bottom:20px}
+.link-label{font-size:11px;color:#6c7086;margin-bottom:6px;text-transform:uppercase;letter-spacing:1px}
+.link-row{display:flex;gap:8px;align-items:center}
+.link-val{font-family:monospace;font-size:12px;color:#a6e3a1;overflow-wrap:anywhere;min-width:0;flex:1;line-height:1.4}
+.copy-link-btn{background:#313244;color:#cdd6f4;border:none;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;white-space:nowrap;transition:background 0.15s}
+.copy-link-btn:hover{background:#45475a}
+.copy-link-btn.done{background:#a6e3a1;color:#0a0a0f}
+
+/* Advanced section */
+.adv-toggle{width:100%;background:none;border:none;color:#6c7086;font-size:12px;cursor:pointer;text-align:center;padding:8px 0;text-decoration:underline}
+.adv-toggle:hover{color:#a6adc8}
+.adv-section{display:none;margin-top:12px}
+.adv-section.open{display:block}
+.copy-box{background:#11111b;border:1px solid #313244;border-radius:8px;padding:12px;margin-bottom:10px}
+.copy-cmd{font-family:monospace;font-size:12px;color:#a6e3a1;word-break:break-all;line-height:1.5;margin-bottom:10px}
+.copy-btn{width:100%;background:#313244;color:#cdd6f4;border:none;border-radius:6px;padding:10px;font-size:13px;font-weight:600;cursor:pointer;transition:background 0.15s}
+.copy-btn:hover{background:#45475a}
+.copy-btn.done{background:#a6e3a1;color:#0a0a0f}
+.adv-step{font-size:13px;color:#a6adc8;padding:8px 0;border-top:1px solid #1e1e2e;display:flex;gap:10px;align-items:baseline;line-height:1.5}
+.adv-num{background:#313244;color:#89b4fa;border-radius:50%;width:20px;height:20px;min-width:20px;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700}
+kbd{display:inline-block;background:#313244;border:1px solid #45475a;border-radius:4px;padding:0 5px;font-size:11px;font-family:monospace;color:#cdd6f4}
+
+.expiry{font-size:11px;color:#f38ba8;text-align:center;margin-top:18px}
+</style></head>
+<body><div class="card">
+  <div class="logo">PHOENIX</div>
+  <div class="tagline">Local-First AI Memory Layer</div>
+  <h2>Connect this ${osLabel} computer to Phoenix</h2>
+  <div class="sub">Download the script, then <strong>right-click → Run with PowerShell</strong>.</div>
+
+  <div class="dl-box">
+    <a class="dl-btn" href="${dlUrl}">⬇ Download Phoenix Installer</a>
+    <div class="dl-hint">${dlHint}</div>
+  </div>
+
+  <div class="link-box">
+    <div class="link-label" id="linkLabel">Invited by</div>
+    <div class="link-row">
+      <div class="link-val" style="font-size:15px;font-weight:700;color:#cdd6f4;font-family:inherit">🖥 ${hubDisplayName}</div>
+    </div>
+    <div style="font-size:11px;color:#6c7086;margin-top:8px">Invite link auto-copied to clipboard — the installer will use it automatically.</div>
+  </div>
+
+  <button class="adv-toggle" id="advToggle">▼ Need to paste the link manually?</button>
+
+  <div class="adv-section" id="advSec">
+    <div class="copy-box">
+      <div class="copy-cmd" style="font-size:11px;word-break:break-all">${installUrl}</div>
+      <button class="copy-btn" id="cpyLink" data-url="${installUrl}">Copy invite link</button>
+    </div>
+  </div>
+
+  <div class="expiry">⏱ This invite expires in 30 minutes</div>
+</div>
+<script>
+var INVITE_URL = ${JSON.stringify(installUrl)};
+
+// Auto-copy invite link to clipboard on load
+navigator.clipboard.writeText(INVITE_URL).catch(function() {});
+
+document.getElementById('advToggle').addEventListener('click', function() {
+  var s = document.getElementById('advSec');
+  s.classList.toggle('open');
+  this.textContent = s.classList.contains('open') ? '▲ Hide' : '▼ Need to paste the link manually?';
+});
+document.getElementById('cpyLink').addEventListener('click', function() {
+  var b = this;
+  navigator.clipboard.writeText(INVITE_URL).then(function() {
+    b.textContent = '✓ Copied!'; b.classList.add('done');
+    setTimeout(function() { b.textContent = 'Copy invite link'; b.classList.remove('done'); }, 2000);
+  });
+});
+</script>
+</body></html>`);
+  }
+
+  // PowerShell (irm ... | iex) or curl → raw script, existing behavior
+  if (isWindows || isPowerShell) {
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    return res.send(generateWindowsClientInstaller(token, hubWs, clientJsUrl));
+  }
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.send(generateLinuxClientInstaller(token, hubWs, clientJsUrl));
+});
+
+// Download the installer as a compiled .exe (Windows) or binary (Linux).
+// The hub URL + token are encoded into the filename so the exe is self-configuring —
+// user double-clicks, it installs, no terminal needed.
+// Falls back to script download if the compiled binary isn't built yet.
+app.get('/install/:token/download', (req, res) => {
+  const { token } = req.params;
+  if (!checkInviteToken(token)) return res.status(403).send('Invalid or expired token');
+
+  const host    = req.headers.host || `127.0.0.1:${PORT}`;
+  const isHttps = req.secure
+    || (req.headers['x-forwarded-proto'] === 'https')
+    || host.includes('trycloudflare.com')
+    || host.includes('ts.net');
+  const proto   = isHttps ? 'https' : 'http';
+  const wsProto = isHttps ? 'wss' : 'ws';
+  const ua      = (req.headers['user-agent'] || '').toLowerCase();
+  const isWin   = ua.includes('windows');
+
+  if (isWin) {
+    // Encode config into filename — PS1 reads its own filename, no browser/server needed
+    const cfg     = JSON.stringify({ h: host, t: token, s: isHttps ? 1 : 0 });
+    const encoded = Buffer.from(cfg).toString('base64url');
+    const filename = `phoenix-install.bat`;
+    const bat = generateBATDownload(host, proto, wsProto, token);
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    return res.send(bat);
+  }
+
+  // Linux/Mac: shell script
+  const sh = `#!/bin/bash\ncurl -s ${proto}://${host}/install/${token} | bash`;
+  res.setHeader('Content-Type', 'application/octet-stream');
+  res.setHeader('Content-Disposition', 'attachment; filename="phoenix-install.sh"');
+  res.send(sh);
+});
+
+// Simple .bat launcher — browser allows download (warns, not blocked).
+// Double-click runs it. Fetches + executes the full install PS1 from the hub.
+// No polyglot, no escaping hell, no AV flagging.
+function generateBATDownload(host, proto, wsProto, token) {
+  const installUrl = `${proto}://${host}/install/${token}`;
+  const lines = [
+    '@echo off',
+    `title Phoenix Installer`,
+    `PowerShell -NoProfile -ExecutionPolicy Bypass -Command "iex (irm '${installUrl}')"`,
+    'if %ERRORLEVEL% neq 0 (',
+    '  echo.',
+    '  echo   Something went wrong. See above for details.',
+    '  pause',
+    ')',
+  ];
+  return lines.join('\r\n');
+}
+
+// ---- dead code below kept for reference, replaced by generateBATDownload above ----
+function generateBATDownload_UNUSED(host, proto, wsProto, token) {
+  const nodeVer = '22.16.0';
+  const nodeUrl = `https://nodejs.org/dist/v${nodeVer}/node-v${nodeVer}-win-x64.zip`;
+  const lines = [
+    '# Phoenix Installer — double-click to run',
+    '# Phoenix Installer',
+    '$ErrorActionPreference = "Stop"',
+    '',
+    '# Read config from own filename (base64url encoded)',
+    '$self = $MyInvocation.MyCommand.Path',
+    '$b64url = [System.IO.Path]::GetFileNameWithoutExtension($self) -replace "^(phoenix|pan)-", ""',
+    '# Convert base64url -> standard base64',
+    '$b64 = $b64url.Replace("-", "+").Replace("_", "/")',
+    'switch ($b64.Length % 4) { 2 { $b64 += "==" } 3 { $b64 += "=" } }',
+    '$cfgJson = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($b64))',
+    '$cfg = $cfgJson | ConvertFrom-Json',
+    '$isHttps = $cfg.s -eq 1',
+    '$xProto  = if ($isHttps) { "https" } else { "http" }',
+    '$xWs     = if ($isHttps) { "wss"   } else { "ws"   }',
+    '$hubHost = $cfg.h',
+    '$token   = $cfg.t',
+    '$hubHttp = "$xProto`://$hubHost"',
+    '$hubWs   = "$xWs`://$hubHost"',
+    '',
+    'Write-Host ""',
+    'Write-Host "  ╔═══════════════════════╗" -ForegroundColor Cyan',
+    'Write-Host "  ║       PHOENIX         ║" -ForegroundColor Cyan',
+    'Write-Host "  ╚═══════════════════════╝" -ForegroundColor Cyan',
+    'Write-Host ""',
+    'Write-Host "  Hub loaded from filename — connecting..." -ForegroundColor White',
+    'Write-Host ""',
+    'Write-Host "  Connecting to: $hubHttp" -ForegroundColor Gray',
+    '',
+    '# Verify hub reachable',
+    'try {',
+    '  $null = Invoke-WebRequest "$hubHttp/health" -UseBasicParsing -TimeoutSec 10',
+    '  Write-Host "  Hub OK ' + String.fromCharCode(0x2713) + '" -ForegroundColor Green',
+    '} catch {',
+    '  Write-Host "  Cannot reach hub: $hubHttp" -ForegroundColor Red',
+    '  Read-Host "  Press Enter to close"',
+    '  exit 1',
+    '}',
+    '',
+    '# Phoenix directory',
+    '$phoenixDir = Join-Path $env:LOCALAPPDATA "Phoenix"',
+    'New-Item -ItemType Directory -Force -Path $phoenixDir | Out-Null',
+    '',
+    '# Find or download Node.js',
+    '$nodeExe = $null',
+    'try { $nodeExe = (Get-Command node -ErrorAction SilentlyContinue).Source } catch {}',
+    'if (-not $nodeExe -or -not (Test-Path $nodeExe)) {',
+    '  $nodeDir = Join-Path $phoenixDir "node"',
+    '  $nodeExe = Join-Path $nodeDir "node.exe"',
+    '  if (-not (Test-Path $nodeExe)) {',
+    '    Write-Host "  Node.js not found — downloading..." -ForegroundColor Yellow',
+    '    $zipPath = Join-Path $env:TEMP "phoenix-node.zip"',
+    '    $extractDir = Join-Path $env:TEMP "phoenix-node-extract"',
+    '    if (Test-Path $extractDir) { Remove-Item $extractDir -Recurse -Force }',
+    `    Invoke-WebRequest "${nodeUrl}" -OutFile $zipPath -UseBasicParsing`,
+    '    Expand-Archive $zipPath -DestinationPath $extractDir -Force',
+    `    $extracted = Get-ChildItem $extractDir | Where-Object { $_.Name -like "node-v${nodeVer}*" } | Select-Object -First 1`,
+    '    if (Test-Path $nodeDir) { Remove-Item $nodeDir -Recurse -Force }',
+    '    Move-Item $extracted.FullName $nodeDir',
+    '    Remove-Item $zipPath -ErrorAction SilentlyContinue',
+    '    Write-Host "  Node.js installed ' + String.fromCharCode(0x2713) + '" -ForegroundColor Green',
+    '  } else {',
+    '    Write-Host "  Node.js (bundled) ready ' + String.fromCharCode(0x2713) + '" -ForegroundColor Green',
+    '  }',
+    '} else {',
+    '  $ver = & $nodeExe --version 2>$null',
+    '  Write-Host "  Node.js $ver already installed ' + String.fromCharCode(0x2713) + '" -ForegroundColor Green',
+    '}',
+    '',
+    '# Find npm — check alongside node.exe first, then PATH, then nvm dirs',
+    '$nodeDir = Split-Path $nodeExe',
+    '$npmCli = Join-Path $nodeDir "node_modules\\npm\\bin\\npm-cli.js"',
+    'if (-not (Test-Path $npmCli)) {',
+    '  # Try npm.cmd next to node.exe (nvm-style installs)',
+    '  $npmCmd = Join-Path $nodeDir "npm.cmd"',
+    '  if (Test-Path $npmCmd) { $npmCli = $null; $env:PATH = "$nodeDir;$env:PATH" }',
+    '  else {',
+    '    # Fall back to system PATH',
+    '    $npmCmd = (Get-Command npm -ErrorAction SilentlyContinue).Source',
+    '    if ($npmCmd) { $npmCli = $null } else { throw "npm not found — install Node.js from nodejs.org" }',
+    '  }',
+    '}',
+    '',
+    '# Download phoenix-client.js',
+    'Write-Host "  Downloading Phoenix client..." -ForegroundColor Gray',
+    '$clientPath = Join-Path $phoenixDir "phoenix-client.js"',
+    'Invoke-WebRequest "$hubHttp/client/phoenix-client.js" -OutFile $clientPath -UseBasicParsing',
+    'Write-Host "  Phoenix client downloaded ' + String.fromCharCode(0x2713) + '" -ForegroundColor Green',
+    '',
+    '# Write package.json with type:module (phoenix-client.js uses ESM imports)',
+    'Set-Content (Join-Path $phoenixDir "package.json") \'{"name":"phoenix-client","version":"1.0.0","type":"module"}\' -Encoding UTF8',
+    '',
+    '# Install ws dependency',
+    'Write-Host "  Installing dependencies..." -ForegroundColor Gray',
+    'if ($npmCli) {',
+    '  try { & $nodeExe $npmCli install ws --prefix $phoenixDir --no-audit --no-fund --save --loglevel=silent 2>&1 | Out-Null } catch {}',
+    '} else {',
+    '  & npm install ws --prefix $phoenixDir --no-audit --no-fund --save 2>&1 | Out-Null',
+    '}',
+    'Write-Host "  Dependencies installed ' + String.fromCharCode(0x2713) + '" -ForegroundColor Green',
+    '',
+    '# Write client config',
+    '$clientCfg = "{""hub_ws"":""$hubWs"",""hub_http"":""$hubHttp"",""token"":""$token""}"',
+    'Set-Content (Join-Path $phoenixDir "phoenix-client-config.json") $clientCfg -Encoding UTF8',
+    '',
+    '# Launch phoenix-client.js as a background process',
+    'Write-Host "  Starting Phoenix client..." -ForegroundColor Gray',
+    'Start-Process $nodeExe -ArgumentList "`"$clientPath`"" -WorkingDirectory $phoenixDir -WindowStyle Hidden',
+    '',
+    'Write-Host ""',
+    'Write-Host "  ' + String.fromCharCode(0x2713) + ' Connected!" -ForegroundColor Green',
+    'Write-Host "  Check your Phoenix dashboard to approve this device." -ForegroundColor White',
+    'Write-Host "  (You can close this window)" -ForegroundColor Gray',
+    'Write-Host ""',
+    'Start-Sleep 4',
+  ];
+  return lines.join('\r\n');
+}
+
+function generateWindowsClientInstaller(token, hubWs, clientJsUrl) {
+  const httpUrl   = hubWs.replace(/^ws/, 'http');
+  const nodeVer   = '22.16.0';
+  const lines = [
+    '# Phoenix Client Installer',
+    '$ErrorActionPreference = "Stop"',
+    '',
+    'function Step { param($m) Write-Host "  > $m" -ForegroundColor Cyan }',
+    'function Ok   { param($m) Write-Host "  [OK] $m" -ForegroundColor Green }',
+    'function Fail { param($m) Write-Host "  [ERR] $m" -ForegroundColor Red; Read-Host "  Press Enter to close"; exit 1 }',
+    '',
+    'Write-Host ""',
+    'Write-Host "  ╔═══════════════════════╗" -ForegroundColor Cyan',
+    'Write-Host "  ║       PHOENIX         ║" -ForegroundColor Cyan',
+    'Write-Host "  ╚═══════════════════════╝" -ForegroundColor Cyan',
+    'Write-Host ""',
+    '',
+    '# ── Directories ─────────────────────────────────────────────────────────',
+    '$PhoenixDir = Join-Path $env:LOCALAPPDATA "Phoenix"',
+    '$NodeDir = Join-Path $PhoenixDir "node"',
+    'New-Item -ItemType Directory -Force -Path $PhoenixDir  | Out-Null',
+    'New-Item -ItemType Directory -Force -Path $NodeDir | Out-Null',
+    '',
+    '# ── Node.js ──────────────────────────────────────────────────────────────',
+    '$nodeExe = $null',
+    'try { $nodeExe = (Get-Command node -ErrorAction Stop).Source } catch {}',
+    'if (-not $nodeExe) {',
+    '  $nodeExe = Join-Path $NodeDir "node.exe"',
+    '  if (-not (Test-Path $nodeExe)) {',
+    `    Step "Downloading Node.js v${nodeVer}..."`,
+    `    $nodeUrl = "https://nodejs.org/dist/v${nodeVer}/node-v${nodeVer}-win-x64.zip"`,
+    '    $tmp = Join-Path $env:TEMP "phoenix-node.zip"',
+    '    $ext = Join-Path $env:TEMP "phoenix-node-ext"',
+    '    if (Test-Path $ext) { Remove-Item $ext -Recurse -Force }',
+    '    (New-Object System.Net.WebClient).DownloadFile($nodeUrl, $tmp)',
+    '    Expand-Archive $tmp $ext -Force',
+    `    $sub = Join-Path $ext "node-v${nodeVer}-win-x64"`,
+    '    Get-ChildItem $sub | Move-Item -Destination $NodeDir -Force',
+    '    Remove-Item $tmp,$ext -Force -Recurse -ErrorAction SilentlyContinue',
+    '    Ok "Node.js installed"',
+    '  } else { Ok "Node.js (cached)" }',
+    '} else { Ok "Node.js already on system: $((& $nodeExe --version 2>$null))" }',
+    '',
+    '# ── npm (bundled with node zip) ──────────────────────────────────────────',
+    '$npmCli = Join-Path $NodeDir "node_modules" | Join-Path -ChildPath "npm" | Join-Path -ChildPath "bin" | Join-Path -ChildPath "npm-cli.js"',
+    'if (-not (Test-Path $npmCli)) {',
+    '  # Bundled node — npm-cli.js path varies; try common locations',
+    '  $npmCli = Get-ChildItem $NodeDir -Recurse -Filter "npm-cli.js" -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName',
+    '}',
+    'if (-not $npmCli) { Fail "npm not found — please install Node.js from nodejs.org then re-run" }',
+    '',
+    '# ── Download phoenix-client.js ───────────────────────────────────────────',
+    'Step "Downloading Phoenix client..."',
+    '$clientJs = Join-Path $PhoenixDir "phoenix-client.js"',
+    '(New-Object System.Net.WebClient).DownloadFile("' + clientJsUrl + '", $clientJs)',
+    'Ok "Phoenix client downloaded"',
+    '',
+    '# ── package.json (ESM — phoenix-client.js uses import syntax) ────────────',
+    '[IO.File]::WriteAllText((Join-Path $PhoenixDir "package.json"), \'{"name":"phoenix-client","version":"1.0.0","type":"module"}\')',
+    '',
+    '# ── Install ws ───────────────────────────────────────────────────────────',
+    'Step "Installing dependencies..."',
+    'try { & $nodeExe $npmCli install ws --prefix $PhoenixDir --no-audit --no-fund --save --loglevel=silent 2>&1 | Out-Null } catch {}',
+    'Ok "ws installed"',
+    '',
+    '# ── Write config ─────────────────────────────────────────────────────────',
+    'Step "Writing config..."',
+    '$deviceName = $env:COMPUTERNAME',
+    'try {',
+    '  $model = (Get-WmiObject Win32_ComputerSystem).Model',
+    '  if ($model -and $model -ne "System Product Name" -and $model -ne "To Be Filled By O.E.M." -and $model.Trim().Length -gt 2) {',
+    '    $deviceName = "$($model.Trim())-$env:COMPUTERNAME"',
+    '  }',
+    '} catch {}',
+    '$cfgObj = [ordered]@{',
+    '  hub_ws   = "' + hubWs  + '"',
+    '  hub_http = "' + httpUrl + '"',
+    '  token    = "' + token   + '"',
+    '  device_id = $env:COMPUTERNAME',
+    '  name      = $deviceName',
+    '}',
+    '$cfgJson = $cfgObj | ConvertTo-Json -Compress',
+    '[IO.File]::WriteAllText((Join-Path $PhoenixDir "phoenix-client-config.json"), $cfgJson)',
+    'Ok "Config written"',
+    '',
+    '# ── Launch client in background, show first 5s of output ───────────────',
+    'Step "Starting Phoenix client..."',
+    '$logOut = Join-Path $PhoenixDir "client-out.log"',
+    '$logErr = Join-Path $PhoenixDir "client-err.log"',
+    'Remove-Item $logOut,$logErr -ErrorAction SilentlyContinue',
+    '$nodeArgs = "`"$clientJs`" --hub `"' + hubWs + '`" --token `"' + token + '`" --name `"$deviceName`""',
+    '$proc = Start-Process $nodeExe -ArgumentList $nodeArgs -WorkingDirectory $PhoenixDir -WindowStyle Hidden -RedirectStandardOutput $logOut -RedirectStandardError $logErr -PassThru',
+    'Write-Host "  Waiting for client to start..." -ForegroundColor Gray',
+    'Start-Sleep 5',
+    'if ($proc.HasExited) {',
+    '  Write-Host "  [ERR] Node crashed (exit code $($proc.ExitCode))" -ForegroundColor Red',
+    '} else {',
+    '  Write-Host "  Phoenix client running (PID $($proc.Id)) ✓" -ForegroundColor Green',
+    '}',
+    '$o = if (Test-Path $logOut) { Get-Content $logOut -Raw } else { "" }',
+    '$e = if (Test-Path $logErr) { Get-Content $logErr -Raw } else { "" }',
+    'if ($o) { Write-Host $o -ForegroundColor Gray }',
+    'if ($e) { Write-Host $e -ForegroundColor Red }',
+    '',
+    'Write-Host ""',
+    'Write-Host "  ✓ Connected!" -ForegroundColor Green',
+    'Write-Host "  Check your Phoenix dashboard to approve this device." -ForegroundColor White',
+    'Write-Host ""',
+    'Read-Host "  Press Enter to close"',
+  ];
+  return lines.join('\r\n');
+}
+
+function generateLinuxClientInstaller(token, hubWs, clientJsUrl) {
+  // Build as array — avoids JS template-literal escaping issues with shell $() and heredocs
+  const httpUrl = hubWs.replace(/^ws/, 'http');
+  const lines = [
+    '#!/usr/bin/env bash',
+    '# Phoenix Client Installer — Linux / macOS',
+    '# Run: curl -s ' + httpUrl + '/install/' + token + ' | bash',
+    'set -euo pipefail',
+    '',
+    'PHOENIX_DIR="${HOME}/.local/share/phoenix-client"',
+    'NODE_DIR="${PHOENIX_DIR}/node"',
+    'NODE_VERSION="22.16.0"',
+    'OS="$(uname -s | tr \'[:upper:]\' \'[:lower:]\')"',
+    'ARCH="$(uname -m)"',
+    '[ "${ARCH}" = "x86_64" ] && NODE_ARCH="x64" || NODE_ARCH="arm64"',
+    'NODE_URL="https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-${OS}-${NODE_ARCH}.tar.xz"',
+    '',
+    'log() { echo -e "  \\033[36m>\\033[0m $1"; }',
+    'ok()  { echo -e "  \\033[32m[OK]\\033[0m $1"; }',
+    '',
+    'log "Creating directories"',
+    'mkdir -p "${PHOENIX_DIR}" "${NODE_DIR}" "${PHOENIX_DIR}/data"',
+    '',
+    'log "Setting up Node.js v${NODE_VERSION}"',
+    'if [ ! -x "${NODE_DIR}/bin/node" ]; then',
+    '  TMP="$(mktemp /tmp/phoenix-node.XXXXXX.tar.xz)"',
+    '  if command -v curl &>/dev/null; then',
+    '    curl -sSL "${NODE_URL}" -o "${TMP}"',
+    '  else',
+    '    wget -qO "${TMP}" "${NODE_URL}"',
+    '  fi',
+    '  tar -xJf "${TMP}" -C "${NODE_DIR}" --strip-components=1',
+    '  rm -f "${TMP}"',
+    'fi',
+    'ok "Node.js $(${NODE_DIR}/bin/node --version)"',
+    '',
+    'log "Downloading phoenix-client.js"',
+    'if command -v curl &>/dev/null; then',
+    '  curl -sSL "' + clientJsUrl + '" -o "${PHOENIX_DIR}/phoenix-client.js"',
+    'else',
+    '  wget -qO "${PHOENIX_DIR}/phoenix-client.js" "' + clientJsUrl + '"',
+    'fi',
+    '',
+    'log "Installing ws dependency"',
+    'cd "${PHOENIX_DIR}"',
+    '"${NODE_DIR}/bin/npm" init -y >/dev/null 2>&1',
+    '"${NODE_DIR}/bin/npm" install ws --no-audit --no-fund >/dev/null 2>&1',
+    'ok "Dependencies installed"',
+    '',
+    'log "Writing config"',
+    'DEVICE_ID="$(hostname)"',
+    'DEVICE_NAME="${DEVICE_ID}"',
+    'if [ "$(uname)" = "Darwin" ]; then',
+    '  HW_MODEL="$(system_profiler SPHardwareDataType 2>/dev/null | awk -F: \'/Model Name/{gsub(/^ +/,"",$2); print $2; exit}\')"',
+    '  [ -n "${HW_MODEL}" ] && DEVICE_NAME="${HW_MODEL}-${DEVICE_ID}"',
+    'elif [ -f /sys/devices/virtual/dmi/id/product_name ]; then',
+    '  HW_MODEL="$(cat /sys/devices/virtual/dmi/id/product_name 2>/dev/null | tr -d \'\\n\')"',
+    '  [ -n "${HW_MODEL}" ] && [ "${HW_MODEL}" != "System Product Name" ] && DEVICE_NAME="${HW_MODEL}-${DEVICE_ID}"',
+    'fi',
+    'cat > "${PHOENIX_DIR}/phoenix-client-config.json" <<PHOENIXCFGEOF',
+    '{',
+    '  "hub_ws": "' + hubWs + '",',
+    '  "token": "' + token + '",',
+    '  "device_id": "${DEVICE_ID}",',
+    '  "name": "${DEVICE_NAME}"',
+    '}',
+    'PHOENIXCFGEOF',
+    '',
+    'log "Registering systemd service"',
+    'SYSTEMD_DIR="${HOME}/.config/systemd/user"',
+    'mkdir -p "${SYSTEMD_DIR}"',
+    'cat > "${SYSTEMD_DIR}/phoenix-client.service" <<PHOENIXUNIT',
+    '[Unit]',
+    'Description=Phoenix Client',
+    'After=network-online.target',
+    '',
+    '[Service]',
+    'ExecStart=${NODE_DIR}/bin/node ${PHOENIX_DIR}/phoenix-client.js',
+    'WorkingDirectory=${PHOENIX_DIR}',
+    'Restart=always',
+    'RestartSec=5',
+    '',
+    '[Install]',
+    'WantedBy=default.target',
+    'PHOENIXUNIT',
+    '',
+    'if command -v systemctl &>/dev/null; then',
+    '  systemctl --user daemon-reload 2>/dev/null || true',
+    '  systemctl --user enable phoenix-client.service 2>/dev/null || true',
+    '  systemctl --user start phoenix-client.service 2>/dev/null || true',
+    '  ok "Systemd service started"',
+    'else',
+    '  "${NODE_DIR}/bin/node" "${PHOENIX_DIR}/phoenix-client.js" &',
+    '  ok "Client started (running in background)"',
+    'fi',
+    '',
+    'echo ""',
+    'echo -e "  \\033[32mPhoenix Client installed!\\033[0m"',
+    'echo "  Hub:   ' + hubWs + '"',
+    'echo "  Data:  ${PHOENIX_DIR}"',
+  ];
+  return lines.join('\n');
+}
+
+// Feature registry — maps feature names to Steward services for toggle API
+// Import start/stop directly for the toggle endpoint (Steward handles boot, this handles runtime toggles)
+import { startScout, stopScout, getFindings, updateFinding } from './scout.js';
+import { startDream, stopDream } from './dream.js';
+import { startClassifier, stopClassifier } from './classifier.js';
+import { startAutoDev, stopAutoDev } from './autodev.js';
+import { startStackScanner, stopStackScanner } from './stack-scanner.js';
+
+const featureRegistry = {
+  scout: { start: startScout, stop: stopScout, interval: '12h', defaultMs: 12 * 60 * 60 * 1000 },
+  dream: { start: startDream, stop: stopDream, interval: '6h', defaultMs: 6 * 60 * 60 * 1000 },
+  autodev: { start: startAutoDev, stop: stopAutoDev, interval: '1h', defaultMs: 60 * 60 * 1000 },
+  evolution: { start: () => console.log('[Phoenix] Evolution enabled — runs after each dream cycle'), stop: () => console.log('[Phoenix] Evolution disabled'), interval: 'after-dream', defaultMs: 0 },
+};
+
+// GET /api/automation/status — current feature toggle states
+app.get('/api/automation/status', (req, res) => {
+  let toggles = {};
+  try {
+    const row = get("SELECT value FROM settings WHERE key = 'feature_toggles'");
+    if (row) toggles = JSON.parse(row.value);
+  } catch {}
+
+  const features = {
+    scout: { enabled: toggles.scout !== false, interval: '12h' },
+    dream: { enabled: toggles.dream !== false, interval: '6h' },
+    autodev: { enabled: toggles.autodev === true, interval: '1h' },
+    evolution: { enabled: toggles.evolution === true, interval: 'after-dream' },
+    classifier: { enabled: true, interval: '5m', required: true },
+    project_sync: { enabled: true, interval: '10m', required: true },
+  };
+  res.json({ features });
+});
+
+// POST /api/automation/toggle — toggle a feature on/off (manager+ only)
+app.post('/api/automation/toggle', requireFeature('automations:toggle'), (req, res) => {
+  const { feature, enabled } = req.body;
+  if (!feature || !featureRegistry[feature]) {
+    return res.status(400).json({ error: 'Invalid feature. Valid: ' + Object.keys(featureRegistry).join(', ') });
+  }
+
+  // Load current toggles
+  let toggles = {};
+  try {
+    const row = get("SELECT value FROM settings WHERE key = 'feature_toggles'");
+    if (row) toggles = JSON.parse(row.value);
+  } catch {}
+
+  toggles[feature] = !!enabled;
+  run("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('feature_toggles', :val, datetime('now','localtime'))", {
+    ':val': JSON.stringify(toggles)
+  });
+
+  // Actually start/stop the feature
+  const reg = featureRegistry[feature];
+  if (enabled) {
+    console.log(`[Phoenix] Starting ${feature}...`);
+    reg.start(reg.defaultMs);
+  } else {
+    console.log(`[Phoenix] Stopping ${feature}...`);
+    reg.stop();
+  }
+
+  res.json({ ok: true, feature, enabled: !!enabled });
+});
+
+// GET /api/automation/usage — AI usage stats
+// #465: now includes by_source (phone/dashboard/scout/dream/router/internal/...)
+// and by_device (pixel-10-pro / minipc / null) breakdowns alongside by_caller.
+app.get('/api/automation/usage', (req, res) => {
+  try {
+    const COL_TOKENS = `COALESCE(SUM(input_tokens), 0) as input_tokens, COALESCE(SUM(output_tokens), 0) as output_tokens`;
+    const COL_BASE   = `COUNT(*) as calls, COALESCE(SUM(cost_cents), 0) as cost_cents`;
+
+    // Today
+    const todayStats = get(`SELECT COALESCE(SUM(cost_cents), 0) as total_cost_cents, COUNT(*) as total_calls
+      FROM ai_usage WHERE date(created_at) = date('now','localtime')`);
+    const todayByCaller = all(`SELECT caller, ${COL_BASE}, ${COL_TOKENS}
+      FROM ai_usage WHERE date(created_at) = date('now','localtime') GROUP BY caller`);
+    const todayBySource = all(`SELECT COALESCE(source,'internal') as source, ${COL_BASE}, ${COL_TOKENS}
+      FROM ai_usage WHERE date(created_at) = date('now','localtime') GROUP BY source`);
+    const todayByDevice = all(`SELECT COALESCE(device_id,'(none)') as device_id, ${COL_BASE}, ${COL_TOKENS}
+      FROM ai_usage WHERE date(created_at) = date('now','localtime') GROUP BY device_id`);
+
+    // This week
+    const weekStats = get(`SELECT COALESCE(SUM(cost_cents), 0) as total_cost_cents, COUNT(*) as total_calls
+      FROM ai_usage WHERE created_at >= datetime('now','localtime', '-7 days')`);
+    const weekByCaller = all(`SELECT caller, ${COL_BASE}
+      FROM ai_usage WHERE created_at >= datetime('now','localtime', '-7 days') GROUP BY caller`);
+    const weekBySource = all(`SELECT COALESCE(source,'internal') as source, ${COL_BASE}
+      FROM ai_usage WHERE created_at >= datetime('now','localtime', '-7 days') GROUP BY source`);
+    const weekByDevice = all(`SELECT COALESCE(device_id,'(none)') as device_id, ${COL_BASE}
+      FROM ai_usage WHERE created_at >= datetime('now','localtime', '-7 days') GROUP BY device_id`);
+
+    // All time
+    const allTimeStats = get(`SELECT COALESCE(SUM(cost_cents), 0) as total_cost_cents, COUNT(*) as total_calls
+      FROM ai_usage`);
+    const allTimeByCaller = all(`SELECT caller, ${COL_BASE} FROM ai_usage GROUP BY caller`);
+    const allTimeBySource = all(`SELECT COALESCE(source,'internal') as source, ${COL_BASE} FROM ai_usage GROUP BY source`);
+    const allTimeByDevice = all(`SELECT COALESCE(device_id,'(none)') as device_id, ${COL_BASE} FROM ai_usage GROUP BY device_id`);
+
+    const toMapBy = (rows, key) => {
+      const m = {};
+      for (const r of rows) m[r[key]] = {
+        calls: r.calls, cost_cents: r.cost_cents,
+        input_tokens: r.input_tokens, output_tokens: r.output_tokens,
+      };
+      return m;
+    };
+
+    res.json({
+      today: {
+        ...todayStats,
+        by_caller: toMapBy(todayByCaller, 'caller'),
+        by_source: toMapBy(todayBySource, 'source'),
+        by_device: toMapBy(todayByDevice, 'device_id'),
+      },
+      week: {
+        ...weekStats,
+        by_caller: toMapBy(weekByCaller, 'caller'),
+        by_source: toMapBy(weekBySource, 'source'),
+        by_device: toMapBy(weekByDevice, 'device_id'),
+      },
+      all_time: {
+        ...allTimeStats,
+        by_caller: toMapBy(allTimeByCaller, 'caller'),
+        by_source: toMapBy(allTimeBySource, 'source'),
+        by_device: toMapBy(allTimeByDevice, 'device_id'),
+      },
+    });
+  } catch (e) {
+    console.error('[Phoenix Usage] Error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/automation/usage/recent?limit=10 — recent AI calls feed.
+// Powers the desktop dashboard's "Phoenix's Mind" panel ("what Phoenix is thinking
+// about right now"). Mirrors the per-call telemetry the phone's
+// PhoenixThinkingCard already surfaces locally. Per-call latency_ms is bug #471.
+app.get('/api/automation/usage/recent', (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 10, 50);
+    const rows = all(`
+      SELECT caller, model, COALESCE(source,'internal') as source,
+             COALESCE(device_id,'(none)') as device_id,
+             input_tokens, output_tokens, cost_cents,
+             COALESCE(prompt_preview,'') as prompt_preview,
+             latency_ms,
+             created_at
+      FROM ai_usage
+      ORDER BY id DESC
+      LIMIT ${limit}
+    `);
+    res.json({ ok: true, recent: rows });
+  } catch (e) {
+    console.error('[Phoenix Usage Recent] Error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ==================== PHOENIX THOUGHT STREAM ====================
+// First-person reasoning trace — see service/src/thoughts.js header.
+// Powers the dashboard's "Phoenix's Mind" panel and the `phoenix_thoughts` MCP tool.
+
+// GET /api/v1/thoughts/recent?limit=20&source=intuition&since_ms=3600000
+app.get('/api/v1/thoughts/recent', (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 20, 200);
+    const source = (req.query.source || '').trim() || undefined;
+    const sinceMs = req.query.since_ms ? parseInt(req.query.since_ms) : undefined;
+    const rows = recentThoughts({ limit, source, sinceMs });
+    res.json({ ok: true, thoughts: rows });
+  } catch (e) {
+    console.error('[Thoughts API] recent failed:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// POST /api/v1/thoughts { source, thought, refs?, importance? }
+// Used by Phoenix itself (via MCP) to log explicit deliberations — e.g. "I'm
+// considering interjecting because…". Kept out of `ai_usage` because this is
+// a verdict, not a billing event.
+app.post('/api/v1/thoughts', express.json(), (req, res) => {
+  try {
+    const { source, thought, refs, importance } = req.body || {};
+    if (!source || !thought) {
+      return res.status(400).json({ ok: false, error: 'source and thought required' });
+    }
+    const id = writeThought(source, thought, refs || null, importance);
+    if (!id) return res.status(500).json({ ok: false, error: 'write failed' });
+    res.json({ ok: true, id });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ─── Intuition Subsystem Endpoints (tasks #491, #492, #493) ─────────────────
+// Needs levels, events, satisfy action. Used by the dashboard Intuition
+// panel and debug scripts. The passive loop runs inside `service/src/intuition/`.
+
+// GET /api/v1/needs/levels?user=<name>  → { user, levels: { energy: 72, ... } }
+app.get('/api/v1/needs/levels', (req, res) => {
+  try {
+    const user = (req.query.user || '').trim() || needsCurrentUser();
+    const levels = needs.allLevels(user);
+    res.json({ ok: true, user, levels });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// GET /api/v1/needs/events?user=<name>&need=focus&limit=10
+app.get('/api/v1/needs/events', (req, res) => {
+  try {
+    const user = (req.query.user || '').trim() || needsCurrentUser();
+    const needId = (req.query.need || '').trim() || undefined;
+    const limit = Math.min(parseInt(req.query.limit, 10) || 20, 100);
+    const events = needs.recentEvents(user, { needId, limit });
+    res.json({ ok: true, user, need: needId, events });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// GET /api/v1/phoenix/synthesis?user=<name>&force=1
+// LLM-synthesized first-person paragraph capturing what Phoenix is currently
+// trying to understand. Backs the Phoenix's-Mind synthesis box on the dashboard
+// (task #494). Cached 3 min per user — pass force=1 to bypass.
+app.get('/api/v1/phoenix/synthesis', async (req, res) => {
+  try {
+    const user = (req.query.user || '').trim() || needsCurrentUser();
+    const force = req.query.force === '1';
+    const { generate } = await import('./intuition/synthesis.js');
+    const result = await generate(user, { force, trigger: force ? 'manual' : 'tick' });
+    res.json({ ok: true, user, ...result });
+  } catch (e) {
+    console.error('[Phoenix Synthesis API] failed:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ─── Phoenix Reasoning Steps (task #495) ───────────────────────────────────
+// Typed reasoning substrate. Each step is one atomic thought-move
+// (observe/recall/infer/...) with refs to evidence. The widget paragraph
+// is a *rendering* of the latest cycle; these endpoints expose the
+// substrate underneath so consumers can drill in.
+//
+// GET /api/v1/phoenix/reasoning/recent?user=<name>&limit=20&kind=infer&since_ms=N
+app.get('/api/v1/phoenix/reasoning/recent', async (req, res) => {
+  try {
+    const userId = (req.query.user || '').trim() || undefined;
+    const limit = parseInt(req.query.limit, 10);
+    const since_ms = parseInt(req.query.since_ms, 10);
+    const { recentSteps } = await import('./intuition/reasoning.js');
+    const rows = recentSteps({
+      userId,
+      limit: Number.isFinite(limit) ? limit : 20,
+      kind: req.query.kind || undefined,
+      since_ms: Number.isFinite(since_ms) ? since_ms : undefined,
+    });
+    res.json({ ok: true, count: rows.length, steps: rows });
+  } catch (e) {
+    console.error('[Phoenix Reasoning API] recent failed:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// GET /api/v1/phoenix/reasoning/cycle/:id  → one cycle + all its steps.
+app.get('/api/v1/phoenix/reasoning/cycle/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isFinite(id)) return res.status(400).json({ ok: false, error: 'bad id' });
+    const { getCycle } = await import('./intuition/reasoning.js');
+    const result = getCycle(id);
+    if (!result) return res.status(404).json({ ok: false, error: 'not found' });
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    console.error('[Phoenix Reasoning API] cycle failed:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// GET /api/v1/phoenix/reasoning/why/:stepId  → causal chain (parents walk).
+app.get('/api/v1/phoenix/reasoning/why/:stepId', async (req, res) => {
+  try {
+    const id = parseInt(req.params.stepId, 10);
+    if (!Number.isFinite(id)) return res.status(400).json({ ok: false, error: 'bad step id' });
+    const { walkParents } = await import('./intuition/reasoning.js');
+    const chain = walkParents(id);
+    res.json({ ok: true, count: chain.length, chain });
+  } catch (e) {
+    console.error('[Phoenix Reasoning API] why failed:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// POST /api/v1/phoenix/reasoning/cycle  { user?, trigger? } → force a new cycle.
+app.post('/api/v1/phoenix/reasoning/cycle', express.json(), async (req, res) => {
+  try {
+    const user = (req.body?.user || req.query.user || '').trim() || needsCurrentUser();
+    const trigger = req.body?.trigger || 'manual';
+    const { runCycle } = await import('./intuition/reasoning.js');
+    const result = await runCycle({ userId: user, trigger });
+    res.json({ ok: result.ok !== false, user, ...result });
+  } catch (e) {
+    console.error('[Phoenix Reasoning API] cycle POST failed:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// POST /api/v1/needs/satisfy { user?, need, delta?, toLevel?, source?, note? }
+// Used by manual UI + tests + future skills ("Phoenix, log that I ate a sandwich").
+app.post('/api/v1/needs/satisfy', express.json(), (req, res) => {
+  try {
+    const { user, need, delta, toLevel, source, note, refs } = req.body || {};
+    if (!need) return res.status(400).json({ ok: false, error: 'need required' });
+    const userId = (user || '').trim() || needsCurrentUser();
+    const result = needs.satisfy(userId, need, { delta, toLevel, source: source || 'api', note, refs });
+    if (!result) return res.status(400).json({ ok: false, error: `unknown need: ${need}` });
+    res.json({ ok: true, user: userId, need, ...result });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// POST /api/v1/needs/set { user?, need, level, note? } — dashboard slider override
+app.post('/api/v1/needs/set', express.json(), (req, res) => {
+  try {
+    const { user, need, level, note } = req.body || {};
+    if (!need || typeof level !== 'number') {
+      return res.status(400).json({ ok: false, error: 'need and numeric level required' });
+    }
+    const userId = (user || '').trim() || needsCurrentUser();
+    const result = needs.manualSet(userId, need, level, { note });
+    if (!result) return res.status(400).json({ ok: false, error: `unknown need: ${need}` });
+    res.json({ ok: true, user: userId, need, ...result });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// GET /api/v1/interjections?user=owner&limit=20 — recent delivered interjections
+app.get('/api/v1/interjections', (req, res) => {
+  try {
+    const user = (req.query.user || '').trim() || null;
+    const limit = Math.min(parseInt(req.query.limit) || 20, 200);
+    const rows = recentInterjections({ userId: user, limit });
+    res.json({ ok: true, interjections: rows });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// POST /api/v1/interjections/:id/feedback { feedback: accept|dismiss|snooze|thanks }
+// Updates status + adjusts the per-user need weight (learning loop).
+app.post('/api/v1/interjections/:id/feedback', express.json(), async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const feedback = (req.body?.feedback || '').trim();
+    const valid = ['accept', 'dismiss', 'snooze', 'thanks', 'ignored'];
+    if (!valid.includes(feedback)) {
+      return res.status(400).json({ ok: false, error: `feedback must be one of ${valid.join('|')}` });
+    }
+    const r = await recordFeedback(id, feedback);
+    if (!r.ok) return res.status(400).json(r);
+    res.json(r);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// POST /api/v1/needs/weight { user?, need, delta }  — learning loop adjustment
+app.post('/api/v1/needs/weight', express.json(), (req, res) => {
+  try {
+    const { user, need, delta } = req.body || {};
+    if (!need || typeof delta !== 'number') {
+      return res.status(400).json({ ok: false, error: 'need and numeric delta required' });
+    }
+    const userId = (user || '').trim() || needsCurrentUser();
+    const next = needs.adjustWeight(userId, need, delta);
+    if (next == null) return res.status(400).json({ ok: false, error: `unknown need: ${need}` });
+    res.json({ ok: true, user: userId, need, weight: next });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// GET /api/v1/interjections?user=owner&limit=20 — delivered interjections log
+app.get('/api/v1/interjections', (req, res) => {
+  try {
+    const user = (req.query.user || '').trim() || null;
+    const limit = Math.min(parseInt(req.query.limit) || 20, 200);
+    const rows = recentInterjections({ userId: user, limit });
+    res.json({ ok: true, interjections: rows });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// POST /api/v1/interjections/:id/feedback { feedback: 'accept'|'dismiss'|'thanks'|'snooze' }
+// Powers the per-user weight learning loop. accept/thanks raise the need's
+// weight, dismiss lowers it. See intuition/action.js recordFeedback.
+app.post('/api/v1/interjections/:id/feedback', express.json(), async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const { feedback } = req.body || {};
+    if (!id || !feedback) return res.status(400).json({ ok: false, error: 'id + feedback required' });
+    const result = await recordFeedback(id, feedback);
+    if (!result.ok) return res.status(400).json(result);
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ==================== SCOUT ENDPOINTS ====================
+
+// GET /dashboard/api/scout — list scout findings
+app.get('/dashboard/api/scout', (req, res) => {
+  try {
+    const status = req.query.status || 'new';
+    const limit = parseInt(req.query.limit) || 20;
+    const findings = getFindings({ status, limit });
+    res.json({ findings });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /dashboard/api/scout/run — trigger a scout scan (does NOT enable the scout service)
+app.post('/dashboard/api/scout/run', async (req, res) => {
+  try {
+    const { scout } = await import('./scout.js');
+    await scout();
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PATCH /dashboard/api/scout/:id — approve/dismiss a finding
+app.patch('/dashboard/api/scout/:id', (req, res) => {
+  try {
+    const { status } = req.body || {};
+    if (!status) return res.status(400).json({ error: 'status required' });
+    updateFinding(parseInt(req.params.id), status);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/v1/context/reset — strip injected context from CLAUDE.md, keep static docs only
+app.post('/api/v1/context/reset', (req, res) => {
+  try {
+    // Find all CLAUDE.md files that might have Phoenix-CONTEXT blocks
+    const phoenixRoot = join(__dirname, '..', '..');
+    const claudeMdPath = join(phoenixRoot, 'CLAUDE.md');
+    if (!existsSync(claudeMdPath)) return res.json({ ok: false, error: 'CLAUDE.md not found' });
+
+    const content = readFileSync(claudeMdPath, 'utf8');
+    let startMarker = '<!-- PHOENIX-CONTEXT-START -->';
+    let endMarker = '<!-- PHOENIX-CONTEXT-END -->';
+    let startIdx = content.indexOf(startMarker);
+    let endIdx = content.lastIndexOf(endMarker);
+    if (startIdx === -1 || endIdx === -1) {
+      startMarker = '<!-- PHOENIX-CONTEXT-START -->';
+      endMarker = '<!-- PHOENIX-CONTEXT-END -->';
+      startIdx = content.indexOf(startMarker);
+      endIdx = content.lastIndexOf(endMarker);
+    }
+
+    if (startIdx === -1 || endIdx === -1) return res.json({ ok: true, before: content.length, after: content.length, message: 'No injected context found' });
+
+    const trimmed = content.substring(0, startIdx) + startMarker + '\n' + endMarker + content.substring(endIdx + endMarker.length);
+    writeFileSync(claudeMdPath, trimmed, 'utf8');
+    console.log(`[Context Reset] CLAUDE.md: ${content.length} → ${trimmed.length} chars (saved ${content.length - trimmed.length})`);
+    res.json({ ok: true, before: content.length, after: trimmed.length, saved: content.length - trimmed.length });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// GET /api/v1/context/size — quick check of current CLAUDE.md size
+app.get('/api/v1/context/size', (req, res) => {
+  try {
+    const phoenixRoot = join(__dirname, '..', '..');
+    const claudeMdPath = join(phoenixRoot, 'CLAUDE.md');
+    if (!existsSync(claudeMdPath)) return res.json({ total: 0, static: 0, injected: 0 });
+
+    const content = readFileSync(claudeMdPath, 'utf8');
+    let startMarker = '<!-- PHOENIX-CONTEXT-START -->';
+    let endMarker = '<!-- PHOENIX-CONTEXT-END -->';
+    let startIdx = content.indexOf(startMarker);
+    let endIdx = content.lastIndexOf(endMarker);
+    if (startIdx === -1 || endIdx === -1) {
+      startMarker = '<!-- PHOENIX-CONTEXT-START -->';
+      endMarker = '<!-- PHOENIX-CONTEXT-END -->';
+      startIdx = content.indexOf(startMarker);
+      endIdx = content.lastIndexOf(endMarker);
+    }
+
+    const staticSize = startIdx > 0 ? startIdx : content.length;
+    const injectedSize = (startIdx > 0 && endIdx > 0) ? (endIdx - startIdx) : 0;
+
+    res.json({
+      total: content.length,
+      static: staticSize,
+      injected: injectedSize,
+      tokens_approx: Math.round(content.length / 4),
+      warning: content.length > 15000,
+      critical: content.length > 20000,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/v1/claude-models (also /api/v1/ai/models) — fetch available Claude models from Anthropic API
+// Falls back to a curated list if no API key. Cached for 1 hour.
+let _modelsCache = null;
+let _modelsCacheAt = 0;
+async function getClaudeModels() {
+  if (_modelsCache && (Date.now() - _modelsCacheAt) < 3600000) return _modelsCache;
+  const keyRow = get("SELECT value FROM settings WHERE key = 'anthropic_api_key'");
+  if (keyRow?.value) {
+    try {
+      const r = await fetch('https://api.anthropic.com/v1/models', {
+        headers: { 'x-api-key': keyRow.value, 'anthropic-version': '2023-06-01' }
+      });
+      if (r.ok) {
+        const data = await r.json();
+        const apiModels = (data.data || [])
+          .filter(m => m.id.startsWith('claude-'))
+          .map(m => ({ id: m.id, name: m.display_name || m.id, created_at: m.created_at }))
+          .sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
+        // Merge in pinned models that the API may not return yet
+        const pinned = [
+          { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6' },
+          { id: 'claude-sonnet-4-5', name: 'Claude Sonnet 4.5' },
+          { id: 'claude-haiku-4-5',  name: 'Claude Haiku 4.5 (fast)' },
+        ];
+        const apiIds = new Set(apiModels.map(m => m.id));
+        const merged = [...apiModels, ...pinned.filter(m => !apiIds.has(m.id))];
+        _modelsCache = { models: merged, source: 'anthropic_api', fetched_at: new Date().toISOString() };
+        _modelsCacheAt = Date.now();
+        return _modelsCache;
+      }
+    } catch {}
+  }
+  const fallback = [
+    { id: 'claude-haiku-4-5',           name: 'Claude Haiku 4.5 (fast)' },
+    { id: 'claude-sonnet-4-5',          name: 'Claude Sonnet 4.5' },
+    { id: 'claude-sonnet-4-6',          name: 'Claude Sonnet 4.6' },
+    { id: 'claude-opus-4-5',            name: 'Claude Opus 4.5' },
+    { id: 'claude-opus-4-6',            name: 'Claude Opus 4.6' },
+  ];
+  return { models: fallback, source: 'fallback', fetched_at: new Date().toISOString() };
+}
+const _modelsHandler = async (req, res) => {
+  try { res.json(await getClaudeModels()); } catch (e) { res.status(500).json({ error: e.message }); }
+};
+app.get('/api/v1/claude-models', _modelsHandler);
+app.get('/api/v1/ai/models', _modelsHandler);
+
+// GET /api/v1/claude-usage — Claude Code session token usage from JSONL files
+// Heavy: reads dozens of JSONL files + calls Anthropic API. Cached 5 minutes.
+// On cold start, returns empty shell immediately and computes in background.
+let _claudeUsageCache = null;
+let _claudeUsageCacheAt = 0;
+let _claudeUsageComputing = false;
+const CLAUDE_USAGE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+app.get('/api/v1/claude-usage', async (req, res) => {
+  if (_claudeUsageCache && (Date.now() - _claudeUsageCacheAt) < CLAUDE_USAGE_TTL_MS) {
+    return res.json(_claudeUsageCache);
+  }
+  // If already computing, return stale cache or empty shell (don't pile up)
+  if (_claudeUsageComputing) {
+    return res.json(_claudeUsageCache || { session: { input: 0, output: 0, cache_read: 0, cache_create: 0, total: 0, messages: 0 }, today: { input: 0, output: 0, cache_read: 0, cache_create: 0, total: 0, messages: 0 }, week: { input: 0, output: 0, cache_read: 0, cache_create: 0, total: 0, messages: 0 }, model: 'loading...', rateLimits: null });
+  }
+  _claudeUsageComputing = true;
+  try {
+    const homeDir = process.env.HOME || process.env.USERPROFILE;
+    const sessDir = join(homeDir, '.claude', 'sessions');
+    const projBase = join(homeDir, '.claude', 'projects');
+
+    // Read active sessions
+    const sessionFiles = existsSync(sessDir) ? readdirSync(sessDir).filter(f => f.endsWith('.json')) : [];
+    const sessions = sessionFiles.map(f => {
+      try { return JSON.parse(readFileSync(join(sessDir, f), 'utf8')); } catch { return null; }
+    }).filter(Boolean);
+
+    // Find JSONL files for sessions and sum tokens
+    function sumJsonlTokens(filePath, maxBytes = 10 * 1024 * 1024, skipSizeLimit = false) {
+      const result = { input: 0, output: 0, cache_read: 0, cache_create: 0, messages: 0, model: '' };
+      try {
+        // Skip files larger than maxBytes — but never skip active sessions regardless of size
+        const fstat = statSync(filePath);
+        if (!skipSizeLimit && fstat.size > maxBytes) return result;
+        const data = readFileSync(filePath, 'utf8');
+        for (const line of data.split('\n')) {
+          if (!line.trim()) continue;
+          try {
+            const msg = JSON.parse(line);
+            if (msg.message?.usage) {
+              const u = msg.message.usage;
+              result.input += u.input_tokens || 0;
+              result.output += u.output_tokens || 0;
+              result.cache_read += u.cache_read_input_tokens || 0;
+              result.cache_create += u.cache_creation_input_tokens || 0;
+              result.messages++;
+            }
+            if (msg.message?.model && !result.model) result.model = msg.message.model;
+          } catch {}
+        }
+      } catch {}
+      return result;
+    }
+
+    // Search project dirs for each session's JSONL
+    const projectDirs = existsSync(projBase) ? readdirSync(projBase).filter(f => {
+      try { return statSync(join(projBase, f)).isDirectory(); } catch { return false; }
+    }) : [];
+
+    const now = Date.now();
+    const twoHours = 2 * 60 * 60 * 1000;
+    const oneDay = 24 * 60 * 60 * 1000;
+    const oneWeek = 7 * oneDay;
+
+    let sessionTokens = { input: 0, output: 0, cache_read: 0, cache_create: 0, messages: 0 };
+    let todayTokens = { input: 0, output: 0, cache_read: 0, cache_create: 0, messages: 0 };
+    let weekTokens = { input: 0, output: 0, cache_read: 0, cache_create: 0, messages: 0 };
+    let model = '';
+    let activeSessions = 0;
+    let currentSessionStart = null;
+
+    // Process all JSONL files from all projects
+    for (const pd of projectDirs) {
+      const pdPath = join(projBase, pd);
+      const jsonlFiles = readdirSync(pdPath).filter(f => f.endsWith('.jsonl'));
+
+      for (const jf of jsonlFiles) {
+        const sessionId = jf.replace('.jsonl', '');
+        const session = sessions.find(s => s.sessionId === sessionId);
+        const filePath = join(pdPath, jf);
+        const stat = statSync(filePath);
+        const fileAge = now - stat.mtimeMs;
+
+        // Current session (matches active session files)
+        if (session) {
+          activeSessions++;
+          const tokens = sumJsonlTokens(filePath, 10 * 1024 * 1024, true); // no size limit for active sessions
+          if (tokens.model) model = tokens.model;
+
+          // This is an active session — count its tokens
+          sessionTokens.input += tokens.input;
+          sessionTokens.output += tokens.output;
+          sessionTokens.cache_read += tokens.cache_read;
+          sessionTokens.cache_create += tokens.cache_create;
+          sessionTokens.messages += tokens.messages;
+          if (!currentSessionStart || (session.startedAt && session.startedAt < currentSessionStart)) {
+            currentSessionStart = session.startedAt;
+          }
+        }
+
+        // Today's tokens (modified today)
+        const todayStart = new Date();
+        todayStart.setHours(0, 0, 0, 0);
+        if (stat.mtimeMs >= todayStart.getTime()) {
+          const tokens = session ? { ...sessionTokens } : sumJsonlTokens(filePath);
+          if (!session) {
+            todayTokens.input += tokens.input;
+            todayTokens.output += tokens.output;
+            todayTokens.cache_read += tokens.cache_read;
+            todayTokens.cache_create += tokens.cache_create;
+            todayTokens.messages += tokens.messages;
+          }
+        }
+
+        // Week tokens
+        if (fileAge < oneWeek) {
+          if (!session) {
+            const tokens = sumJsonlTokens(filePath);
+            weekTokens.input += tokens.input;
+            weekTokens.output += tokens.output;
+            weekTokens.cache_read += tokens.cache_read;
+            weekTokens.cache_create += tokens.cache_create;
+            weekTokens.messages += tokens.messages;
+          }
+        }
+      }
+    }
+
+    // Add session tokens to today and week
+    todayTokens.input += sessionTokens.input;
+    todayTokens.output += sessionTokens.output;
+    todayTokens.cache_read += sessionTokens.cache_read;
+    todayTokens.cache_create += sessionTokens.cache_create;
+    todayTokens.messages += sessionTokens.messages;
+    weekTokens.input += todayTokens.input;
+    weekTokens.output += todayTokens.output;
+    weekTokens.cache_read += todayTokens.cache_read;
+    weekTokens.cache_create += todayTokens.cache_create;
+    weekTokens.messages += todayTokens.messages;
+
+    // Fetch real rate limit data by making a tiny Haiku call and reading response headers
+    // The /api/oauth/usage endpoint rate-limits aggressively, but every Anthropic API
+    // response includes rate limit headers (anthropic-ratelimit-unified-*)
+    // CACHE: avoid hammering Anthropic API every 30s — cache for 5 minutes
+    let rateLimits = null;
+    const RL_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+    if (global._rlCache && (Date.now() - global._rlCache.ts < RL_CACHE_TTL)) {
+      rateLimits = global._rlCache.data;
+    } else {
+    try {
+      const credsPath = join(homeDir, '.claude', '.credentials.json');
+      if (existsSync(credsPath)) {
+        const creds = JSON.parse(readFileSync(credsPath, 'utf8'));
+        const token = creds.claudeAiOauth?.accessToken;
+        const subType = creds.claudeAiOauth?.subscriptionType || 'unknown';
+        const tier = creds.claudeAiOauth?.rateLimitTier || 'unknown';
+        if (token) {
+          const body = JSON.stringify({
+            model: 'claude-haiku-4-5-20251001',
+            max_tokens: 1,
+            messages: [{ role: 'user', content: 'hi' }],
+          });
+          const rlData = await new Promise((resolve) => {
+            const req = https.request('https://api.anthropic.com/v1/messages', {
+              method: 'POST',
+              headers: {
+                'x-api-key': token,
+                'Content-Type': 'application/json',
+                'anthropic-version': '2023-06-01',
+                'Content-Length': Buffer.byteLength(body),
+              },
+              timeout: 15000,
+            }, (resp) => {
+              const headers = {};
+              for (const [k, v] of Object.entries(resp.headers)) {
+                if (k.toLowerCase().includes('ratelimit')) headers[k] = v;
+              }
+              // Drain the response body
+              resp.on('data', () => {});
+              resp.on('end', () => resolve(headers));
+            });
+            req.on('error', () => resolve(null));
+            req.on('timeout', () => { req.destroy(); resolve(null); });
+            req.write(body);
+            req.end();
+          });
+          if (rlData) {
+            const h = rlData;
+            rateLimits = {
+              subscriptionType: subType,
+              rateLimitTier: tier,
+              status: h['anthropic-ratelimit-unified-status'] || 'unknown',
+            };
+            // 5-hour session window
+            if (h['anthropic-ratelimit-unified-5h-utilization']) {
+              rateLimits.five_hour = {
+                utilization: parseFloat(h['anthropic-ratelimit-unified-5h-utilization']) * 100,
+                resets_at: h['anthropic-ratelimit-unified-5h-reset'] ? parseInt(h['anthropic-ratelimit-unified-5h-reset']) * 1000 : null,
+                status: h['anthropic-ratelimit-unified-5h-status'] || 'unknown',
+              };
+            }
+            // 7-day weekly
+            if (h['anthropic-ratelimit-unified-7d-utilization']) {
+              rateLimits.seven_day = {
+                utilization: parseFloat(h['anthropic-ratelimit-unified-7d-utilization']) * 100,
+                resets_at: h['anthropic-ratelimit-unified-7d-reset'] ? parseInt(h['anthropic-ratelimit-unified-7d-reset']) * 1000 : null,
+                status: h['anthropic-ratelimit-unified-7d-status'] || 'unknown',
+              };
+            }
+            // Overage / extra usage
+            if (h['anthropic-ratelimit-unified-overage-utilization']) {
+              rateLimits.extra_usage = {
+                utilization: parseFloat(h['anthropic-ratelimit-unified-overage-utilization']) * 100,
+                resets_at: h['anthropic-ratelimit-unified-overage-reset'] ? parseInt(h['anthropic-ratelimit-unified-overage-reset']) * 1000 : null,
+                status: h['anthropic-ratelimit-unified-overage-status'] || 'unknown',
+              };
+            }
+          }
+        }
+      }
+    } catch (rlErr) {
+      console.error('[Claude Usage] Rate limit fetch error:', rlErr.message);
+    }
+    if (rateLimits) global._rlCache = { ts: Date.now(), data: rateLimits };
+    } // end rlCache miss
+
+    const usageResult = {
+      session: {
+        ...sessionTokens,
+        total: sessionTokens.input + sessionTokens.output + sessionTokens.cache_read + sessionTokens.cache_create,
+        startedAt: currentSessionStart,
+        activeSessions,
+      },
+      today: {
+        ...todayTokens,
+        total: todayTokens.input + todayTokens.output + todayTokens.cache_read + todayTokens.cache_create,
+      },
+      week: {
+        ...weekTokens,
+        total: weekTokens.input + weekTokens.output + weekTokens.cache_read + weekTokens.cache_create,
+      },
+      model: model || 'unknown',
+      rateLimits,
+    };
+    _claudeUsageCache = usageResult;
+    _claudeUsageCacheAt = Date.now();
+    _claudeUsageComputing = false;
+    res.json(usageResult);
+  } catch (e) {
+    _claudeUsageComputing = false;
+    console.error('[Claude Usage] Error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/v1/gemini-usage — Gemini CLI session token usage from JSON files
+app.get('/api/v1/gemini-usage', async (req, res) => {
+  try {
+    const homeDir = process.env.USERPROFILE || homedir();
+    const geminiTmpDir = join(homeDir, '.gemini', 'tmp', 'desktop', 'chats');
+    if (!existsSync(geminiTmpDir)) {
+      return res.json({ session: { input: 0, output: 0, total: 0, messages: 0 }, today: { input: 0, output: 0, total: 0, messages: 0 }, model: 'gemini' });
+    }
+
+    const files = readdirSync(geminiTmpDir).filter(f => f.endsWith('.json'));
+    const now = Date.now();
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+
+    let sessionTokens = { input: 0, output: 0, messages: 0 };
+    let todayTokens = { input: 0, output: 0, messages: 0 };
+    let latestModel = 'gemini-1.5-pro';
+
+    for (const f of files) {
+      try {
+        const filePath = join(geminiTmpDir, f);
+        const stat = statSync(filePath);
+        const data = JSON.parse(readFileSync(filePath, 'utf8'));
+        
+        if (!data.history) continue;
+
+        let fileInput = 0;
+        let fileOutput = 0;
+        let fileMsgs = 0;
+
+        for (const entry of data.history) {
+          if (entry.usage) {
+            fileInput += entry.usage.prompt_tokens || 0;
+            fileOutput += entry.usage.candidates_tokens || 0;
+            fileMsgs++;
+            if (entry.model) latestModel = entry.model;
+          }
+        }
+
+        // Current session (recently modified)
+        if (now - stat.mtimeMs < 60 * 60 * 1000) { // last 1 hour
+          sessionTokens.input += fileInput;
+          sessionTokens.output += fileOutput;
+          sessionTokens.messages += fileMsgs;
+        }
+
+        if (stat.mtimeMs >= todayStart.getTime()) {
+          todayTokens.input += fileInput;
+          todayTokens.output += fileOutput;
+          todayTokens.messages += fileMsgs;
+        }
+      } catch (err) {}
+    }
+
+    res.json({
+      session: {
+        input: sessionTokens.input,
+        output: sessionTokens.output,
+        total: sessionTokens.input + sessionTokens.output,
+        messages: sessionTokens.messages,
+      },
+      today: {
+        input: todayTokens.input,
+        output: todayTokens.output,
+        total: todayTokens.input + todayTokens.output,
+        messages: todayTokens.messages,
+      },
+      model: latestModel,
+      rateLimits: null,
+    });
+  } catch (e) {
+    console.error('[Gemini Usage] Error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/v1/usage/llm-routing — per-caller LLM routing snapshot.
+//
+// Answers: who's calling the LLM, which model is each caller configured to use,
+// where does each call actually go (cloud / local), and how much budget is each
+// caller burning on the cloud tier (Cerebras free quota).
+//
+// The dashboard's UsagePanel renders this in an "LLM Routing" section so the
+// user can see — at a glance — what's pinned to Cerebras vs running locally
+// on minipc, and decide whether to repoint things if quota gets tight.
+//
+// Routing config sources, in priority order:
+//   1. job_models[caller]   — per-caller override (highest priority)
+//   2. ai_model             — default model when caller not in job_models
+//   3. ai_fallback_chain_*  — chain used by askAIWithFallback (router/voice)
+//
+// Window: last 7 days of ai_usage. Returns null if the table is empty.
+app.get('/api/v1/usage/llm-routing', (req, res) => {
+  try {
+    const cutoff7d = new Date(Date.now() - 7 * 86400000).toISOString().replace('T', ' ').slice(0, 19);
+
+    // Classify a model id as cloud or local based on its prefix / known
+    // vision-model names. Keep the rules here in one place so the dashboard
+    // doesn't have to duplicate them.
+    const classify = (model) => {
+      if (!model) return 'unknown';
+      if (model.startsWith('cerebras:')) return 'cloud';
+      if (model.startsWith('groq:') || model.startsWith('gemini:') || model.startsWith('openai:')) return 'cloud';
+      if (model.startsWith('sdk:') || model.startsWith('claude-') || model.startsWith('anthropic:')) return 'cloud';
+      if (model.startsWith('ollama:')) return 'local';
+      // Bare vision-model names (legacy logging from screen-watcher /
+      // dashboard-vision-verifier — they call analyzeImage directly without
+      // an ollama: prefix, so the model column has just "minicpm-v" etc.)
+      if (/^(minicpm-v|moondream|qwen2\.5vl|llava-phi3|qwen3:\d|qwen3-embedding)/.test(model)) return 'local';
+      return 'unknown';
+    };
+
+    // Provider label for the UI (so we can show "Cerebras" / "Ollama" tags).
+    const provider = (model) => {
+      if (!model) return null;
+      if (model.startsWith('cerebras:')) return 'Cerebras';
+      if (model.startsWith('groq:'))     return 'Groq';
+      if (model.startsWith('gemini:'))   return 'Gemini';
+      if (model.startsWith('openai:'))   return 'OpenAI';
+      if (model.startsWith('sdk:') || model.startsWith('claude-') || model.startsWith('anthropic:')) return 'Anthropic (SDK)';
+      if (model.startsWith('ollama:'))   return 'Ollama (minipc)';
+      if (/^(minicpm-v|moondream|qwen2\.5vl|llava-phi3|qwen3:\d|qwen3-embedding)/.test(model)) return 'Ollama (minipc)';
+      return null;
+    };
+
+    // Per-caller × per-model breakdown from ai_usage. We do NOT compare
+    // created_at against epoch numbers — created_at is stored as TEXT
+    // ('YYYY-MM-DD HH:MM:SS'), so we use string compare against an ISO
+    // cutoff string. Fixing the bug that made my prior counts off by ~50×.
+    const rows = all(`
+      SELECT caller, model,
+             COUNT(*) AS n,
+             SUM(COALESCE(input_tokens, 0))  AS in_tok,
+             SUM(COALESCE(output_tokens, 0)) AS out_tok,
+             ROUND(AVG(latency_ms))          AS avg_ms
+      FROM ai_usage
+      WHERE created_at > :cutoff
+      GROUP BY caller, model
+      ORDER BY n DESC
+    `, { ':cutoff': cutoff7d });
+
+    // Aggregate per-caller (a single caller can hit multiple models — e.g.
+    // router falls back to claude-haiku when Cerebras 429s — so we sum
+    // both rows under one caller).
+    const byCaller = new Map();
+    for (const r of rows) {
+      if (!byCaller.has(r.caller)) {
+        byCaller.set(r.caller, {
+          caller: r.caller,
+          calls_7d: 0,
+          tokens_7d: 0,
+          cloud_calls_7d: 0,
+          local_calls_7d: 0,
+          cloud_tokens_7d: 0,
+          local_tokens_7d: 0,
+          models: [],
+          configured_model: null, // filled below from job_models / ai_model
+          where_primary: null,    // 'cloud' | 'local' (the configured destination)
+          provider_primary: null,
+        });
+      }
+      const c = byCaller.get(r.caller);
+      const where = classify(r.model);
+      const tok   = (r.in_tok || 0) + (r.out_tok || 0);
+      c.calls_7d  += r.n;
+      c.tokens_7d += tok;
+      if (where === 'cloud') { c.cloud_calls_7d += r.n; c.cloud_tokens_7d += tok; }
+      else if (where === 'local') { c.local_calls_7d += r.n; c.local_tokens_7d += tok; }
+      c.models.push({
+        model: r.model,
+        where,
+        provider: provider(r.model),
+        calls_7d: r.n,
+        tokens_7d: tok,
+        avg_latency_ms: r.avg_ms,
+      });
+    }
+
+    // Decorate with current routing intent (the model the caller would hit on
+    // the NEXT call, regardless of historical 7-day mix). Reads job_models +
+    // ai_model from settings — the same path llm.js getModelForCaller uses.
+    let jobModels = {};
+    try {
+      const jm = get(`SELECT value FROM settings WHERE key = 'job_models'`);
+      if (jm) jobModels = JSON.parse(jm.value);
+    } catch {}
+    let defaultModel = null;
+    try {
+      const ai = get(`SELECT value FROM settings WHERE key = 'ai_model'`);
+      if (ai) defaultModel = ai.value.replace(/^"|"$/g, '');
+    } catch {}
+
+    for (const c of byCaller.values()) {
+      c.configured_model = jobModels[c.caller] || defaultModel;
+      c.where_primary    = classify(c.configured_model);
+      c.provider_primary = provider(c.configured_model);
+    }
+
+    // Cloud totals (the only thing that burns Cerebras quota). Local calls
+    // are 100% free and don't count toward the daily caps shown on
+    // cloud.cerebras.ai/platform/.../limits.
+    let cloud_calls = 0, cloud_tokens_in = 0, cloud_tokens_out = 0;
+    let local_calls = 0;
+    for (const r of rows) {
+      const where = classify(r.model);
+      if (where === 'cloud') {
+        cloud_calls += r.n;
+        cloud_tokens_in  += (r.in_tok  || 0);
+        cloud_tokens_out += (r.out_tok || 0);
+      } else if (where === 'local') {
+        local_calls += r.n;
+      }
+    }
+
+    // Cerebras personal tier — the binding caps the user is actually subject
+    // to. Hard-coded from cloud.cerebras.ai (no API exposes them). These are
+    // the caps we measure usage against in the dashboard.
+    const cerebrasPersonalTier = {
+      rpm_cap:     5,
+      rph_cap:     150,
+      rpd_cap:     2400,
+      tpm_cap:     30_000,
+      tph_cap:     1_000_000,
+      tpd_cap:     1_000_000,
+    };
+
+    const callers = Array.from(byCaller.values()).sort((a, b) => b.tokens_7d - a.tokens_7d);
+
+    res.json({
+      window: '7d',
+      cutoff_at: cutoff7d,
+      generated_at: new Date().toISOString(),
+      defaults: {
+        ai_model_default: defaultModel,
+        job_models_count: Object.keys(jobModels).length,
+      },
+      totals: {
+        cloud_calls_7d:      cloud_calls,
+        cloud_tokens_in_7d:  cloud_tokens_in,
+        cloud_tokens_out_7d: cloud_tokens_out,
+        cloud_tokens_7d:     cloud_tokens_in + cloud_tokens_out,
+        cloud_calls_per_day: Math.round(cloud_calls / 7),
+        cloud_tokens_per_day: Math.round((cloud_tokens_in + cloud_tokens_out) / 7),
+        local_calls_7d:      local_calls,
+        local_calls_per_day: Math.round(local_calls / 7),
+      },
+      cerebras_personal_tier: cerebrasPersonalTier,
+      headroom: {
+        // Headroom multipliers vs personal-tier caps. >1 means you're under
+        // the cap; <1 means you'd be rate-limited if traffic stayed flat.
+        rpd_headroom: cloud_calls > 0 ? +(cerebrasPersonalTier.rpd_cap * 7 / cloud_calls).toFixed(2) : null,
+        tpd_headroom: (cloud_tokens_in + cloud_tokens_out) > 0
+          ? +(cerebrasPersonalTier.tpd_cap * 7 / (cloud_tokens_in + cloud_tokens_out)).toFixed(2)
+          : null,
+      },
+      callers,
+    });
+  } catch (e) {
+    console.error('[LLM Routing] Error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/v1/settings — read all Phoenix settings (for mobile sync + dashboard)
+// ── Claude Control endpoints ───────────────────────────────────────────────
+// Dedicated always-on Claude PTY for computer-control voice commands. See
+// src/claude-control.js for the full design. The router's send-to-claude
+// skill POSTs to /send and optionally waits for output via /output.
+
+app.post('/api/v1/claude-control/send', async (req, res) => {
+  try {
+    const { text, wait_for_output_ms = 4000 } = req.body || {};
+    if (!text || typeof text !== 'string') {
+      return res.status(400).json({ ok: false, error: 'text required' });
+    }
+    const { sendCommand, waitForOutput, getStatus } = await import('./claude-control.js');
+    const beforeTs = Date.now();
+    const r = sendCommand(text);
+    if (!r.ok) {
+      // 503 so the skill knows to tell the user "claude terminal not running"
+      return res.status(503).json(r);
+    }
+    let new_output = null;
+    if (wait_for_output_ms > 0) {
+      new_output = await waitForOutput(beforeTs, Math.min(wait_for_output_ms, 30000));
+    }
+    res.json({ ok: true, sent: text, new_output, status: getStatus() });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.get('/api/v1/claude-control/output', async (req, res) => {
+  try {
+    const { getRecentOutput, getStatus } = await import('./claude-control.js');
+    const maxBytes = Math.min(parseInt(req.query.bytes) || 4096, 16384);
+    res.json({ ok: true, output: getRecentOutput(maxBytes), status: getStatus() });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.get('/api/v1/claude-control/status', async (req, res) => {
+  try {
+    const { getStatus } = await import('./claude-control.js');
+    res.json({ ok: true, ...getStatus() });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/api/v1/claude-control/restart', async (req, res) => {
+  try {
+    const { stopClaudeControl, startClaudeControl, getStatus } = await import('./claude-control.js');
+    stopClaudeControl();
+    setTimeout(() => { try { startClaudeControl(); } catch {} }, 500);
+    res.json({ ok: true, message: 'restart initiated', status_pre: getStatus() });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.get('/api/v1/settings', (req, res) => {
+  try {
+    const rows = all("SELECT key, value FROM settings");
+    const settings = {};
+    for (const r of rows) {
+      try { settings[r.key] = JSON.parse(r.value); } catch { settings[r.key] = r.value; }
+    }
+    // Credentials NEVER go over the wire. This endpoint used to return the raw
+    // settings table, which meant provider API keys and OAuth client secrets
+    // were served to anyone who could reach it — and with public_tunnel on by
+    // default, "anyone" included the open internet (verified 2026-08-07).
+    // redactSettings() omits them entirely rather than masking: PUT is a
+    // partial merge and the dashboard saves one key at a time, so nothing
+    // round-trips a mask back over a real value. `_secrets` reports which names
+    // are configured, and whether from env or db, without the value.
+    res.json(redactSettings(settings));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PUT /api/v1/settings — update settings (partial merge — only keys sent are updated)
+app.put('/api/v1/settings', (req, res) => {
+  try {
+    const updates = req.body;
+    const keys = Object.keys(updates);
+    for (const [key, value] of Object.entries(updates)) {
+      const valStr = typeof value === 'string' ? value : JSON.stringify(value);
+      run("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (:key, :val, datetime('now','localtime'))", {
+        ':key': key, ':val': valStr
+      });
+    }
+    console.log(`[Phoenix Settings] Updated: ${keys.join(', ')} (from ${req.headers['x-device-name'] || req.ip})`);
+    // Audit log for settings changes (security-sensitive)
+    try {
+      const auditReq = { user: { id: req.user?.id || 1 }, org_id: req.org_id || 'org_personal' };
+      auditLog(auditReq, 'settings.update', keys.join(','), { keys, source: req.headers['x-device-name'] || req.ip });
+    } catch {}
+    // Return the saved values so clients can confirm the write succeeded
+    const saved = {};
+    for (const key of keys) {
+      const row = get("SELECT value FROM settings WHERE key = :k", { ':k': key });
+      if (row) { try { saved[key] = JSON.parse(row.value); } catch { saved[key] = row.value; } }
+    }
+    res.json({ ok: true, saved });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ==================== TTS / Voice Profiles ====================
+// Lazy-load TTS module (heavy imports, only load when needed)
+let ttsModule = null;
+async function getTTS() {
+  if (!ttsModule) ttsModule = await import('./tts.js');
+  return ttsModule;
+}
+
+// List voice profiles
+app.get('/api/v1/voice/profiles', async (req, res) => {
+  try {
+    const tts = await getTTS();
+    res.json({ profiles: tts.listVoiceProfiles() });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Upload reference audio for a voice profile
+app.post('/api/v1/voice/profile/:name', async (req, res) => {
+  try {
+    const tts = await getTTS();
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', () => {
+      const buf = Buffer.concat(chunks);
+      if (buf.length < 1000) return res.status(400).json({ error: 'Audio too short (need 10-15 seconds)' });
+      tts.saveReference(req.params.name, buf);
+      res.json({ ok: true, voice: req.params.name, bytes: buf.length });
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Synthesize speech (returns WAV audio)
+app.post('/api/v1/voice/speak', async (req, res) => {
+  try {
+    const tts = await getTTS();
+    const { text, voice } = req.body;
+    if (!text) return res.status(400).json({ error: 'text required' });
+    if (!voice) return res.status(400).json({ error: 'voice required' });
+
+    const result = await tts.synthesize(text, voice);
+    res.set('Content-Type', 'audio/wav');
+    res.set('X-TTS-Cached', result.cached ? '1' : '0');
+    tts.streamWav(result.path).pipe(res);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── #496: Cross-device TTS routing ───────────────────────────────────────────
+// POST /api/v1/speak  { text, target?, voice?, rate?, fallback? }
+//   Picks the best speaker device (presence → activity → voice source →
+//   recent heartbeat → phone push) and dispatches tts_speak. Falls back
+//   through the chain on delivery failure.
+//
+// GET  /api/v1/speak/preview?target=<device>
+//   Debug: returns which device WOULD be picked + why, without speaking.
+app.post('/api/v1/speak', async (req, res) => {
+  try {
+    const { speakSomewhere } = await import('./speak-router.js');
+    const { text, target, voice, rate, fallback } = req.body || {};
+    if (!text) return res.status(400).json({ error: 'text required' });
+    const result = await speakSomewhere({ text, target, voice, rate, fallback });
+    if (!result.ok) return res.status(503).json(result);
+    res.json(result);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/v1/speak/preview', async (req, res) => {
+  try {
+    const { pickSpeakerDevice } = await import('./speak-router.js');
+    const choice = pickSpeakerDevice({ target: req.query.target || undefined });
+    res.json(choice);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Cross-device MIC routing (symmetric to /api/v1/speak) ────────────────────
+// POST /api/v1/listen  { duration_ms?, target?, transcribe?, sample_rate?, fallback? }
+//   Picks the best mic device (same 5-rung chain as speak-router) and
+//   dispatches `audio_capture`. Push-to-talk: records `duration_ms` then
+//   returns base64 WAV + (optional) whisper transcript.
+//
+// GET  /api/v1/listen/preview?target=<device>
+//   Debug: returns which device WOULD be picked + why, without recording.
+app.post('/api/v1/listen', async (req, res) => {
+  try {
+    const { listenSomewhere } = await import('./mic-router.js');
+    const { duration_ms, target, transcribe, sample_rate, fallback } = req.body || {};
+    const result = await listenSomewhere({ duration_ms, target, transcribe, sample_rate, fallback });
+    if (!result.ok) return res.status(503).json(result);
+    res.json(result);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/v1/listen/preview', async (req, res) => {
+  try {
+    const { pickMicDevice } = await import('./mic-router.js');
+    const choice = pickMicDevice({ target: req.query.target || undefined });
+    res.json(choice);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Pre-generate common phrases for a voice (background task)
+app.post('/api/v1/voice/pregenerate/:name', async (req, res) => {
+  try {
+    const tts = await getTTS();
+    if (!tts.hasVoiceProfile(req.params.name)) {
+      return res.status(404).json({ error: `Voice "${req.params.name}" has no reference audio` });
+    }
+    res.json({ ok: true, message: `Pre-generating phrases for "${req.params.name}"...` });
+    // Run in background — don't block the response
+    tts.pregenerate(req.params.name, (progress) => {
+      console.log(`[TTS] ${req.params.name}: ${progress.done}/${progress.total} phrases (${progress.errors} errors)`);
+    }).then(r => {
+      console.log(`[TTS] Pre-generation complete for "${req.params.name}": ${r.done}/${r.total} (${r.errors} errors)`);
+    }).catch(e => {
+      console.error(`[TTS] Pre-generation failed for "${req.params.name}": ${e.message}`);
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Download voice pack (reference + cached phrases as ZIP)
+app.get('/api/v1/voice/pack/:name', async (req, res) => {
+  try {
+    const tts = await getTTS();
+    if (!tts.hasVoiceProfile(req.params.name)) {
+      return res.status(404).json({ error: `Voice "${req.params.name}" not found` });
+    }
+    // For now just return profile info — ZIP packaging is a TODO
+    const profiles = tts.listVoiceProfiles();
+    const profile = profiles.find(p => p.name === req.params.name.toLowerCase().replace(/[^a-z0-9_-]/g, '_'));
+    res.json({ profile: profile || null, downloadUrl: 'TODO: ZIP packaging' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Dashboard (web UI + API) — privacy middleware noises stats/counts on GET responses
+app.use('/dashboard', privacyMiddleware({ caller: 'dashboard' }), dashboardRouter);
+// Benchmark dashboard API — no privacy middleware needed (benchmark data only)
+if (featureEnabled('routes_benchmark')) app.use('/dashboard/api', benchmarkDashRouter);
+
+// Redirect /dashboard/ to /v2/ (Svelte dashboard)
+app.get('/dashboard', (req, res) => res.redirect('/v2/'));
+app.get('/dashboard/', (req, res) => res.redirect('/v2/'));
+
+// Shortcut redirects for full-screen apps
+app.get('/kronos', (req, res) => res.redirect('/v2/kronos'));
+app.get('/atlas', (req, res) => res.redirect('/v2/atlas'));
+
+// Svelte v2 dashboard — static files
+// Immutable chunks (_app/immutable/**) have content-hashed filenames — cache forever.
+// index.html and version.json must never be cached (they change on rebuild).
+// Browser dashboard UI (SvelteKit) — gated: OFF in the `wearable` profile.
+// No browser dashboard; use Claude Code + the Phoenix MCP server instead.
+if (featureEnabled('dashboard_ui')) {
+app.use('/v2', express.static(join(__dirname, '..', 'public', 'v2'), {
+  etag: true,
+  lastModified: true,
+  index: 'index.html',
+  setHeaders: (res, filePath) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET');
+    if (filePath.includes('/_app/immutable/')) {
+      // Content-hashed — safe to cache for 1 year
+      res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    } else {
+      // index.html, version.json, etc. — always revalidate
+      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    }
+  }
+}));
+// SPA fallback — any /v2/* that isn't a file gets index.html
+app.get('/v2/*path', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.sendFile(join(__dirname, '..', 'public', 'v2', 'index.html'));
+});
+} else {
+  // Dashboard UI off (e.g. wearable profile): 404 the entire /v2 tree so the
+  // root static catch-all further down doesn't half-serve the SvelteKit shell.
+  app.use('/v2', (req, res) => res.status(404).type('text')
+    .send('Phoenix dashboard is off in this profile — use Claude Code + the Phoenix MCP server (/mcp/phoenix).'));
+} // end dashboard_ui gate
+
+// Setup wizard — first-run page, no auth required, no caching
+app.use('/setup', express.static(join(__dirname, '..', 'public', 'setup'), {
+  etag: false,
+  setHeaders: (res) => {
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  }
+}));
+
+// Docs / reports — served in Phoenix window, accessible from any device
+app.use('/docs', express.static(join(__dirname, '..', 'public', 'docs'), {
+  etag: false,
+  setHeaders: (res) => {
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  }
+}));
+
+// Mobile dashboard — static files, no ES modules, no caching
+app.use('/mobile', express.static(join(__dirname, '..', 'public', 'mobile'), {
+  etag: false,
+  setHeaders: (res) => {
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  }
+}));
+
+// Phoenix status & privacy console (SHIP-PLAN Phase 4) — the single page that
+// replaces the widget zoo for `core`: memory stats, capture toggles, services
+// health, and the MCP connector. Standalone, no build step, every profile.
+// Served at both /status (canonical) and /privacy (the consent entry point).
+app.get(['/status', '/privacy'], (req, res) => {
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.sendFile(join(__dirname, '..', 'public', 'status.html'));
+});
+
+// APK download — serves the latest debug build so the phone can sideload over Tailscale
+app.get('/apk/latest', (req, res) => {
+  const apkPath = join(__dirname, '..', '..', 'android', 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk');
+  res.setHeader('Content-Type', 'application/vnd.android.package-archive');
+  res.setHeader('Content-Disposition', 'attachment; filename="phoenix-debug.apk"');
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.sendFile(apkPath, (err) => {
+    if (err && !res.headersSent) {
+      res.status(404).send('APK not built. Run: cd android && ./gradlew.bat assembleDebug');
+    }
+  });
+});
+
+// APK version metadata — Android self-update flow polls this and compares
+// `versionCode` against `BuildConfig.VERSION_CODE`. If the server has a newer
+// build, the app downloads /apk/latest, verifies sha256, and triggers the
+// system installer. Reads versionCode/versionName/applicationId from the
+// gradle-produced output-metadata.json so we never lie about what the APK is.
+let _apkMetaCache = null;
+app.get('/api/v1/apk/version', (req, res) => {
+  try {
+    const apkPath = join(__dirname, '..', '..', 'android', 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk');
+    const metaPath = join(__dirname, '..', '..', 'android', 'app', 'build', 'outputs', 'apk', 'debug', 'output-metadata.json');
+
+    if (!existsSync(apkPath) || !existsSync(metaPath)) {
+      return res.status(404).json({ error: 'APK not built. Run: cd android && ./gradlew.bat assembleDebug' });
+    }
+
+    const stat = statSync(apkPath);
+    const mtimeMs = stat.mtimeMs;
+    const size = stat.size;
+
+    const meta = JSON.parse(readFileSync(metaPath, 'utf8'));
+    const elem = (meta.elements || [])[0] || {};
+    const versionCode = elem.versionCode;
+    const versionName = elem.versionName;
+    const applicationId = meta.applicationId;
+
+    // Cache sha256 by mtime+size — APK is ~200MB, no point rehashing on every poll
+    let sha256 = (_apkMetaCache && _apkMetaCache.mtimeMs === mtimeMs && _apkMetaCache.size === size)
+      ? _apkMetaCache.sha256
+      : null;
+    if (!sha256) {
+      sha256 = createHash('sha256').update(readFileSync(apkPath)).digest('hex');
+      _apkMetaCache = { mtimeMs, size, sha256 };
+    }
+
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.json({
+      applicationId,
+      versionCode,
+      versionName,
+      apkUrl: '/apk/latest',
+      apkSize: size,
+      sha256,
+      buildTime: new Date(mtimeMs).toISOString()
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Legacy inline mobile route (removed — now static)
+app.get('/mobile-old/', (req, res) => { res.redirect('/mobile/'); });
+/*
+  res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>Phoenix Mobile</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#0a0a0f; color:#cdd6f4; font-family:-apple-system,system-ui,sans-serif; font-size:14px; }
+  .tabs { display:flex; border-bottom:1px solid #313244; overflow-x:auto; position:sticky; top:0; background:#0a0a0f; z-index:10; }
+  .tab { padding:10px 14px; color:#6c7086; cursor:pointer; white-space:nowrap; border-bottom:2px solid transparent; font-size:13px; }
+  .tab.active { color:#89b4fa; border-bottom-color:#89b4fa; }
+  .page { display:none; padding:12px; }
+  .page.active { display:flex; flex-direction:column; gap:8px; }
+  select { width:100%; background:#1e1e2e; color:#cdd6f4; border:1px solid #313244; border-radius:8px; padding:10px 12px; font-size:14px; margin-bottom:8px; }
+  .chat-area { flex:1; display:flex; flex-direction:column; min-height:60vh; }
+  .messages { flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:6px; padding:8px 0; }
+  .msg-user { background:#89b4fa; color:#000; border-radius:14px 14px 4px 14px; padding:8px 12px; align-self:flex-end; max-width:80%; }
+  .msg-phoenix { background:#1e1e2e; border-radius:14px 14px 14px 4px; padding:8px 12px; align-self:flex-start; max-width:80%; }
+  .input-bar { display:flex; gap:8px; padding:8px 0; position:sticky; bottom:0; background:#0a0a0f; }
+  .input-bar input { flex:1; background:#1e1e2e; color:#cdd6f4; border:1px solid #313244; border-radius:8px; padding:10px 12px; font-size:14px; outline:none; }
+  .input-bar button { background:#89b4fa; color:#000; border:none; border-radius:8px; padding:10px 16px; font-weight:600; }
+  .card { background:#1e1e2e; border:1px solid #313244; border-radius:8px; padding:12px; }
+  .stat { font-size:20px; font-weight:600; color:#89b4fa; }
+  .label { font-size:11px; color:#6c7086; text-transform:uppercase; letter-spacing:0.5px; }
+  .sensor-row { display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px solid #181825; }
+  h3 { font-size:15px; color:#cdd6f4; margin-bottom:8px; }
+  .muted { color:#6c7086; text-align:center; padding:20px; }
+</style>
+</head>
+<body>
+<div class="tabs">
+  <div class="tab active" onclick="switchTab('chat')">Chat</div>
+  <div class="tab" onclick="switchTab('terminal')">Terminal</div>
+  <div class="tab" onclick="switchTab('projects')">Projects</div>
+  <div class="tab" onclick="switchTab('sensors')">Sensors</div>
+  <div class="tab" onclick="switchTab('data')">Data</div>
+  <div class="tab" onclick="switchTab('settings')">Settings</div>
+</div>
+
+<div id="chat" class="page active">
+  <select id="project-select" onchange="loadChat()">
+    <option value="">Select project...</option>
+  </select>
+  <div class="chat-area">
+    <div class="messages" id="chat-messages"><div class="muted">Select a project</div></div>
+    <div class="input-bar">
+      <input id="chat-input" placeholder="Message Phoenix..." onkeydown="if(event.key==='Enter')sendMsg()">
+      <button onclick="sendMsg()">Send</button>
+    </div>
+  </div>
+</div>
+
+<div id="terminal" class="page">
+  <select id="term-project-select" onchange="loadTerminal()">
+    <option value="">Select project...</option>
+  </select>
+  <div class="card"><div class="muted">Terminal view — select a project</div></div>
+</div>
+
+<div id="projects" class="page">
+  <div id="projects-list"><div class="muted">Loading...</div></div>
+</div>
+
+<div id="sensors" class="page">
+  <div id="sensors-list"><div class="muted">Loading...</div></div>
+</div>
+
+<div id="data" class="page">
+  <div id="stats-cards" style="display:grid;grid-template-columns:1fr 1fr;gap:8px"></div>
+  <div id="recent-events" style="margin-top:12px"><div class="muted">Loading...</div></div>
+</div>
+
+<div id="settings" class="page">
+  <div class="card"><div class="muted">Settings available on desktop dashboard</div></div>
+</div>
+
+<script>
+const API = window.location.origin;
+let projects = [];
+
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelector('.tab[onclick*="'+name+'"]').classList.add('active');
+  document.getElementById(name).classList.add('active');
+  if (name === 'projects') loadProjects();
+  if (name === 'sensors') loadSensors();
+  if (name === 'data') loadData();
+}
+
+async function loadProjectSelects() {
+  try {
+    const res = await fetch(API + '/dashboard/api/projects');
+    projects = await res.json();
+    ['project-select','term-project-select'].forEach(id => {
+      const sel = document.getElementById(id);
+      if (!sel) return;
+      sel.innerHTML = '<option value="">Select project...</option>';
+      projects.forEach(p => {
+        const opt = document.createElement('option');
+        opt.value = p.path;
+        opt.textContent = p.name;
+        sel.appendChild(opt);
+      });
+      // Auto-select Phoenix
+      const phx = projects.find(p => p.name === 'Phoenix');
+      if (phx) { sel.value = phx.path; }
+    });
+    loadChat();
+  } catch(e) { console.error('Projects:', e); }
+}
+
+async function loadChat() {
+  const msgs = document.getElementById('chat-messages');
+  try {
+    const res = await fetch(API + '/dashboard/api/events?limit=30&event_type=RouterCommand');
+    const data = await res.json();
+    const events = (data.events || []).reverse();
+    if (!events.length) { msgs.innerHTML = '<div class="muted">No conversations yet</div>'; return; }
+    msgs.innerHTML = '';
+    events.forEach(e => {
+      try {
+        const d = JSON.parse(e.data);
+        const text = d.text || d.query || '';
+        const resp = d.result || d.response || '';
+        if (text) { const div = document.createElement('div'); div.className='msg-user'; div.textContent=text; msgs.appendChild(div); }
+        if (resp && resp !== '[AMBIENT]') { const div = document.createElement('div'); div.className='msg-phoenix'; div.textContent=resp; msgs.appendChild(div); }
+      } catch {}
+    });
+    msgs.scrollTop = msgs.scrollHeight;
+  } catch(e) { msgs.innerHTML = '<div class="muted">Error: '+e.message+'</div>'; }
+}
+
+async function sendMsg() {
+  const input = document.getElementById('chat-input');
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+  const msgs = document.getElementById('chat-messages');
+  const div = document.createElement('div'); div.className='msg-user'; div.textContent=text; msgs.appendChild(div);
+  const typing = document.createElement('div'); typing.className='msg-phoenix'; typing.textContent='...'; msgs.appendChild(typing);
+  msgs.scrollTop = msgs.scrollHeight;
+  try {
+    const res = await fetch(API + '/api/v1/chat', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({message:text,source:'dashboard'}) });
+    const data = await res.json();
+    typing.textContent = data.response || data.result || 'No response';
+  } catch(e) { typing.textContent = 'Error: ' + e.message; }
+  msgs.scrollTop = msgs.scrollHeight;
+}
+
+async function loadProjects() {
+  const el = document.getElementById('projects-list');
+  try {
+    const res = await fetch(API + '/dashboard/api/projects');
+    const data = await res.json();
+    el.innerHTML = data.map(p => '<div class="card" style="margin-bottom:8px"><h3>'+p.name+'</h3><div style="font-size:12px;color:#6c7086">'+p.path+'</div><div style="font-size:12px;color:#a6adc8;margin-top:4px">'+(p.description||'')+'</div></div>').join('');
+  } catch(e) { el.innerHTML = '<div class="muted">Error: '+e.message+'</div>'; }
+}
+
+async function loadSensors() {
+  const el = document.getElementById('sensors-list');
+  try {
+    const res = await fetch(API + '/api/sensors/devices/latest');
+    const data = await res.json();
+    if (!data || !Object.keys(data).length) { el.innerHTML = '<div class="muted">No sensor data</div>'; return; }
+    el.innerHTML = Object.entries(data).map(([k,v]) => '<div class="sensor-row"><span>'+k+'</span><span style="color:#89b4fa">'+JSON.stringify(v)+'</span></div>').join('');
+  } catch(e) {
+    // Fallback to device sensors
+    try {
+      const res2 = await fetch(API + '/api/sensors/devices/9');
+      const d2 = await res2.json();
+      el.innerHTML = (d2.assignments||[]).map(s => '<div class="sensor-row"><span>'+s.sensor_key+'</span><span style="color:#89b4fa">'+(s.enabled?'ON':'OFF')+'</span></div>').join('') || '<div class="muted">No sensors configured</div>';
+    } catch { el.innerHTML = '<div class="muted">Sensors unavailable</div>'; }
+  }
+}
+
+async function loadData() {
+  try {
+    const res = await fetch(API + '/dashboard/api/stats');
+    const s = await res.json();
+    document.getElementById('stats-cards').innerHTML =
+      '<div class="card"><div class="stat">'+s.total_events+'</div><div class="label">Events</div></div>'+
+      '<div class="card"><div class="stat">'+s.total_sessions+'</div><div class="label">Sessions</div></div>'+
+      '<div class="card"><div class="stat">'+s.total_projects+'</div><div class="label">Projects</div></div>'+
+      '<div class="card"><div class="stat">'+s.total_devices+'</div><div class="label">Devices</div></div>';
+  } catch {}
+  try {
+    const res = await fetch(API + '/dashboard/api/events?limit=10');
+    const data = await res.json();
+    document.getElementById('recent-events').innerHTML = '<h3>Recent Events</h3>' +
+      (data.events||[]).map(e => '<div class="sensor-row"><span style="font-size:11px">'+e.event_type+'</span><span style="font-size:11px;color:#6c7086">'+e.created_at.slice(11,19)+'</span></div>').join('');
+  } catch {}
+}
+
+// Auto-refresh chat every 5 seconds
+setInterval(loadChat, 5000);
+
+// Init
+loadProjectSelects();
+</script>
+</body>
+</html>`);
+});
+
+*/
+
+// Old dashboard static files (fallback) — gated with the SvelteKit UI.
+if (featureEnabled('dashboard_ui'))
+app.use('/dashboard', express.static(join(__dirname, '..', 'public'), {
+  etag: false,
+  lastModified: true,
+  setHeaders: (res) => {
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  }
+}));
+
+// Permissions matrix — feature → min power level + widget visibility
+// Dashboard uses this to gate widgets and actions based on req.user.power
+app.get('/api/v1/permissions/matrix', (req, res) => {
+  const matrix = getPermissionsMatrix();
+  const power = req.user?.power ?? 100;
+  // Annotate each feature: can this user do it?
+  const features = {};
+  for (const [feature, required] of Object.entries(matrix.features)) {
+    features[feature] = { required, allowed: power >= required };
+  }
+  const widgets = {};
+  for (const [widget, required] of Object.entries(matrix.widgets)) {
+    widgets[widget] = { required, visible: power >= required };
+  }
+  res.json({
+    power,
+    realPower: req.user?.realPower ?? power,
+    isImpersonating: req.user?.isImpersonating ?? false,
+    impersonation: req.user?.impersonation ?? null,
+    features,
+    widgets
+  });
+});
+
+// Impersonation — owner-only: temporarily preview the dashboard as a different power level, user, or group.
+//
+// POST /api/v1/impersonate { type: 'power', power: 25 }          — power-level preview
+// POST /api/v1/impersonate { type: 'user', userId: 3 }           — preview as specific user
+// POST /api/v1/impersonate { type: 'group', orgId: '...', power: 25, roleName: 'Member' } — group preview
+// DELETE /api/v1/impersonate                                      — stop impersonating
+// GET /api/v1/impersonate                                         — check current state
+const IMPERSONATE_PRESETS = [
+  { label: 'Child',   power: 5  },
+  { label: 'Guest',   power: 15 },
+  { label: 'User',    power: 25 },
+  { label: 'Manager', power: 50 },
+  { label: 'Admin',   power: 75 },
+];
+
+function isOwner(req) {
+  return req.user?.role === 'owner' || (req.user?.realPower ?? req.user?.power ?? 0) >= 100;
+}
+
+app.get('/api/v1/impersonate', (req, res) => {
+  const current = getImpersonation();
+  res.json({
+    active: current !== null,
+    impersonation: current,
+    realPower: req.user?.realPower ?? 100,
+    presets: IMPERSONATE_PRESETS,
+  });
+});
+
+app.post('/api/v1/impersonate', (req, res) => {
+  if (!isOwner(req)) return res.status(403).json({ error: 'Owner only' });
+  const { type = 'power', power, userId, orgId, roleName } = req.body || {};
+
+  if (type === 'power') {
+    // Impersonate by raw power level (0–99)
+    const p = Number(power);
+    if (isNaN(p) || p < 0 || p >= 100) return res.status(400).json({ error: 'power must be 0–99' });
+    const preset = IMPERSONATE_PRESETS.find(l => l.power === p);
+    setImpersonation({ type: 'power', power: p, label: preset?.label ?? `Level ${p}` });
+    return res.json({ ok: true, impersonation: getImpersonation() });
+  }
+
+  if (type === 'user') {
+    // Impersonate a specific registered user
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const u = db.prepare(`SELECT id, display_name, display_nickname, power_lvl, role FROM users WHERE id = ?`).get(userId);
+    if (!u) return res.status(404).json({ error: 'User not found' });
+    const p = u.power_lvl ?? 0;
+    if (p >= 100) return res.status(400).json({ error: 'Cannot impersonate an owner-level user' });
+    setImpersonation({ type: 'user', power: p, label: u.display_nickname || u.display_name || `User #${u.id}`, userId: u.id });
+    return res.json({ ok: true, impersonation: getImpersonation() });
+  }
+
+  if (type === 'group') {
+    // Impersonate as a member of an org at a given role level
+    if (!orgId) return res.status(400).json({ error: 'orgId required' });
+    const org = db.prepare(`SELECT id, name FROM orgs WHERE id = ?`).get(orgId);
+    if (!org) return res.status(404).json({ error: 'Org not found' });
+    const p = Number(power);
+    if (isNaN(p) || p < 0 || p >= 100) return res.status(400).json({ error: 'power must be 0–99' });
+    setImpersonation({ type: 'group', power: p, label: `${org.name} → ${roleName ?? `Level ${p}`}`, orgId, orgName: org.name, roleName: roleName ?? `Level ${p}` });
+    return res.json({ ok: true, impersonation: getImpersonation() });
+  }
+
+  return res.status(400).json({ error: 'type must be power | user | group' });
+});
+
+app.delete('/api/v1/impersonate', (req, res) => {
+  if (!isOwner(req)) return res.status(403).json({ error: 'Owner only' });
+  clearImpersonation();
+  res.json({ ok: true });
+});
+
+// Users list — for impersonation user picker (owner-only)
+app.get('/api/v1/users', (req, res) => {
+  if (!isOwner(req)) return res.status(403).json({ error: 'Owner only' });
+  try {
+    const users = db.prepare(`SELECT id, display_name, display_nickname, email, role, power_lvl, is_active FROM users ORDER BY power_lvl DESC, display_name ASC`).all();
+    res.json({ users });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Roles list — for group/role picker in impersonation
+app.get('/api/v1/roles', (req, res) => {
+  if (!isOwner(req)) return res.status(403).json({ error: 'Owner only' });
+  try {
+    const roles = db.prepare(`SELECT id, name, level FROM roles ORDER BY level ASC`).all();
+    res.json({ roles: roles.length ? roles : IMPERSONATE_PRESETS.map((p, i) => ({ id: i+1, name: p.label, level: p.power })) });
+  } catch {
+    res.json({ roles: IMPERSONATE_PRESETS.map((p, i) => ({ id: i+1, name: p.label, level: p.power })) });
+  }
+});
+
+// Auth check — returns current user (used by SvelteKit dashboard layout)
+app.get('/auth/me', (req, res) => {
+  const ip = req.ip || req.connection?.remoteAddress || 'unknown';
+  const isLocalhost = ip === '127.0.0.1' || ip === '::1' || ip.endsWith('127.0.0.1') || ip === '::ffff:127.0.0.1';
+  const isTailscale = ip.startsWith('100.') || ip.startsWith('::ffff:100.');
+  if (isLocalhost || isTailscale) {
+    res.json({ authenticated: true, user: { id: 1, email: 'owner@localhost', display_name: 'Owner', role: 'owner' } });
+  } else if (req.user) {
+    res.json({ authenticated: true, user: req.user });
+  } else {
+    res.json({ authenticated: false });
+  }
+});
+
+// GitHub OAuth callback — redirect to dashboard with code param so JS handles it
+app.get('/auth/github/callback', (req, res) => {
+  res.redirect(`/dashboard/?code=${req.query.code}`);
+});
+
+// Google OAuth callback — send code back to opener window, then close popup
+app.get('/auth/google/callback', (req, res) => {
+  const code = req.query.code || '';
+  const error = req.query.error || '';
+  res.send(`<!DOCTYPE html><html><head><style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #0d1117; color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+    .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 40px; text-align: center; max-width: 400px; }
+    h2 { margin-bottom: 12px; font-size: 20px; }
+    p { color: #8b949e; margin-bottom: 24px; font-size: 14px; }
+    .btn { display: inline-block; padding: 10px 24px; background: #58a6ff; color: #0d1117; border-radius: 6px; text-decoration: none; font-weight: 600; font-size: 14px; }
+    .btn:hover { background: #79b8ff; }
+  </style></head><body>
+  <div class="card">
+    <h2>${error ? 'Sign-in Failed' : 'Completing sign-in...'}</h2>
+    <p>${error ? 'Google returned an error. This may be a temporary issue — try again in a few minutes.' : 'You should be redirected automatically.'}</p>
+    <a class="btn" href="/dashboard/">Back to Dashboard</a>
+  </div>
+  <script>
+    if ('${code}' && window.opener) {
+      window.opener.postMessage({ type: 'google-oauth', code: '${code}', error: '${error}' }, window.location.origin);
+      window.close();
+    } else if ('${code}' && !window.opener) {
+      window.location.href = '/dashboard/?google_code=${code}';
+    }
+  </script></body></html>`);
+});
+
+// Serve captured photos (stored in src/data/photos by api.js)
+app.use('/photos', express.static(join(__dirname, 'data', 'photos')));
+
+// Serve clipboard images (pasted screenshots from dashboard)
+app.use('/clipboard', express.static(join(process.env.TEMP || '%USERPROFILE%\\AppData\\Local\\Temp', 'phoenix-clipboard')));
+
+// Serve root-level static assets (icons, images referenced by the dashboard)
+app.use(express.static(join(__dirname, '..', 'public'), { etag: false }));
+
+// Dev instance — detect running dev server (dev-server.js on 7781 or Vite on 5173+)
+app.post('/api/v1/dev/start', async (req, res) => {
+  const DEV_PORT = 7781;
+  // Check if already running
+  for (const port of [DEV_PORT, 5173, 5174, 5175, 5180, 5181, 5190]) {
+    try {
+      const r = await fetch(`http://localhost:${port}/health`, { signal: AbortSignal.timeout(500) });
+      if (r.ok) return res.json({ ok: true, port, running: true });
+    } catch {}
+    if (port !== DEV_PORT) {
+      try {
+        const r = await fetch(`http://localhost:${port}/v2/`, { signal: AbortSignal.timeout(500) });
+        if (r.ok) return res.json({ ok: true, port, running: true });
+      } catch {}
+    }
+  }
+  // Not running — launch it
+  try {
+    const { spawn } = await import('child_process');
+    const { dirname, join } = await import('path');
+    const { fileURLToPath } = await import('url');
+    const serviceDir = join(dirname(fileURLToPath(import.meta.url)), '..');
+    const devServerPath = join(serviceDir, 'dev-server.js');
+    const child = spawn('node', [devServerPath], {
+      cwd: serviceDir,
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+      env: { ...process.env, PHOENIX_CRAFT: '0' }, // strip Craft flag — dev runs as standalone, not a Craft
+    });
+    child.unref();
+    // Wait for it to come up (poll for up to 10 seconds)
+    for (let i = 0; i < 20; i++) {
+      await new Promise(r => setTimeout(r, 500));
+      try {
+        const r = await fetch(`http://localhost:${DEV_PORT}/health`, { signal: AbortSignal.timeout(500) });
+        if (r.ok) return res.json({ ok: true, port: DEV_PORT, running: true, started: true });
+      } catch {}
+    }
+    res.json({ ok: false, error: 'Dev server launched but not responding yet — try again in a few seconds' });
+  } catch (err) {
+    res.json({ ok: false, error: 'Failed to start dev server: ' + err.message });
+  }
+});
+
+// Dev restart — kill existing dev server and start fresh
+app.post('/api/v1/dev/restart', async (req, res) => {
+  const DEV_PORT = 7781;
+  const { spawn } = await import('child_process');
+  const { killProcessOnPort } = await import('./platform.js');
+
+  // Kill existing dev server
+  const killed = await killProcessOnPort(DEV_PORT);
+  if (killed.size > 0) await new Promise(r => setTimeout(r, 2000));
+
+  // Start new dev server
+  try {
+    const serviceDir = join(dirname(fileURLToPath(import.meta.url)), '..');
+    const child = spawn('node', [join(serviceDir, 'dev-server.js')], {
+      cwd: serviceDir, detached: true, stdio: 'ignore', windowsHide: true, env: { ...process.env },
+    });
+    child.unref();
+
+    for (let i = 0; i < 20; i++) {
+      await new Promise(r => setTimeout(r, 500));
+      try {
+        const r = await fetch(`http://localhost:${DEV_PORT}/health`, { signal: AbortSignal.timeout(500) });
+        if (r.ok) return res.json({ ok: true, port: DEV_PORT, restarted: true });
+      } catch {}
+    }
+    res.json({ ok: false, error: 'Dev server launched but not responding yet' });
+  } catch (err) {
+    res.json({ ok: false, error: 'Failed to restart dev server: ' + err.message });
+  }
+});
+
+// Dev proxy — forwards test API calls to dev server (avoids CORS issues with browser-to-dev)
+app.all('/api/v1/dev/proxy/*proxyPath', async (req, res) => {
+  const devPort = 7781;
+  const targetPath = Array.isArray(req.params.proxyPath) ? req.params.proxyPath.join('/') : req.params.proxyPath; // Express 5 returns array for wildcard params
+  const url = `http://127.0.0.1:${devPort}/${targetPath}`;
+  try {
+    const opts = { method: req.method, headers: { 'Content-Type': 'application/json' }, signal: AbortSignal.timeout(120000) };
+    if (req.method !== 'GET' && req.method !== 'HEAD' && req.body) {
+      opts.body = JSON.stringify(req.body);
+    }
+    const r = await fetch(url, opts);
+    const text = await r.text();
+    res.status(r.status).type('json').send(text);
+  } catch (err) {
+    res.status(502).json({ ok: false, error: `Dev server proxy failed: ${err.message}` });
+  }
+});
+
+// ── Tunnel API ────────────────────────────────────────────────────────────────
+// NOTE: /api/v1/client/register and /api/v1/client/status live in routes/client.js
+
+// GET  /api/v1/tunnel/status  — returns current public tunnel URL (or null)
+// POST /api/v1/tunnel/start   — (re)starts Cloudflare Quick Tunnel without a full server restart
+// Cache funnel state for 60s. The dashboard polls this endpoint as part of its
+// settings page render, and the tunnel state changes on the order of human
+// action — so caching prevents back-to-back `tailscale funnel status` spawns
+// from leaking conhost when admin tools or browser auto-refresh hit us.
+let _funnelStatusCache = null; // { active, ts }
+app.get('/api/v1/tunnel/status', async (req, res) => {
+  const cfURL = getTunnelURL();
+  let tailscaleActive;
+  if (_funnelStatusCache && Date.now() - _funnelStatusCache.ts < 60_000) {
+    tailscaleActive = _funnelStatusCache.active;
+  } else {
+    tailscaleActive = await new Promise(resolve => {
+      let done = false;
+      let proc;
+      const finish = (v) => { if (done) return; done = true; try { proc?.kill('SIGKILL'); } catch {} resolve(v); };
+      try {
+        proc = spawnChild('tailscale', ['funnel', 'status'], { windowsHide: true, shell: false });
+        proc.on('error', () => finish(false));
+        proc.on('close', (code) => finish(code === 0));
+        // Hard kill — exec's `timeout` option only sends SIGTERM, which
+        // tailscale.exe ignores during COM init, leaving the child + conhost
+        // orphaned. SIGKILL on a hard timer guarantees cleanup.
+        setTimeout(() => finish(false), 3000);
+      } catch { finish(false); }
+    });
+    _funnelStatusCache = { active: tailscaleActive, ts: Date.now() };
+  }
+  res.json({
+    ok: true,
+    cloudflare: cfURL || null,
+    tailscale_funnel: tailscaleActive,
+    active_url: cfURL || (tailscaleActive ? 'tailscale-funnel' : null),
+  });
+});
+
+app.post('/api/v1/tunnel/start', async (req, res) => {
+  const port = parseInt(process.env.PHOENIX_PUBLIC_PORT || process.env.PHOENIX_CARRIER_PORT || '7777');
+  try {
+    const url = await startCloudflareTunnel(port);
+    if (url) return res.json({ ok: true, url, via: 'cloudflare-tunnel' });
+    res.json({ ok: false, error: 'Tunnel started but no URL received — check server logs' });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Terminal API — list sessions, projects for terminal
+app.get('/api/v1/terminal/sessions', async (req, res) => {
+  res.json({ sessions: await listSessions() });
+});
+
+// Per-session adapter health — surfaces whether each Claude adapter is alive
+// and when it last responded. /health says "server running" but doesn't track
+// individual adapter sessions. This endpoint fills that gap.
+app.get('/api/v1/terminal/adapter-health', async (req, res) => {
+  const now = Date.now();
+  const sessions = await listSessions();
+  const adapters = sessions
+    .filter(s => s.pipeMode || s.mode === 'ADAPTER')
+    .map(s => {
+      const agoMs = s.lastOutputTs ? now - s.lastOutputTs : null;
+      const agoSec = agoMs != null ? Math.floor(agoMs / 1000) : null;
+      const agoStr = agoSec == null ? 'never'
+        : agoSec < 60 ? `${agoSec}s`
+        : agoSec < 3600 ? `${Math.floor(agoSec / 60)}m ${agoSec % 60}s`
+        : `${Math.floor(agoSec / 3600)}h ${Math.floor((agoSec % 3600) / 60)}m`;
+      const stale = agoSec != null && agoSec > 300 && s.state !== 'working';
+      const stuck = s.state === 'working' && agoSec != null && agoSec > 90;
+      return {
+        id: s.id,
+        project: s.project || null,
+        state: s.state,
+        lastOutputTs: s.lastOutputTs || null,
+        lastOutputAgo: agoStr,
+        clients: s.clients,
+        stale,
+        stuck,
+        healthy: !stuck && s.clients > 0,
+      };
+    });
+  res.json({ ok: true, adapters, count: adapters.length });
+});
+
+// Create a new pipe-mode session (mobile new-tab button)
+app.post('/api/v1/terminal/new', async (req, res) => {
+  try {
+    const { project, model } = req.body || {};
+    const prefix = project ? 'dash-' + project.toLowerCase().replace(/[^a-z0-9]/g, '-') : 'dash-phoenix';
+    // Find the next available session ID
+    const existing = await listSessions();
+    const ids = new Set(existing.map(s => s.id));
+    let sessionId = prefix;
+    let n = 2;
+    while (ids.has(sessionId)) { sessionId = `${prefix}-${n++}`; }
+    // Resolve cwd from project path if available
+    let cwd = null;
+    if (project) {
+      try {
+        const { all: dbAll } = await import('./db.js');
+        const rows = dbAll('SELECT path FROM projects WHERE name = ? LIMIT 1', [project]);
+        if (rows?.[0]?.path) cwd = rows[0].path;
+      } catch {}
+    }
+    await createPipeSession(sessionId, { projectName: project || 'Phoenix', cwd });
+    if (model) await pipeSetModel(sessionId, model);
+    res.json({ ok: true, session_id: sessionId });
+  } catch (err) {
+    console.error('[Phoenix] /api/v1/terminal/new error:', err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/api/v1/terminal/projects', (req, res) => {
+  res.json({ projects: getTerminalProjects() });
+});
+app.delete('/api/v1/terminal/sessions/:id', (req, res) => {
+  const killed = killSession(req.params.id);
+  res.json({ ok: killed });
+});
+
+// Process registry — all PIDs spawned by Phoenix (PTY, Claude CLI, agent-sdk)
+app.get('/api/v1/processes', async (req, res) => {
+  const processes = await getProcessRegistry();
+  const alive = processes.filter(p => p.alive);
+  const dead = processes.filter(p => !p.alive);
+  res.json({ processes, summary: { total: processes.length, alive: alive.length, dead: dead.length } });
+});
+
+// Permission prompts — mobile polls this to show Allow/Deny buttons
+app.get('/api/v1/terminal/permissions', (req, res) => {
+  res.json({ permissions: getPendingPermissions() });
+});
+app.delete('/api/v1/terminal/permissions/:id', (req, res) => {
+  clearPermission(parseInt(req.params.id));
+  res.json({ ok: true });
+});
+// Send text to active terminal (phone voice commands → terminal, or
+// the desktop dashboard's own input — same endpoint, different source).
+// Falls back to pipe mode if PTY send fails (mobile dashboard uses pipe mode now).
+app.post('/api/v1/terminal/send', requireNotChild, async (req, res) => {
+  const { text, session_id, raw, source: bodySource } = req.body;
+  if (!text) return res.status(400).json({ error: 'text required' });
+
+  // Try pipe mode first — resolves session ID prefix matches (e.g. dash-pan → dash-pan-1)
+  let resolvedSessionId = session_id || null;
+  if (resolvedSessionId) {
+    const sessions = await listSessions();
+    const exact = sessions.find(s => s.id === resolvedSessionId);
+    if (!exact) {
+      const prefix = sessions.find(s => s.id.startsWith(resolvedSessionId));
+      if (prefix) resolvedSessionId = prefix.id;
+    }
+  }
+  const piped = await pipeSend(resolvedSessionId, text);
+  if (piped) {
+    console.log(`[Phoenix Send] Routed to pipe mode: "${text.substring(0, 60)}" → ${resolvedSessionId}`);
+    return res.json({ ok: true, session: resolvedSessionId, method: 'pipe' });
+  }
+
+  // Fallback: raw PTY write (legacy)
+  const toSend = raw ? text : text + '\r';
+  // #982 — derive provenance early so we can pass it through sendToSession
+  // for pty_input event logging in terminal.js (Carrier side).
+  const _ua_send = String(req.headers['user-agent'] || '');
+  const _hdr_send = req.headers['x-phoenix-source'];
+  let _src_send = bodySource || _hdr_send;
+  if (!_src_send) {
+    if (/Electron/i.test(_ua_send)) _src_send = 'desktop_electron';
+    else if (/Android|iPhone|Mobile/i.test(_ua_send)) _src_send = 'mobile';
+    else if (/Mozilla/i.test(_ua_send)) _src_send = 'desktop_browser';
+    else _src_send = 'unknown';
+  }
+  const sent = sendToSession(session_id || null, toSend, _src_send);
+
+  // Immediate echo — broadcast user message to all WS clients for this session
+  // so it appears in the transcript instantly, without waiting for Claude Code
+  // to write it to the JSONL file (which can take seconds if Claude is busy).
+  // The transcript watcher's dedup will handle the overlap when JSONL catches up.
+  // Echo when: non-raw sends (legacy), OR raw sends that contain actual text
+  // (not just control chars like \r). The dashboard splits sends into text+\r,
+  // both with raw:true, so we need to echo the text part.
+  const echoText = (text || '').trim();
+  if (sent && echoText && !/^[\r\n\x03\x1b]/.test(echoText)) {
+    broadcastToSession(session_id || null, 'user_echo', {
+      text: echoText,
+      ts: new Date().toISOString(),
+    });
+  }
+
+  // Derive the real client source. Priority:
+  //   1) explicit body.source (caller knows best)
+  //   2) X-Phoenix-Source header
+  //   3) User-Agent sniff (Electron/Chrome on desktop vs Android/Mobile)
+  //   4) fallback to 'unknown'
+  // The old code hardcoded everything to 'mobile_dashboard' / 'MobileSend',
+  // which made the desktop terminal lie about itself in the event log.
+  const ua = String(req.headers['user-agent'] || '');
+  const headerSource = req.headers['x-phoenix-source'];
+  let source = bodySource || headerSource;
+  if (!source) {
+    if (/Electron/i.test(ua)) source = 'desktop_electron';
+    else if (/Android|iPhone|Mobile/i.test(ua)) source = 'mobile';
+    else if (/Mozilla/i.test(ua)) source = 'desktop_browser';
+    else source = 'unknown';
+  }
+  const isMobile = /mobile/i.test(source);
+  const eventType = isMobile ? 'MobileSend' : 'DesktopSend';
+  console.log(`[Phoenix Send] (${source}) "${String(text).substring(0,60)}" → ${session_id || 'auto'} (raw=${!!raw}, sent=${sent})`);
+
+  // Log as event with the REAL source so the event log shows where it came from
+  const dataStr = JSON.stringify({
+    text, session_id: session_id || 'auto', sent, raw: !!raw,
+    source, user_agent: ua.substring(0, 120), timestamp: Date.now()
+  });
+  const eventId = insert(`INSERT INTO events (session_id, event_type, data, org_id) VALUES (:sid, :type, :data, :oid)`, {
+    ':sid': session_id || (isMobile ? 'mobile-send' : 'desktop-send'), ':type': eventType, ':data': dataStr, ':oid': req.org_id || 'org_personal'
+  });
+  indexEventFTS(eventId, eventType, dataStr);
+
+  const sessInfo = await listSessions();
+  res.json({ ok: sent, session: session_id || 'auto', active_sessions: sessInfo.map(s => s.id + '(' + s.clients + ')') });
+});
+
+// Get transcript messages for a session (fallback for page load when WebSocket push hasn't arrived)
+app.get('/api/v1/terminal/messages/:session_id', async (req, res) => {
+  try {
+    const messages = await getSessionMessages(req.params.session_id);
+    res.json({ ok: true, messages: messages || [] });
+  } catch (err) {
+    res.json({ ok: false, messages: [], error: err.message });
+  }
+});
+
+// Debug: stream buffer size for regression testing (#437 stream bloat)
+app.get('/api/v1/terminal/debug/buffer/:session_id', async (req, res) => {
+  try {
+    const info = await getSessionBufferSize(req.params.session_id);
+    if (!info) return res.status(404).json({ ok: false, error: 'Session not found' });
+    res.json({ ok: true, ...info });
+  } catch (err) {
+    res.json({ ok: false, error: err.message });
+  }
+});
+
+// HTTP interrupt fallback — for when WebSocket is dead but user presses Escape
+app.post('/api/v1/terminal/interrupt', (req, res) => {
+  const sessionId = req.query.session || req.body?.session_id;
+  if (sessionId) {
+    const ok = pipeInterrupt(sessionId);
+    res.json({ ok, session: sessionId });
+  } else {
+    // No session specified — interrupt all active sessions
+    const sessions = listSessions();
+    let interrupted = 0;
+    for (const s of sessions) {
+      if (s.claudeRunning) {
+        pipeInterrupt(s.id);
+        interrupted++;
+      }
+    }
+    res.json({ ok: true, interrupted });
+  }
+});
+
+// Adapter reset — clears broken adapter state so next message creates a fresh adapter
+// and resumes from JSONL. Use when session.messages is frozen or claudeRunning is stuck.
+app.post('/api/v1/terminal/adapter-reset', async (req, res) => {
+  const session_id = req.body?.session_id || req.query.session;
+  if (!session_id) return res.status(400).json({ error: 'session_id required' });
+  const ok = await pipeResetAdapter(session_id);
+  res.json({ ok: !!ok, session: session_id });
+});
+
+// PIPE MODE: send user message to a terminal session via pipe_send.
+// Spawns claude -p as a child process, returns clean JSON responses.
+// Dedup: reject identical text to same session within 5 seconds
+const _pipeDedup = new Map(); // key: `${session_id}:${text}` → timestamp
+app.post('/api/v1/terminal/pipe', requireNotChild, async (req, res) => {
+  const { text, session_id, source: bodySource } = req.body;
+  const ip = req.ip || req.connection?.remoteAddress || 'unknown';
+  console.log(`[Phoenix Pipe] POST /pipe session_id=${session_id} text=${(text||'').slice(0,50)} ip=${ip} user=${req.user?.email || 'NONE'}`);
+  if (!text) return res.status(400).json({ error: 'text required' });
+  if (!session_id) return res.status(400).json({ error: 'session_id required' });
+
+  // #982 — log every pipe input as pty_input event with provenance.
+  // /pipe doesn't write to a raw PTY (it spawns claude -p) but it's still an
+  // input-into-an-assistant-session, so the same provenance audit applies.
+  try {
+    const _ua_pipe = String(req.headers['user-agent'] || '');
+    const _hdr_pipe = req.headers['x-phoenix-source'];
+    let _src_pipe = bodySource || _hdr_pipe;
+    if (!_src_pipe) {
+      if (/Electron/i.test(_ua_pipe)) _src_pipe = 'desktop_electron';
+      else if (/Android|iPhone|Mobile/i.test(_ua_pipe)) _src_pipe = 'mobile';
+      else if (/Mozilla/i.test(_ua_pipe)) _src_pipe = 'desktop_browser';
+      else _src_pipe = 'unknown';
+    }
+    const _data_pipe = JSON.stringify({
+      session_id, text: String(text).slice(0, 200), text_len: String(text).length,
+      source: _src_pipe, ip, ua: _ua_pipe.slice(0, 120), route: 'http:/pipe', ts: Date.now(),
+    });
+    const _eid_pipe = insert(`INSERT INTO events (session_id, event_type, data, org_id) VALUES (:sid, :type, :data, :oid)`, {
+      ':sid': session_id, ':type': 'pty_input', ':data': _data_pipe, ':oid': req.org_id || 'org_personal',
+    });
+    if (_src_pipe === 'unknown') {
+      console.warn(`[Phoenix Pipe] UNKNOWN-source pipe input → ${session_id}: ${JSON.stringify(String(text).slice(0,80))} ua=${_ua_pipe.slice(0,80)}`);
+    }
+    if (typeof indexEventFTS === 'function') indexEventFTS(_eid_pipe, 'pty_input', _data_pipe);
+  } catch (e) {
+    console.warn(`[Phoenix Pipe] pty_input log failed: ${e.message}`);
+  }
+
+  // Dedup: block identical message to same session within 5s window
+  const dedupKey = `${session_id}:${text}`;
+  const now = Date.now();
+  const lastSent = _pipeDedup.get(dedupKey);
+  if (lastSent && now - lastSent < 5000) {
+    console.log(`[Phoenix Pipe] DEDUP blocked duplicate message (${now - lastSent}ms ago)`);
+    return res.json({ ok: true, session: session_id, deduped: true });
+  }
+  _pipeDedup.set(dedupKey, now);
+  // Cleanup old entries every 100 sends
+  if (_pipeDedup.size > 100) {
+    for (const [k, ts] of _pipeDedup) {
+      if (now - ts > 10000) _pipeDedup.delete(k);
+    }
+  }
+
+  let ok = await pipeSend(session_id, text);
+  console.log(`[Phoenix Pipe] pipeSend result: ok=${ok} session=${session_id}`);
+
+  // Auto-recreate session if it was lost (e.g. Carrier restart killed PTY sessions)
+  if (!ok) {
+    console.log(`[Phoenix Pipe] Session ${session_id} not found — auto-creating and retrying`);
+    try {
+      // Derive project name from session ID: "dash-pan-1" → "Phoenix", "dash-woe-2" → "woe"
+      const match = session_id.match(/^dash-([a-z0-9-]+?)(?:-\d+)?$/);
+      const projectSlug = match?.[1] || 'phoenix';
+      const projectName = projectSlug.toUpperCase();
+      let cwd = null;
+      try {
+        const { all: dbAll } = await import('./db.js');
+        const rows = dbAll('SELECT path FROM projects WHERE LOWER(REPLACE(name, \' \', \'-\')) = ? OR LOWER(name) = ? LIMIT 1',
+          [projectSlug, projectSlug]);
+        if (rows?.[0]?.path) cwd = rows[0].path;
+      } catch {}
+      await createPipeSession(session_id, { projectName, cwd });
+      ok = await pipeSend(session_id, text);
+      console.log(`[Phoenix Pipe] Auto-recreate + retry: ok=${ok} session=${session_id} cwd=${cwd}`);
+    } catch (err) {
+      console.error(`[Phoenix Pipe] Auto-recreate failed: ${err.message}`);
+    }
+  }
+
+  res.json({ ok: !!ok, session: session_id });
+});
+
+// Switch model for a live session — takes effect on the very next message sent
+app.post('/api/v1/terminal/set-model', (req, res) => {
+  const { session_id, model } = req.body;
+  if (!session_id) return res.status(400).json({ error: 'session_id required' });
+  const ok = pipeSetModel(session_id, model || null);
+  res.json({ ok, session: session_id, model: model || null });
+});
+
+// Permission response — mobile user tapped Allow or Deny
+// Sets the response on the pending permission so the blocking PermissionRequest hook can return
+app.post('/api/v1/terminal/permissions/respond', (req, res) => {
+  const { response, perm_id } = req.body;
+  if (!response) return res.status(400).json({ error: 'response required (allow or deny)' });
+  if (!perm_id) return res.status(400).json({ error: 'perm_id required' });
+
+  // Normalize response: accept various formats from mobile
+  const normalized = (response === '1' || response === 'allow' || response === 'yes' || response === true)
+    ? 'allow' : 'deny';
+
+  const allPerms = getPendingPermissions();
+  console.log(`[Phoenix Perm] Trying to respond: perm_id=${perm_id} (type=${typeof perm_id}), pending=${allPerms.length}, ids=${allPerms.map(p=>p.id).join(',')}`);
+  const found = respondToPermission(parseInt(perm_id), normalized);
+  console.log(`[Phoenix Perm] Response: ${normalized} for perm ${perm_id} (found=${found})`);
+
+  res.json({ ok: found, response: normalized, method: 'hook' });
+});
+
+// ==================== Test Runner API ====================
+import { runTests, getTestStatus, resumeRestartTest, cancelTests } from './routes/tests.js';
+
+// Storage for external test results (from test-restart.js and other external scripts)
+let externalResults = [];
+
+app.get('/api/v1/tests', (req, res) => {
+  const status = getTestStatus();
+  // Merge external results into the response
+  if (externalResults.length > 0) {
+    status.externalResults = externalResults;
+  }
+  res.json(status);
+});
+
+app.post('/api/v1/tests/run', async (req, res) => {
+  const { suite } = req.body || {};
+  const result = await runTests(suite || 'all');
+  res.json(result);
+});
+
+app.post('/api/v1/tests/cancel', (req, res) => {
+  const cancelled = cancelTests();
+  res.json({ ok: cancelled, message: cancelled ? 'Tests cancelled' : 'No tests running' });
+});
+
+// Accept results from external test scripts (like test-restart.js)
+app.post('/api/v1/tests/external-result', (req, res) => {
+  const { suite, results, summary } = req.body || {};
+  if (!suite || !results) return res.status(400).json({ error: 'suite and results required' });
+  externalResults.unshift({
+    suite,
+    results,
+    summary,
+    receivedAt: new Date().toISOString(),
+  });
+  // Keep last 10 external results
+  if (externalResults.length > 10) externalResults.length = 10;
+  console.log(`[Phoenix Tests] External result received: ${suite} — ${summary?.passed || 0} passed, ${summary?.failed || 0} failed`);
+  res.json({ ok: true });
+});
+
+// AutoDev API
+app.get('/api/v1/autodev/config', (req, res) => res.json(getAutoDevConfig()));
+app.put('/api/v1/autodev/config', (req, res) => {
+  saveAutoDevConfig(req.body);
+  res.json({ ok: true });
+});
+app.get('/api/v1/autodev/log', (req, res) => {
+  const limit = parseInt(req.query.limit) || 20;
+  res.json(getAutoDevLog(limit));
+});
+app.post('/api/v1/autodev/run', async (req, res) => {
+  const { autodev } = await import('./autodev.js');
+  autodev();
+  res.json({ ok: true, message: 'AutoDev triggered' });
+});
+
+// Wait for next terminal response — polls events DB for a Stop event after a given timestamp
+app.get('/api/v1/terminal/wait-response', async (req, res) => {
+  const since = req.query.since || new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const maxWait = Math.min(parseInt(req.query.timeout) || 30000, 60000);
+  const startTime = Date.now();
+
+  const poll = setInterval(() => {
+    const event = get(
+      `SELECT data FROM events WHERE event_type = 'Stop' AND created_at > :since ORDER BY created_at DESC LIMIT 1`,
+      { ':since': since }
+    );
+    if (event) {
+      clearInterval(poll);
+      try {
+        const parsed = JSON.parse(event.data);
+        res.json({ ok: true, response: parsed.last_assistant_message || '' });
+      } catch {
+        res.json({ ok: false, error: 'parse error' });
+      }
+    } else if (Date.now() - startTime > maxWait) {
+      clearInterval(poll);
+      res.json({ ok: false, error: 'timeout' });
+    }
+  }, 1000);
+});
+
+// Stack Scanner API
+app.get('/api/v1/stacks', (req, res) => res.json(getAllStacks()));
+app.post('/api/v1/stacks/scan', (req, res) => {
+  scanStacks();
+  res.json({ ok: true });
+});
+
+// Context briefing — living state doc + recent chat for new Claude sessions
+// Atlas — service graph data from Steward registry
+app.get('/api/v1/atlas/services', (req, res) => {
+  res.json(getAtlasData());
+});
+
+app.get('/api/v1/atlas/summary', async (req, res) => {
+  try {
+    const { getAtlasSummary } = await import('./steward.js');
+    const summary = await getAtlasSummary();
+    res.json({ ok: true, summary, generated_at: new Date().toISOString() });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Hybrid memory search — FTS5 (lexical) + sqlite-vec (semantic) fused with
+// reciprocal rank fusion. Multi-tenant via the `scope` query param.
+//
+// Usage:
+//   GET /api/v1/memory/search?q=onedrive%20removal&scope=main&limit=20
+app.get('/api/v1/memory/search', async (req, res) => {
+  const q = String(req.query.q || '').trim();
+  const scope = String(req.query.scope || 'main');
+  const limit = Math.min(100, parseInt(req.query.limit, 10) || 20);
+  if (!q) return res.status(400).json({ error: 'q (query) required' });
+  try {
+    const results = await searchMemory(q, { scope, limit });
+    res.json({ scope, q, count: results.length, results });
+  } catch (err) {
+    console.error('[Phoenix MemorySearch] endpoint error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// List registered DB scopes (for debugging / Atlas surfacing).
+app.get('/api/v1/memory/scopes', (req, res) => {
+  res.json({ scopes: listScopes() });
+});
+
+// Backfill progress — indexed/total/remaining + running flag.
+app.get('/api/v1/memory/backfill-status', (req, res) => {
+  res.json(backfillStatus(req.query.scope || 'main'));
+});
+
+// Render Phoenix's memory as browsable markdown, so you can SEE what it captured
+// instead of only reaching it through similarity search.
+//
+// Derived output: every file is rebuilt from the database on each call, nothing
+// reads it back, nothing edits it by hand. Deliberately does not call an LLM —
+// the prose-writing half is the expensive part, and the Gemini free tier caps
+// at 500/day (hit on 2026-08-10, took voice down with it). A structural render
+// costs nothing and still answers "what is in here".
+app.get('/api/v1/memory/wiki', async (req, res) => {
+  try {
+    const { generateWiki } = await import('./memory/wiki.js');
+    // wiki.js defaults to a folder beside phoenix.db. server.js has no data-dir
+    // constant in scope (PAN_DATA_DIR is an env var read inside db.js), so
+    // letting the module own that resolution avoids a ReferenceError here.
+    const result = generateWiki(req.query.dir || undefined);
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Where is the real hub? Answerable by ANY Phoenix instance, so a client that
+// reaches a stale one gets redirected instead of silently talking to an old
+// database.
+//
+// Exists because the hub moved from the Dell to the mini PC and the phone went
+// dark for nine days: its address was hardcoded in four Kotlin files, the phone
+// exposes no inbound port (verified — every port closed over the tailnet), so
+// the hub had no way to say "I moved". A client that can reach anything can now
+// find everything.
+//
+// Set `hub_base_url` to a Tailscale MagicDNS name (http://phoenix-hub:7777) rather
+// than an IP: move the hub to another machine, rename that machine in the
+// Tailscale admin console, and every client follows with no rebuild.
+app.get('/api/v1/hub-address', (req, res) => {
+  let configured = null;
+  try {
+    const row = get(`SELECT value FROM settings WHERE key = 'hub_base_url'`);
+    configured = row?.value?.replace(/^"|"$/g, '').trim() || null;
+  } catch { /* db not ready — null is a valid answer */ }
+  res.json({
+    ok: true,
+    base_url: configured,          // null = "I'm not authoritative, keep what works"
+    responding_host: req.headers.host || null,
+  });
+});
+
+// Quick admin endpoint to update model_selections without code edits or
+// swaps. Body: { purpose, provider, model, dim?, context_window?, notes? }
+// Returns the resulting row. Used to redirect reasoning_cloud away from
+// Cerebras (which 402s for every model on this billing tier) to Claude
+// without having to grep + edit + rebuild.
+app.post('/api/v1/admin/model-selection', async (req, res) => {
+  try {
+    const { setModelForPurpose, getModelForPurpose } = await import('./db.js');
+    const { purpose, provider, model, dim, context_window, notes } = req.body || {};
+    if (!purpose || !provider || !model) {
+      return res.status(400).json({ error: 'purpose, provider, and model are required' });
+    }
+    const ok = setModelForPurpose(purpose, provider, model, { dim, context_window, notes });
+    if (!ok) return res.status(500).json({ error: 'setModelForPurpose failed' });
+    res.json({ ok: true, selection: getModelForPurpose(purpose) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PHASE 4: dashboard polling bundle.
+//
+// The dashboard layout polls several small endpoints on tight intervals
+// (version.json every 5s, chat/unread every 15s, /health every 10s, etc).
+// Each one consumes a slot from the browser's HTTP/1.1 6-per-origin
+// connection pool — saturating it and queueing real panel data fetches
+// behind the polls. Bundling them into one endpoint cuts the poll
+// connection count from 5+ to 1, freeing the rest of the pool for
+// genuine user navigation.
+//
+// Real HTTP/2 on Carrier would solve this at the protocol layer (no
+// per-origin connection limit) but requires localhost TLS + Tauri webview
+// cooperation. The bundle endpoint is the pragmatic equivalent and works
+// today.
+app.get('/api/v1/dashboard/poll', (req, res) => {
+  // Pure in-memory bundle — no DB queries. Each field is cheap to compute
+  // and the whole response is < 1KB. The dashboard's $effect can poll
+  // this once every 5-10s instead of firing 3 separate fetches.
+  res.json({
+    ts: Date.now(),
+    health: {
+      carrier: true,
+      craft_pid: process.pid,
+      craft_uptime_s: Math.round(process.uptime()),
+    },
+    version_url: '/v2/_app/version.json',
+  });
+});
+
+// Stop the running embeddings backfill in the current Craft. Useful when the
+// vec0 index writes are hogging CPU and the user wants the dashboard
+// responsive RIGHT NOW. After abort, the next Craft startup will re-pick-up
+// where it left off (rows already in event_embeddings stay), unless
+// PAN_DISABLE_EMBEDDINGS_BACKFILL=1 is set on that boot OR the persistent
+// embeddings_backfill_disabled setting is true.
+app.post('/api/v1/memory/backfill-abort', (req, res) => {
+  try {
+    abortBackfill();
+    res.json({ ok: true, aborted: true, message: 'backfill abort signal sent — current iteration finishes then loop exits' });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Persistent disable — flips the embeddings_backfill_disabled setting + sends
+// the same abort signal so the current iteration also stops. Survives Craft
+// swaps and Carrier restarts. POST { enabled: false } to clear it.
+app.post('/api/v1/memory/backfill-disable', (req, res) => {
+  try {
+    const disable = req.body?.disable !== false; // default true
+    run("INSERT INTO settings (key, value) VALUES ('embeddings_backfill_disabled', :v) ON CONFLICT(key) DO UPDATE SET value = :v",
+      { ':v': disable ? 'true' : 'false' });
+    if (disable) abortBackfill();
+    res.json({ ok: true, disabled: disable, message: disable
+      ? 'embeddings_backfill_disabled=true + abort signal sent — backfill will not auto-start on future Craft boots until cleared'
+      : 'embeddings_backfill_disabled=false — backfill will auto-start on next Craft boot' });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Tier 0 Phase 4: org policy lookup for the phone.
+// Returns the active org's policy fields so the phone can grey out toggles
+// (incognito, blackout) when the org disallows them.
+app.get('/api/v1/org/policy', async (req, res) => {
+  try {
+    const { getActiveOrg } = await import('./org-policy.js');
+    const org = getActiveOrg(req);
+    res.json({
+      org_id: org.id,
+      org_slug: org.slug,
+      org_name: org.name,
+      incognito_allowed: org.policy_incognito_allowed !== 0,
+      blackout_allowed: org.policy_blackout_allowed !== 0,
+      data_retention_days: org.policy_data_retention_days,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Tier 0 Phase 5: org current context for the phone top bar.
+// Returns the active org info + user display name + role + list of all orgs.
+app.get('/api/v1/org/current', async (req, res) => {
+  try {
+    const { getActiveOrg } = await import('./org-policy.js');
+    const org = getActiveOrg(req);
+    const userId = req?.user?.id || 1;
+
+    // Sync personal org name from `display_name` setting (user-configurable)
+    try {
+      const nameSetting = get("SELECT value FROM settings WHERE key = 'display_name'");
+      const displayName = nameSetting ? (nameSetting.value || '').replace(/^"|"$/g, '') : null;
+      if (displayName) {
+        const personalOrg = db.prepare(`SELECT name FROM orgs WHERE id = 'org_personal'`).get();
+        if (personalOrg && personalOrg.name !== displayName) {
+          db.prepare(`UPDATE orgs SET name = ? WHERE id = 'org_personal'`).run(displayName);
+          db.prepare(`UPDATE users SET display_name = ?, display_nickname = ? WHERE id = 1`).run(displayName, displayName);
+          console.log(`[Org] Synced personal org name to setting: ${personalOrg.name} → ${displayName}`);
+        }
+      }
+    } catch {}
+
+    // Get user info
+    let user = { display_name: 'User', display_nickname: null, role: 'owner' };
+    try {
+      const u = db.prepare(`SELECT display_name, display_nickname, role FROM users WHERE id = ?`).get(userId);
+      if (u) user = u;
+    } catch {}
+
+    // Get membership role for this org
+    let membershipRole = null;
+    try {
+      const m = db.prepare(`
+        SELECT m.role_id, r.name AS role_name
+        FROM memberships m
+        LEFT JOIN roles r ON r.id = m.role_id
+        WHERE m.user_id = ? AND m.org_id = ? AND m.left_at IS NULL
+      `).get(userId, org.id);
+      if (m) membershipRole = m.role_name || null;
+    } catch {}
+
+    // Get all orgs this user belongs to
+    let orgs = [];
+    try {
+      orgs = db.prepare(`
+        SELECT o.id AS org_id, o.slug, o.name, o.color_primary, o.logo_url,
+               m.role_id, r.name AS role_name
+        FROM memberships m
+        JOIN orgs o ON o.id = m.org_id
+        LEFT JOIN roles r ON r.id = m.role_id
+        WHERE m.user_id = ? AND m.left_at IS NULL
+        ORDER BY o.name
+      `).all(userId);
+    } catch {}
+
+    res.json({
+      org_id: org.id,
+      org_name: org.name,
+      org_slug: org.slug,
+      org_color: org.color_primary || null,
+      user_display_name: user.display_name,
+      user_nickname: user.display_nickname || user.display_name,
+      role: membershipRole || user.role || 'owner',
+      orgs: orgs,
+    });
+  } catch (err) {
+    // Fallback for pre-migration state — read display_name setting if available
+    let fallbackName = 'User';
+    try {
+      const row = get("SELECT value FROM settings WHERE key = 'display_name'");
+      if (row) fallbackName = (row.value || '').replace(/^"|"$/g, '') || 'User';
+    } catch {}
+    res.json({
+      org_id: 'org_personal',
+      org_name: fallbackName,
+      org_slug: 'personal',
+      org_color: null,
+      user_display_name: fallbackName,
+      user_nickname: fallbackName,
+      role: 'owner',
+      orgs: [{ org_id: 'org_personal', slug: 'personal', name: fallbackName, role_name: 'owner' }],
+    });
+  }
+});
+
+// Tier 0 Phase 5 org routes moved to routes/orgs.js (mounted at /api/v1/orgs)
+
+// Clean up stale Tailscale pan-* nodes (duplicates from app reinstalls)
+// Uses `tailscale status --json` to find offline nodes and expires them
+async function cleanupStaleTailscaleNodes() {
+  try {
+    const tsExe = process.platform === 'win32' ? 'C:\\Program Files\\Tailscale\\tailscale.exe' : 'tailscale';
+    const statusJson = execFileSync(tsExe, ['status', '--json'], { timeout: 5000, encoding: 'utf8', windowsHide: true });
+    const status = JSON.parse(statusJson);
+    const self = status.Self || {};
+    const peers = status.Peer || {};
+
+    // Find all pan-* nodes
+    const panNodes = Object.entries(peers)
+      .filter(([_, v]) => v.HostName && (v.HostName.startsWith('phoenix-') || v.HostName.startsWith('pan-')))
+      .map(([k, v]) => ({ nodeKey: k, hostname: v.HostName, online: v.Online, ips: v.TailscaleIPs || [] }));
+
+    // Keep the one that's online, expire offline duplicates
+    const onlineNodes = panNodes.filter(n => n.online);
+    const offlineNodes = panNodes.filter(n => !n.online);
+
+    if (onlineNodes.length > 0 && offlineNodes.length > 0) {
+      console.log(`[Phoenix Tailscale] Found ${onlineNodes.length} online + ${offlineNodes.length} offline nodes. Cleaning up stale...`);
+
+      // Try to delete stale nodes via Tailscale API using OAuth credentials
+      let oauthId, oauthSecret;
+      try {
+        const idRow = get("SELECT value FROM settings WHERE key = 'tailscale_oauth_client_id'");
+        const secretRow = get("SELECT value FROM settings WHERE key = 'tailscale_oauth_client_secret'");
+        oauthId = idRow?.value?.replace(/^"|"$/g, '').trim();
+        oauthSecret = secretRow?.value?.replace(/^"|"$/g, '').trim();
+      } catch {}
+
+      if (oauthId && oauthSecret) {
+        // Get Tailscale API token via OAuth
+        try {
+          const tokenResp = await fetch('https://api.tailscale.com/api/v2/oauth/token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: `client_id=${encodeURIComponent(oauthId)}&client_secret=${encodeURIComponent(oauthSecret)}&grant_type=client_credentials`
+          });
+          if (tokenResp.ok) {
+            const tokenData = await tokenResp.json();
+            const token = tokenData.access_token;
+
+            // List devices via API to get device IDs (nodekeys don't map to API IDs)
+            const devResp = await fetch('https://api.tailscale.com/api/v2/tailnet/-/devices', {
+              headers: { 'Authorization': `Bearer ${token}` }
+            });
+            if (devResp.ok) {
+              const devData = await devResp.json();
+              const apiDevices = devData.devices || [];
+              for (const stale of offlineNodes) {
+                const apiDev = apiDevices.find(d => d.hostname === stale.hostname && !d.online);
+                if (apiDev) {
+                  const delResp = await fetch(`https://api.tailscale.com/api/v2/device/${apiDev.id}`, {
+                    method: 'DELETE',
+                    headers: { 'Authorization': `Bearer ${token}` }
+                  });
+                  console.log(`[Phoenix Tailscale] Deleted stale node ${stale.hostname}: ${delResp.ok ? 'success' : delResp.status}`);
+                }
+              }
+            } else {
+              console.log(`[Phoenix Tailscale] API device list failed: ${devResp.status} — OAuth client may need 'devices' scope`);
+            }
+          }
+        } catch (apiErr) {
+          console.log(`[Phoenix Tailscale] API cleanup failed: ${apiErr.message}`);
+        }
+      } else {
+        for (const stale of offlineNodes) {
+          console.log(`[Phoenix Tailscale] Stale node: ${stale.hostname} — remove from: https://login.tailscale.com/admin/machines`);
+        }
+      }
+    } else if (offlineNodes.length > 0 && onlineNodes.length === 0) {
+      console.log(`[Phoenix Tailscale] ${offlineNodes.length} offline nodes, none online — phone may be disconnected`);
+    }
+  } catch (e) {
+    // Tailscale not installed or not running — skip silently
+  }
+}
+
+// Tier 0 Phase 5: diagnostics endpoint for phone settings.
+// Returns server PID, uptime, Tailscale status, and connection info.
+app.get('/api/v1/diagnostics', (req, res) => {
+  const uptimeMs = Date.now() - _serverStartedAt;
+  const secs = Math.floor(uptimeMs / 1000);
+  const mins = Math.floor(secs / 60);
+  const hrs = Math.floor(mins / 60);
+  const uptime = hrs > 0 ? `${hrs}h ${mins % 60}m` : mins > 0 ? `${mins}m ${secs % 60}s` : `${secs}s`;
+
+  res.json({
+    server_pid: process.pid,
+    uptime,
+    uptime_ms: uptimeMs,
+    started_at: _serverStartedAt,
+    tailscale_ip: _tailscaleIpCache,
+    tailscale_status: _tailscaleIpCache ? 'connected' : 'unknown',
+    node_version: process.version,
+    platform: process.platform,
+    mode: PHOENIX_MODE,
+    craft_id: process.env.PHOENIX_CRAFT_ID || null,
+    memory_mb: Math.round(process.memoryUsage().rss / 1024 / 1024),
+  });
+});
+
+// Wipe a non-main scope (close + delete its SQLCipher file). Used by the
+// phone when toggling incognito OFF — true "forget everything" semantics.
+// Refuses to wipe `main`.
+//
+// Tier 0 Phase 4: writes an audit log entry when a non-personal org wipes
+// a scope. Personal mode is intentionally NOT audited (the user owns it
+// and the whole point of personal incognito is privacy).
+app.post('/api/v1/memory/scope/:scope/wipe', async (req, res) => {
+  const scope = String(req.params.scope || '').trim();
+  if (!scope || scope === 'main') return res.status(400).json({ error: 'cannot wipe main' });
+  if (!/^[a-z0-9-]{1,32}$/.test(scope)) return res.status(400).json({ error: 'invalid scope name' });
+  try {
+    const result = wipeScope(scope);
+
+    // Audit only when in an org context. Personal mode = no audit (privacy).
+    try {
+      const { getActiveOrg } = await import('./org-policy.js');
+      const org = getActiveOrg(req);
+      if (org.id !== 'org_personal') {
+        const { auditLog } = await import('./middleware/org-context.js');
+        // Synthesize the minimum req shape auditLog expects
+        const auditReq = { user: { id: req.user?.id || 1 }, org_id: org.id };
+        auditLog(auditReq, 'incognito.wipe', scope, { wiped_path: result.path });
+      }
+    } catch (auditErr) {
+      console.warn('[scope/wipe] audit failed:', auditErr.message);
+    }
+
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/v1/atlas/service/:id', (req, res) => {
+  const svc = getServiceStatus(req.params.id);
+  if (!svc) return res.status(404).json({ error: 'Service not found' });
+  res.json(svc);
+});
+
+// Atlas app registration — external apps describe themselves
+app.post('/api/v1/atlas/register-app', async (req, res) => {
+  try {
+    const { id, name, description, routes, key_files, version, registered_by } = req.body;
+    if (!id || !name) return res.status(400).json({ ok: false, error: 'id and name required' });
+    run(`INSERT INTO atlas_apps (id, name, description, routes, key_files, version, registered_by, last_seen)
+         VALUES (:id, :name, :desc, :routes, :files, :ver, :by, datetime('now','localtime'))
+         ON CONFLICT(id) DO UPDATE SET
+           name=:name, description=:desc, routes=:routes, key_files=:files,
+           version=:ver, registered_by=:by, last_seen=datetime('now','localtime')`, {
+      ':id': id, ':name': name, ':desc': description || '',
+      ':routes': JSON.stringify(routes || []),
+      ':files': JSON.stringify(key_files || []),
+      ':ver': version || null, ':by': registered_by || 'user'
+    });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.get('/api/v1/atlas/apps', async (req, res) => {
+  try {
+    const apps = all(`SELECT * FROM atlas_apps ORDER BY last_seen DESC`);
+    res.json({ ok: true, apps });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.delete('/api/v1/atlas/apps/:id', async (req, res) => {
+  try {
+    run(`DELETE FROM atlas_apps WHERE id = :id`, { ':id': req.params.id });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ==================== Tier 0 Phase 6: Audit Chain + Backup ====================
+
+// GET /api/v1/audit/verify — verify HMAC chain integrity across all orgs
+app.get('/api/v1/audit/verify', (req, res) => {
+  try {
+    const result = verifyAllAuditChains();
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/v1/audit/log — paginated audit log viewer
+app.get('/api/v1/audit/log', (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    const offset = parseInt(req.query.offset) || 0;
+    const orgFilter = req.query.org_id || null;
+    const actionFilter = req.query.action || null;
+
+    const conditions = [];
+    const params = {};
+    if (orgFilter) { conditions.push('org_id = :org_id'); params[':org_id'] = orgFilter; }
+    if (actionFilter) { conditions.push('action = :action'); params[':action'] = actionFilter; }
+
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    const rows = all(
+      `SELECT * FROM audit_log ${where} ORDER BY id DESC LIMIT ${limit} OFFSET ${offset}`,
+      params
+    );
+
+    // Parse metadata_json for each row
+    const entries = rows.map(r => ({
+      ...r,
+      metadata: r.metadata_json ? (() => { try { return JSON.parse(r.metadata_json); } catch { return r.metadata_json; } })() : null,
+    }));
+
+    const countRow = get(`SELECT COUNT(*) as total FROM audit_log ${where}`, params);
+    res.json({ entries, total: countRow?.total || 0, limit, offset });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/v1/backup/create — create a backup of phoenix.db via SQLite backup API
+app.post('/api/v1/backup/create', async (req, res) => {
+  try {
+    const backupDir = join(getDataDir(), 'backups');
+    mkdirSync(backupDir, { recursive: true });
+
+    const now = new Date();
+    const ts = now.toISOString().replace(/[:.]/g, '-').replace('T', '-').slice(0, 19);
+    const backupPath = join(backupDir, `phoenix-${ts}.db`);
+
+    // Use better-sqlite3's .backup() — works with encrypted DBs
+    await db.backup(backupPath);
+
+    const stats = statSync(backupPath);
+
+    // Audit the backup
+    try {
+      const auditReq = { user: { id: req.user?.id || 1 }, org_id: req.org_id || 'org_personal' };
+      auditLog(auditReq, 'backup.create', backupPath, { size_bytes: stats.size });
+    } catch {}
+
+    console.log(`[Phoenix Backup] Created: ${backupPath} (${(stats.size / 1024 / 1024).toFixed(1)} MB)`);
+    res.json({ ok: true, path: backupPath, size_bytes: stats.size });
+  } catch (err) {
+    console.error('[Phoenix Backup] Failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/v1/backup/list — list available backups with dates and sizes
+app.get('/api/v1/backup/list', (req, res) => {
+  try {
+    const backupDir = join(getDataDir(), 'backups');
+    let files = [];
+    try {
+      files = readdirSync(backupDir)
+        .filter(f => (f.startsWith('phoenix-') || f.startsWith('pan-')) && f.endsWith('.db'))
+        .map(f => {
+          const fullPath = join(backupDir, f);
+          const stats = statSync(fullPath);
+          return {
+            filename: f,
+            path: fullPath,
+            size_bytes: stats.size,
+            created_at: stats.mtime.toISOString(),
+          };
+        })
+        .sort((a, b) => b.created_at.localeCompare(a.created_at));
+    } catch {
+      // backups dir doesn't exist yet
+    }
+    res.json({ backups: files, backup_dir: backupDir });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Inject context into CLAUDE.md — called by frontend before launching Claude
+// Optional: pass tab_session_ids (array of Claude session IDs for this PTY tab)
+// to scope Part 1 of the injection to this specific tab's history.
+app.post('/api/v1/inject-context', async (req, res) => {
+  const { cwd, tab_session_ids } = req.body || {};
+  if (!cwd) return res.status(400).json({ error: 'cwd required' });
+  try {
+    const tabIds = Array.isArray(tab_session_ids) ? tab_session_ids : [];
+    injectSessionContext(cwd, 'org_personal', tabIds);
+    res.json({ ok: true, message: 'Context injected into CLAUDE.md' });
+    // Dashboard loaded successfully — reset watchdog strike counter
+    notifyDashboardLoaded();
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/v1/context-briefing', async (req, res) => {
+  const projectPath = req.query.project_path || '';
+  const tabSessionIds = req.query.session_ids ? req.query.session_ids.split(',').filter(Boolean) : [];
+
+  // 1. Read the living state document (maintained by dream cycle)
+  const stateFile = existsSync(join(process.cwd(), '.phoenix-state.md')) ? join(process.cwd(), '.phoenix-state.md') : join(process.cwd(), '.pan-state.md');
+  let stateDoc = '';
+  try {
+    if (existsSync(stateFile)) stateDoc = readFileSync(stateFile, 'utf8');
+  } catch {}
+
+  // 2. Recent conversation — scoped to tab's session IDs if available, else project path
+  let recentChat = [];
+  if (tabSessionIds.length > 0) {
+    // Tab-specific transcript: only load conversation from this tab's Claude sessions
+    const params = {};
+    const placeholders = tabSessionIds.map((id, i) => { params[`:ts${i}`] = id; return `:ts${i}`; }).join(',');
+    recentChat = all(
+      `SELECT event_type, data, created_at FROM events
+       WHERE event_type IN ('UserPromptSubmit', 'Stop', 'AssistantMessage')
+       AND session_id IN (${placeholders})
+       ORDER BY created_at DESC LIMIT 30`,
+      params
+    );
+  } else if (projectPath) {
+    const fwd = projectPath.replace(/\\/g, '/');
+    const bk = fwd.replace(/\//g, '\\\\');
+    recentChat = all(
+      `SELECT event_type, data, created_at FROM events
+       WHERE (event_type = 'UserPromptSubmit' OR event_type = 'Stop' OR event_type = 'AssistantMessage')
+       AND (data LIKE :pp1 OR data LIKE :pp2)
+       ORDER BY created_at DESC LIMIT 30`,
+      { ':pp1': '%' + bk + '%', ':pp2': '%' + fwd + '%' }
+    );
+  } else {
+    recentChat = all(
+      `SELECT event_type, data, created_at FROM events
+       WHERE event_type IN ('UserPromptSubmit', 'Stop', 'AssistantMessage')
+       ORDER BY created_at DESC LIMIT 30`
+    );
+  }
+
+  // 3. Open tasks for this project
+  let tasks = [];
+  if (projectPath) {
+    const fwd = projectPath.replace(/\\/g, '/');
+    const project = get("SELECT id FROM projects WHERE path = :p", { ':p': fwd });
+    if (project) {
+      tasks = all(
+        `SELECT title, status, priority FROM project_tasks
+         WHERE project_id = :pid AND status != 'done'
+         ORDER BY priority DESC LIMIT 15`,
+        { ':pid': project.id }
+      );
+    }
+  }
+
+  // 4. Project environment & tech stack (so Claude knows what "terminal", "app", etc. mean)
+  let projectBrief = '';
+  if (projectPath) {
+    const fwd = projectPath.replace(/\\/g, '/');
+    const proj = get("SELECT id FROM projects WHERE path = :p", { ':p': fwd });
+    if (proj) projectBrief = getProjectBriefing(proj.id);
+  }
+  if (!projectBrief) {
+    // No project match — still include environment info
+    projectBrief = '## Development Environment\n' + getEnvironmentBriefing() + '\n';
+  }
+
+  // 5. Vector memory context — semantic facts, episodic memories, procedures
+  let memorySection = '';
+  try {
+    const memResult = await buildMemoryContext('session context', { tokenBudget: 8000 });
+    if (memResult.context) {
+      memorySection = memResult.context;
+      console.log(`[Phoenix Briefing] Memory context: ${memResult.stats.facts} facts, ${memResult.stats.episodes} episodes, ${memResult.stats.procedures} procedures`);
+    }
+  } catch (err) {
+    console.error('[Phoenix Briefing] Memory context failed:', err.message);
+  }
+
+  // 6. Build briefing
+  let briefing = '=== PHOENIX SESSION CONTEXT BRIEFING ===\n\n';
+
+  // Environment context first — so Claude knows the tools before anything else
+  briefing += projectBrief + '\n';
+
+  // State doc is the primary context source
+  if (stateDoc) {
+    briefing += stateDoc + '\n\n';
+  }
+
+  // Vector memory — accumulated knowledge from past sessions
+  if (memorySection) {
+    briefing += memorySection + '\n\n';
+  }
+
+  if (tasks.length > 0) {
+    briefing += '## Open Tasks\n';
+    for (const t of tasks) briefing += '- [' + t.status + (t.priority > 0 ? ' P' + t.priority : '') + '] ' + t.title + '\n';
+    briefing += '\n';
+  }
+
+  if (recentChat.length > 0) {
+    briefing += '## Recent Conversation\n';
+    const chatItems = [...recentChat].reverse();
+    for (const e of chatItems) {
+      try {
+        const d = JSON.parse(e.data);
+        if (e.event_type === 'UserPromptSubmit' && d.prompt)
+          briefing += 'User (' + e.created_at + '): ' + d.prompt.substring(0, 300) + '\n';
+        else if (e.event_type === 'Stop' && d.last_assistant_message)
+          briefing += 'Claude (' + e.created_at + '): ' + d.last_assistant_message.substring(0, 500) + '\n';
+      } catch {}
+    }
+    briefing += '\n';
+
+    // Last few messages at full length for real context
+    const lastMessages = chatItems.slice(-6);
+    if (lastMessages.length > 0) {
+      briefing += '## Last Messages (Full)\n';
+      for (const e of lastMessages) {
+        try {
+          const d = JSON.parse(e.data);
+          if (e.event_type === 'UserPromptSubmit' && d.prompt)
+            briefing += 'User (' + e.created_at + '):\n' + d.prompt.substring(0, 3000) + '\n\n';
+          else if (e.event_type === 'Stop' && d.last_assistant_message)
+            briefing += 'Claude (' + e.created_at + '):\n' + d.last_assistant_message.substring(0, 3000) + '\n\n';
+        } catch {}
+      }
+    }
+  }
+
+  briefing += '## Instructions\nThis is a fresh session. Your FIRST message to the user MUST be a brief summary of the Recent Conversation above — start with "Last time we were working on..." and list the key topics/issues. The user should NEVER have to ask what they were working on. You tell them immediately, every single time. Then pick up where they left off.\n';
+
+  res.json({ briefing, state: stateDoc.length > 0, tasks: tasks.length, chat: recentChat.length });
+});
+
+// Dictation — record from PC mic, transcribe via Haiku, return text
+app.post('/api/v1/dictate', async (req, res) => {
+  const duration = Math.min(req.body?.duration || 5, 30); // max 30 seconds
+  try {
+    const { execFile } = await import('child_process');
+    const { promisify } = await import('util');
+    const execFileAsync = promisify(execFile);
+    const { join, dirname } = await import('path');
+    const { fileURLToPath } = await import('url');
+    const __dir = dirname(fileURLToPath(import.meta.url));
+
+    // Record audio using Python sounddevice
+    const recordScript = join(__dir, 'dictate.py');
+    const { stdout } = await execFileAsync('python', [recordScript, String(duration)], {
+      timeout: (duration + 5) * 1000
+    });
+    const result = JSON.parse(stdout.trim());
+
+    if (result.text) {
+      res.json({ ok: true, text: result.text });
+    } else {
+      res.json({ ok: false, error: result.error || 'No transcription' });
+    }
+  } catch (err) {
+    console.error('[Phoenix Dictate] Error:', err.message);
+    res.json({ ok: false, error: err.message });
+  }
+});
+
+// Voice trigger — mouse button actions routed from dashboard JS
+// action: "winh" (Win+H system voice) or "dictate" (Phoenix whisper)
+app.post('/api/v1/voice/trigger', async (req, res) => {
+  const { action } = req.body || {};
+  console.log(`[Phoenix Voice] trigger: ${action}`);
+  if (action === 'winh') {
+    // Send Win+H via Tauri shell
+    try {
+      await fetch('http://127.0.0.1:7790/winh', { method: 'POST', signal: AbortSignal.timeout(2000) });
+      res.json({ ok: true, action: 'winh' });
+    } catch {
+      // Fallback: PowerShell keybd_event if Tauri is down
+      const { exec } = await import('child_process');
+      exec('powershell -NoProfile -Command "Add-Type -MemberDefinition \'[DllImport(\\\"user32.dll\\\")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);\' -Name W -Namespace K; [K.W]::keybd_event(0x5B,0,0,[UIntPtr]::Zero); [K.W]::keybd_event(0x48,0,0,[UIntPtr]::Zero); [K.W]::keybd_event(0x48,0,2,[UIntPtr]::Zero); [K.W]::keybd_event(0x5B,0,2,[UIntPtr]::Zero)"', { windowsHide: true });
+      res.json({ ok: true, action: 'winh', via: 'powershell-fallback' });
+    }
+  } else if (action === 'dictate') {
+    // Forward to existing dictate endpoint logic
+    try {
+      const resp = await fetch('http://127.0.0.1:7790/dictate', { method: 'POST', signal: AbortSignal.timeout(2000) });
+      const data = await resp.json();
+      res.json({ ok: true, action: 'dictate', result: data });
+    } catch {
+      res.json({ ok: false, error: 'Tauri shell not reachable' });
+    }
+  } else {
+    res.status(400).json({ error: 'action must be winh or dictate' });
+  }
+});
+
+// Voice toggle — AHK or other clients can trigger dashboard mic streaming
+app.post('/api/v1/voice/toggle', (req, res) => {
+  broadcastNotification('voice_toggle', {});
+  res.json({ ok: true });
+});
+
+// Voice dictate — forwards to Tauri shell's /dictate endpoint (Tauri owns mouse buttons + audio session)
+// Fallback: if Tauri shell is down, spawn dictate-vad.py directly from server
+let _dictateActive = false;
+app.post('/api/v1/voice/dictate', async (req, res) => {
+  try {
+    // Try Tauri shell first (has user session audio access + mouse button hooks)
+    const resp = await fetch('http://127.0.0.1:7790/dictate', { method: 'POST', signal: AbortSignal.timeout(2000) });
+    const data = await resp.json();
+    _dictateActive = data.action === 'started';
+    res.json({ ok: true, action: data.action, via: 'tauri' });
+  } catch {
+    // Tauri shell not running — fall back to direct spawn
+    const stopFile = join(tmpdir(), 'phoenix_dictate.wav.stop');
+    if (_dictateActive) {
+      try { writeFileSync(stopFile, 'stop'); } catch {}
+      _dictateActive = false;
+      res.json({ ok: true, action: 'stopping', via: 'direct' });
+      return;
+    }
+    try {
+      const { spawn: spawnProc } = await import('child_process');
+      spawnProc('python.exe', [join(__dirname, 'dictate-vad.py'), '--no-sounds'], { stdio: 'ignore', detached: true }).unref();
+      _dictateActive = true;
+      setTimeout(() => { _dictateActive = false; }, 300000);
+      res.json({ ok: true, action: 'started', via: 'direct' });
+    } catch (err) {
+      res.json({ ok: false, error: err.message });
+    }
+  }
+});
+
+// Voice result — receives partial/final transcription from dictate-vad.py and pushes to dashboard
+app.post('/api/v1/voice/result', (req, res) => {
+  const { text, action, partial, org_id, source, device_id } = req.body || {};
+  console.log(`[Phoenix Voice] voice_result: partial=${partial} action=${action} text="${(text||'').substring(0,50)}"`);
+  broadcastNotification('voice_result', { text: text || '', action: action || '', partial: !!partial });
+  // Feed conv-state watcher — every partial/final from voice goes through here
+  try {
+    noteConvUtterance({
+      orgId: org_id || 'org_personal',
+      text: text || '',
+      isFinal: !partial,
+      source: source || 'voice',
+      deviceId: device_id || null,
+    });
+  } catch (e) { /* never block voice path */ }
+  // Reset dictate state when final result arrives
+  if (!partial) _dictateActive = false;
+  res.json({ ok: true });
+});
+
+// GET /api/v1/conversation/state — distilled conversation state for an org
+app.get('/api/v1/conversation/state', (req, res) => {
+  const orgId = req.query.org_id || 'org_personal';
+  res.json({
+    ok: true,
+    state: getConversationState(orgId),
+    buffer: getConversationBuffer(orgId),
+  });
+});
+
+// GET /api/v1/conversation/status — watcher status across all orgs
+app.get('/api/v1/conversation/status', (req, res) => {
+  res.json({ ok: true, ...getConvStateStatus() });
+});
+
+// Whisper transcription — accepts multipart form with WebM audio from dashboard mic button
+app.post('/api/v1/whisper/transcribe', express.raw({ type: 'audio/webm', limit: '10mb' }), async (req, res) => {
+  try {
+    const { writeFileSync, unlinkSync } = await import('fs');
+    const { join } = await import('path');
+    const tmpDir = process.env.TEMP || '%USERPROFILE%\\AppData\\Local\\Temp';
+
+    // Parse multipart or raw body
+    let audioBuffer = req.body;
+    if (!audioBuffer || audioBuffer.length < 500) {
+      return res.json({ ok: false, error: 'Audio too short' });
+    }
+
+    // Save as temp WebM file
+    const tmpFile = join(tmpDir, `phoenix-whisper-${Date.now()}.webm`);
+    writeFileSync(tmpFile, audioBuffer);
+
+    // Send to Whisper server (it handles WebM → WAV conversion)
+    const whisperRes = await fetch('http://127.0.0.1:7782/', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ wav_path: tmpFile }),
+      signal: AbortSignal.timeout(15000),
+    });
+    const result = await whisperRes.json();
+    try { unlinkSync(tmpFile); } catch {}
+
+    if (result.text) {
+      res.json({ ok: true, text: result.text, seconds: result.seconds });
+    } else {
+      res.json({ ok: false, error: result.error || 'No transcription' });
+    }
+  } catch (err) {
+    console.error('[Phoenix Whisper] Transcribe error:', err.message);
+    res.json({ ok: false, error: err.message });
+  }
+});
+
+// Whisper transcription — accepts raw WAV audio (legacy endpoint)
+app.post('/api/v1/whisper', express.raw({ type: 'application/octet-stream', limit: '10mb' }), async (req, res) => {
+  try {
+    const { writeFileSync, unlinkSync } = await import('fs');
+    const { join } = await import('path');
+    const tmpDir = process.env.TEMP || '%USERPROFILE%\\AppData\\Local\\Temp';
+
+    if (!req.body || req.body.length < 1000) {
+      return res.json({ ok: false, error: 'Audio too short' });
+    }
+
+    // Save as temp WAV file
+    const tmpFile = join(tmpDir, `phoenix-whisper-${Date.now()}.wav`);
+    writeFileSync(tmpFile, req.body);
+
+    // Send to Whisper server
+    const whisperRes = await fetch('http://127.0.0.1:7782/', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ wav_path: tmpFile }),
+      signal: AbortSignal.timeout(15000),
+    });
+    const result = await whisperRes.json();
+
+    // Cleanup
+    try { unlinkSync(tmpFile); } catch {}
+
+    if (result.text) {
+      res.json({ ok: true, text: result.text, seconds: result.seconds });
+    } else {
+      res.json({ ok: false, error: result.error || 'No transcription' });
+    }
+  } catch (err) {
+    console.error('[Phoenix Whisper] Error:', err.message);
+    res.json({ ok: false, error: err.message });
+  }
+});
+
+// ==================== Perf Probes (Craft-side) ====================
+// The Carrier's PerfEngine hits these to verify each subsystem works.
+// Every probe returns 200 on success, 503 on degraded/offline.
+// Keep probes cheap — they run every 60s on the Carrier's schedule.
+
+// DB probe: prove SQLite is open + schema exists.
+app.get('/api/v1/perf/probe/db', (req, res) => {
+  try {
+    const row = get('SELECT 1 as ok');
+    if (row && row.ok === 1) return res.status(200).json({ ok: true });
+    return res.status(503).json({ ok: false, error: 'SELECT 1 returned no rows' });
+  } catch (err) {
+    return res.status(503).json({ ok: false, error: String(err?.message || err) });
+  }
+});
+
+// JSONL watcher probe: the watcher is considered alive if the server
+// was able to enumerate Claude project JSONLs during boot.
+app.get('/api/v1/perf/probe/jsonl', (req, res) => {
+  try {
+    const home = process.env.HOME || process.env.USERPROFILE || '';
+    const projects = join(home, '.claude', 'projects');
+    const ok = existsSync(projects);
+    if (ok) return res.status(200).json({ ok: true, projects });
+    return res.status(503).json({ ok: false, error: 'claude projects dir missing' });
+  } catch (err) {
+    return res.status(503).json({ ok: false, error: String(err?.message || err) });
+  }
+});
+
+// MCP server probe: check that the MCP module loaded.
+app.get('/api/v1/perf/probe/mcp', (req, res) => {
+  try {
+    // MCP server registers itself into global state when loaded.
+    // If it's there, return 200 with tool count.
+    const mcpReady = typeof global.__phoenixMcpReady === 'boolean' ? global.__phoenixMcpReady : true;
+    if (mcpReady) return res.status(200).json({ ok: true });
+    return res.status(503).json({ ok: false, error: 'mcp not initialized' });
+  } catch (err) {
+    return res.status(503).json({ ok: false, error: String(err?.message || err) });
+  }
+});
+
+// Generic service probe — checks if the service is registered as running
+// in the services registry. Any unknown service returns 503 (correctly
+// matches the "Offline — Not running" state shown in the panel).
+// Map perf probe names → steward service IDs
+const PROBE_TO_STEWARD = {
+  local_intel: null,           // built-in, always ok
+  resonance: 'embeddings',
+  voice_shell: 'voice-shell',
+  augur: 'classifier',
+  cartographer: 'stack-scanner',
+  dream: 'dream',
+  archivist: 'consolidation',
+  scout: 'scout',
+  orchestrator: 'orchestrator',
+  evolution: 'evolution',
+  forge: 'autodev',
+  tether: 'tailscale',
+};
+
+function serviceProbeHandler(name) {
+  return (req, res) => {
+    try {
+      if (name === 'local_intel') {
+        return res.status(200).json({ ok: true, note: 'built-in' });
+      }
+
+      // Check real steward service status
+      const stewardId = PROBE_TO_STEWARD[name];
+      if (stewardId) {
+        const svc = getServiceStatus(stewardId);
+        if (svc && svc._status === 'running') {
+          return res.status(200).json({ ok: true, service: stewardId, status: 'running' });
+        }
+        const reason = svc?._lastError || svc?._status || 'not registered';
+        return res.status(503).json({ ok: false, error: reason, service: stewardId });
+      }
+
+      return res.status(503).json({ ok: false, error: 'no steward mapping' });
+    } catch (err) {
+      return res.status(503).json({ ok: false, error: String(err?.message || err) });
+    }
+  };
+}
+for (const name of [
+  'local_intel', 'resonance', 'voice_shell', 'augur', 'cartographer',
+  'dream', 'archivist', 'scout', 'orchestrator', 'evolution',
+  'forge', 'tether',
+]) {
+  app.get(`/api/v1/perf/probe/${name}`, serviceProbeHandler(name));
+}
+
+// Health check
+let _serverStartedAt = Date.now();
+// Internal: Carrier posts DB event rows here (Carrier has no DB, Craft does).
+// Used for #472 instrumentation — carrier_restart / craft_swap / etc. so the
+// next time a PTY dies (#457), the events table has the correlating timeline.
+app.post('/api/internal/event', async (req, res) => {
+  try {
+    const { session_id, event_type, data } = req.body || {};
+    if (!event_type) return res.status(400).json({ error: 'event_type required' });
+    const { logEvent } = await import('./db.js');
+    const id = logEvent(session_id || 'system', event_type, data ?? {});
+    res.json({ ok: true, id });
+  } catch (err) {
+    console.error('[internal/event] insert failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Internal: Carrier posts Phoenix notifications here (Carrier has no DB, Craft does)
+async function handleInternalNotify(req, res) {
+  try {
+    const { phoenixNotify, ensurePhoenixContact } = await import('./phoenix-notify.js');
+    ensurePhoenixContact();
+    const { service, subject, body, severity } = req.body || {};
+    if (!service || !subject || !body) return res.status(400).json({ error: 'service, subject, body required' });
+    const id = phoenixNotify(service, subject, body, { severity });
+    res.json({ ok: true, id });
+  } catch (err) {
+    console.error('[phoenix-notify] internal endpoint failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+}
+app.post('/api/internal/phoenix-notify', handleInternalNotify);
+app.post('/api/internal/phoenix-notify', handleInternalNotify);
+
+// Debug: check what Ollama URL is configured
+app.get('/api/v1/ollama-url', async (req, res) => {
+  const url = getOllamaUrl();
+  let reachable = false;
+  try {
+    const r = await fetch(`${url}/api/tags`, { signal: AbortSignal.timeout(5000) });
+    reachable = r.ok;
+  } catch {}
+  res.json({ url, reachable });
+});
+
+// Tailscale IP cache.
+//
+// Was: refreshed every 30s via two sequential execFile calls (full path then
+// PATH fallback). execFile's `timeout` option on Windows only sends SIGTERM,
+// which tailscale.exe routinely ignores during COM init — so the children
+// kept running, conhost.exe per child piled up, and a long-running Craft
+// accumulated hundreds of stuck Tailscale processes (observed: 413 conhost
+// at one point, ~5,760 spawns/day worst case). The 30s cadence was also
+// pointless: a machine's Tailscale IP basically never changes during a
+// process's lifetime.
+//
+// Now:
+//   - Single attempt per cycle (no fallback double-spawn).
+//   - 5-minute cadence (Tailscale IP is essentially static).
+//   - spawn + hard SIGKILL timer guarantees we never leak a child.
+//   - Skip refresh entirely if cache is fresh (extra safety against bursts).
+let _tailscaleIpCache = null;
+let _tailscaleIpFetchedAt = 0;
+const TAILSCALE_IP_REFRESH_MS = 5 * 60_000;
+const TAILSCALE_IP_HARD_KILL_MS = 4_000;
+
+function _refreshTailscaleIp() {
+  // Skip if cache is fresh — guards against rapid re-fires after sleep/wake.
+  if (_tailscaleIpCache && (Date.now() - _tailscaleIpFetchedAt) < TAILSCALE_IP_REFRESH_MS) return;
+
+  const tsExe = process.platform === 'win32'
+    ? 'C:\\Program Files\\Tailscale\\tailscale.exe'
+    : 'tailscale';
+  let done = false;
+  let proc;
+  const finish = (ip) => {
+    if (done) return; done = true;
+    try { proc?.kill('SIGKILL'); } catch {}
+    if (ip) { _tailscaleIpCache = ip; _tailscaleIpFetchedAt = Date.now(); }
+  };
+  try {
+    proc = spawnChild(tsExe, ['ip', '-4'], { windowsHide: true, shell: false });
+    const chunks = [];
+    proc.stdout?.on('data', (c) => chunks.push(c));
+    proc.on('error', () => finish(null));
+    proc.on('close', () => {
+      const ip = Buffer.concat(chunks).toString('utf-8').trim() || null;
+      finish(ip);
+    });
+    // Hard kill — even if Windows ignores SIGTERM during tailscale.exe COM
+    // init, SIGKILL terminates the handle immediately so conhost gets reaped.
+    setTimeout(() => finish(null), TAILSCALE_IP_HARD_KILL_MS);
+  } catch {
+    finish(null);
+  }
+}
+_refreshTailscaleIp();
+setInterval(_refreshTailscaleIp, TAILSCALE_IP_REFRESH_MS).unref();
+
+app.get('/health', (req, res) => {
+  const uptimeMs = Date.now() - _serverStartedAt;
+  const secs = Math.floor(uptimeMs / 1000);
+  const mins = Math.floor(secs / 60);
+  const hrs = Math.floor(mins / 60);
+  const uptime = hrs > 0 ? `${hrs}h ${mins % 60}m` : mins > 0 ? `${mins}m ${secs % 60}s` : `${secs}s`;
+
+  // Get current AI provider for dashboard labeling
+  let terminal_ai_provider = 'claude';
+  try {
+    const row = get("SELECT value FROM settings WHERE key = 'terminal_ai_provider'");
+    if (row && row.value) {
+      terminal_ai_provider = JSON.parse(row.value);
+    }
+  } catch {}
+
+  // Hub display name from settings (for installer UI)
+  let hubName = hostname(); // default to OS hostname
+  try {
+    const row = get("SELECT value FROM settings WHERE key = 'hub_name'");
+    if (row && row.value) hubName = JSON.parse(row.value);
+  } catch {}
+
+  res.json({
+    status: 'running',
+    timestamp: new Date().toISOString(),
+    startedAt: _serverStartedAt,
+    uptime,
+    tailscaleIp: _tailscaleIpCache,
+    hubName: hubName || 'Phoenix Hub',
+    mode: PHOENIX_MODE,
+    profile: PROFILE,
+    craftId: process.env.PHOENIX_CRAFT_ID || null,
+    craftVersion: 'A',
+    terminal_ai_provider
+  });
+});
+
+// Detailed deployment-mode info for debugging which features are gated.
+app.get('/api/v1/mode', (req, res) => {
+  res.json({ ...MODE_INFO, features: { pty: IS_USER_MODE, ahk: IS_USER_MODE, screenshots: IS_USER_MODE, hooks: true, api: true, db: true } });
+});
+
+// Library: unified browsable list of docs, memory, .phoenix files, reports
+app.get('/api/v1/library', (req, res) => {
+  try {
+    const ROOT = pathResolve(__dirname, '..', '..');
+    const items = [];
+
+    function walk(dir, type, baseRel) {
+      let entries;
+      try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+      for (const e of entries) {
+        if (e.name.startsWith('.') && e.name !== '.phoenix') continue;
+        if (e.name === 'node_modules') continue;
+        const full = join(dir, e.name);
+        const rel = baseRel ? join(baseRel, e.name) : e.name;
+        if (e.isDirectory()) {
+          walk(full, type, rel);
+        } else if (/\.(md|tex)$/i.test(e.name) || e.name === '.phoenix') {
+          let stat; try { stat = statSync(full); } catch { continue; }
+          let snippet = '';
+          try {
+            const buf = readFileSync(full, 'utf8');
+            snippet = buf.replace(/^---[\s\S]*?---/, '').replace(/[#>*`_\-]/g, '').trim().split('\n').find(l => l.trim()) || '';
+            if (snippet.length > 120) snippet = snippet.slice(0, 117) + '...';
+          } catch {}
+          items.push({
+            type,
+            title: e.name.replace(/\.(md|tex)$/i, '').replace(/[-_]/g, ' '),
+            path: full.replace(/\\/g, '/'),
+            rel: rel.replace(/\\/g, '/'),
+            modified: stat.mtimeMs,
+            snippet,
+          });
+        }
+      }
+    }
+
+    walk(join(ROOT, 'docs'), 'doc');
+    const claudeProjects = join(homedir(), '.claude', 'projects');
+    if (existsSync(join(claudeProjects, 'C--Users-owner-Desktop-Phoenix', 'memory'))) {
+      walk(join(claudeProjects, 'C--Users-owner-Desktop-Phoenix', 'memory'), 'memory');
+    } else if (existsSync(join(claudeProjects, 'C--Users-owner-Desktop-Phoenix', 'memory'))) {
+      walk(join(claudeProjects, 'C--Users-owner-Desktop-Phoenix', 'memory'), 'memory');
+    }
+    // .phoenix project files
+    try {
+      const phoenixFiles = ['.phoenix', 'service/.phoenix', 'CLAUDE.md'];
+      for (const f of phoenixFiles) {
+        const full = join(ROOT, f);
+        if (existsSync(full)) {
+          const stat = statSync(full);
+          items.push({ type: 'phoenix', title: f, path: full.replace(/\\/g, '/'), rel: f, modified: stat.mtimeMs, snippet: '' });
+        }
+      }
+    } catch {}
+
+    items.sort((a, b) => b.modified - a.modified);
+    res.json({ items, count: items.length });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+app.get('/api/v1/library/view', (req, res) => {
+  try {
+    const p = req.query.path;
+    if (!p || typeof p !== 'string') return res.status(400).send('missing path');
+    // Safety: only serve files under Phoenix root or claude memory dir
+    const ROOT = pathResolve(__dirname, '..', '..').replace(/\\/g, '/');
+    const MEM = join(homedir(), '.claude', 'projects').replace(/\\/g, '/');
+    const norm = pathResolve(p).replace(/\\/g, '/');
+    if (!norm.startsWith(ROOT) && !norm.startsWith(MEM)) return res.status(403).send('forbidden');
+    if (!existsSync(norm)) return res.status(404).send('not found');
+    const content = readFileSync(norm, 'utf8');
+    const escaped = content.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const title = basename(norm);
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.send(`<!doctype html><html><head><meta charset="utf-8"><title>${title}</title>
+<style>
+body{background:#0a0e14;color:#cdd6f4;font-family:ui-monospace,Consolas,monospace;font-size:13px;line-height:1.55;margin:0;padding:24px 32px;}
+h1{font-size:14px;color:#89b4fa;border-bottom:1px solid #313244;padding-bottom:8px;margin-top:0;}
+pre{white-space:pre-wrap;word-wrap:break-word;margin:0;}
+</style></head><body><h1>${title}</h1><pre>${escaped}</pre></body></html>`);
+  } catch (e) {
+    res.status(500).send(String(e));
+  }
+});
+
+// Auto-detect local model providers (Ollama, LM Studio)
+async function autoDetectLocalModels() {
+  const detected = [];
+
+  // Check Ollama (default port 11434)
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    const ollamaUrl = getOllamaUrl();
+    const res = await fetch(`${ollamaUrl}/api/tags`, { signal: controller.signal });
+    clearTimeout(timer);
+    if (res.ok) {
+      const data = await res.json();
+      const models = data.models || [];
+      console.log(`[Phoenix Setup] Ollama detected with ${models.length} models`);
+      for (const m of models) {
+        detected.push({
+          id: m.name || m.model,
+          name: (m.name || m.model).split(':')[0] + ' (Ollama)',
+          provider: 'ollama',
+          url: ollamaUrl,
+        });
+      }
+    }
+  } catch {}
+
+  // Check LM Studio (default port 1234)
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    const res = await fetch('http://localhost:1234/v1/models', { signal: controller.signal });
+    clearTimeout(timer);
+    if (res.ok) {
+      const data = await res.json();
+      const models = data.data || [];
+      console.log(`[Phoenix Setup] LM Studio detected with ${models.length} models`);
+      for (const m of models) {
+        detected.push({
+          id: m.id,
+          name: m.id + ' (LM Studio)',
+          provider: 'lmstudio',
+          url: 'http://localhost:1234',
+        });
+      }
+    }
+  } catch {}
+
+  if (detected.length === 0) {
+    console.log('[Phoenix Setup] No local model providers detected');
+    return;
+  }
+
+  // Sync detected models — replace stale entries, add new ones, remove gone ones
+  run("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('custom_models', :val, datetime('now','localtime'))", {
+    ':val': JSON.stringify(detected)
+  });
+  console.log(`[Phoenix Setup] Synced ${detected.length} local model(s) to providers`);
+
+  // If no default model is set, use the first detected one
+  const currentModel = get("SELECT value FROM settings WHERE key = 'ai_model'");
+  if (!currentModel || !currentModel.value || currentModel.value === '""') {
+    const firstModel = detected[0].id;
+    run("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('ai_model', :val, datetime('now','localtime'))", {
+      ':val': JSON.stringify(firstModel)
+    });
+    console.log(`[Phoenix Setup] Auto-set default model to: ${firstModel}`);
+  }
+}
+
+let server;
+let _startupIntervals = []; // Track intervals so soft restart can clear them
+
+function start() {
+  _serverStartedAt = Date.now();
+  // Clear any intervals from previous start (soft restart)
+  for (const id of _startupIntervals) clearInterval(id);
+  _startupIntervals = [];
+
+  return new Promise((resolve, reject) => {
+    server = app.listen(PORT, HOST, () => {
+      console.log(`[Phoenix] Service running on http://${HOST}:${PORT}`);
+      console.log(profileSummary());
+      console.log(`[Phoenix] Listening for Claude Code hooks...`);
+
+      // Eager-import router.js so first /api/v1/chat call doesn't pay
+      // ~1.5-3s cold-start cost (intuition + llm + thoughts + skills graph).
+      // Fire-and-forget — non-blocking, just warms the module cache.
+      import('./router.js').then(() => {
+        console.log('[Phoenix] router.js pre-warmed');
+      }).catch((err) => {
+        console.error('[Phoenix] router.js pre-warm failed:', err?.message || err);
+      });
+
+      // ── SHARED BOOT (prod + dev) ─────────────────────────────────
+      // Dev is an exact copy of prod on a different port + database.
+      // Only system-wide singletons (steward, device heartbeat) are
+      // skipped in dev — they're one-per-machine and would conflict
+      // with the running prod server.
+
+      // Start Phoenix Client WebSocket server — BEFORE terminal server so its upgrade
+      // handler runs first (terminal.js rejects unknown paths, client needs /ws/client).
+      if (!IS_CRAFT) {
+        startClientServer(server);
+      }
+
+      // Per-device push WS channel — /api/v1/device/push?device_id=X
+      // Registered after client server so /ws/client is already claimed.
+      {
+        const devicePushWss = new WsServer({ noServer: true });
+        server.on('upgrade', (req, socket, head) => {
+          const pathname = new URL(req.url, 'http://localhost').pathname;
+          if (pathname !== '/api/v1/device/push') return;
+          const params = new URL(req.url, 'http://localhost').searchParams;
+          const device_id = params.get('device_id') || 'unknown';
+          const org_id = params.get('org_id') || 'org_personal';
+          const device_type = params.get('device_type') || 'phone';
+          devicePushWss.handleUpgrade(req, socket, head, (ws) => {
+            ws.deviceId = device_id;
+            ws.orgId = org_id;
+            ws.deviceType = device_type;
+            devicePushSockets.set(device_id, ws);
+            ws.on('close', () => devicePushSockets.delete(device_id));
+            ws.on('message', (msg) => {
+              try {
+                const data = JSON.parse(msg);
+                if (data.type === 'ping') ws.send(JSON.stringify({ type: 'pong' }));
+              } catch {}
+            });
+            ws.send(JSON.stringify({ type: 'connected', device_id }));
+            console.log(`[Phoenix Push] Device connected: ${device_id} (${device_type})`);
+          });
+        });
+        console.log('[Phoenix Push] Device push WS ready on /api/v1/device/push');
+      }
+
+      // Start WebSocket terminal server (PTY sessions).
+      // Gated to user-session mode only — node-pty's ConPTY backend
+      // crashes with "AttachConsole failed" when there's no real
+      // console (Session 0 services).
+      // When running as Craft under Carrier, terminal is owned by Carrier — skip here.
+      if (IS_CRAFT) {
+        console.log('[Phoenix Craft] Terminal server SKIPPED — owned by Carrier');
+      } else if (IS_USER_MODE && featureEnabled('terminal_server')) {
+        // Standalone/dev mode owns its own terminal WS server (no Carrier).
+        (IS_DEV ? startDevTerminalServer(server) : startTerminalServer(server))
+          .catch(e => console.error('[Phoenix] Terminal init error:', e));
+      } else if (IS_USER_MODE) {
+        // wearable: browser xterm surface off; pipe mode over HTTP still serves the phone.
+        console.log(`[Phoenix] Terminal WS server SKIPPED — profile ${PROFILE} (pipe mode over HTTP still serves the phone)`);
+      } else {
+        console.log('[Phoenix] Terminal server SKIPPED — service mode (no console)');
+      }
+
+      // Sync projects with disk reality on startup — was running sync at boot,
+      // doing FS walks + DB writes for every project. Could take many seconds
+      // on machines with lots of projects and a large phoenix.db. Defer 5s after
+      // listen so /health doesn't sit behind it. The 10-min interval below
+      // keeps subsequent syncs on schedule.
+      setTimeout(() => {
+        try { syncProjects(); } catch (e) { console.warn('[Phoenix] syncProjects (deferred) failed:', e?.message); }
+      }, 5000);
+
+      // ── ONE-TIME EVENTS-INDEX BUILD (the actual root-cause fix) ──
+      //
+      // events.org_id was added via ALTER TABLE in the tier0-org-foundation
+      // migration. No index was created for it, so EVERY dashboard / Intuition
+      // / Steward query that filters by org_id (almost all of them) did a
+      // full table scan of a 1.6 GB events table. That's the single biggest
+      // contributor to the 170-220s event-loop blocks that survived every
+      // other patch.
+      //
+      // CREATE INDEX IF NOT EXISTS is idempotent — the first Craft that ever
+      // boots this code pays the build cost (~30-90s on the existing 1.6GB
+      // db), every Craft after that sees it as a no-op (a few ms).
+      //
+      // Deferred to +10s after listen so Craft's HTTP server is already up
+      // and Carrier has confirmed the swap before the index build starts.
+      // The build itself blocks the loop for its duration (sync better-sqlite3),
+      // but that's a one-time event the user experiences once.
+      setTimeout(() => {
+        try {
+          const t0 = Date.now();
+          // Composite (org_id, event_type) — leftmost-prefix means it covers
+          // BOTH "WHERE org_id = X" and "WHERE org_id = X AND event_type = Y"
+          // patterns with a single index.
+          console.log('[DB] Building idx_events_org_id_type (one-time, may take 30-60s on 1.6GB DB)...');
+          db.exec(`CREATE INDEX IF NOT EXISTS idx_events_org_id_type ON events(org_id, event_type)`);
+          console.log(`[DB] idx_events_org_id_type built in ${Date.now() - t0}ms`);
+          const t1 = Date.now();
+          // (org_id, created_at DESC) for "WHERE org_id = X ORDER BY created_at DESC LIMIT N"
+          // — the dominant pattern for dashboard event-list panels.
+          console.log('[DB] Building idx_events_org_id_created (one-time)...');
+          db.exec(`CREATE INDEX IF NOT EXISTS idx_events_org_id_created ON events(org_id, created_at DESC)`);
+          console.log(`[DB] idx_events_org_id_created built in ${Date.now() - t1}ms`);
+          // memory_items.event_id — the classifier (Augur) runs every 5 min and
+          // does `LEFT JOIN memory_items m ON m.event_id = e.id WHERE m.id IS NULL`
+          // to find unprocessed events. Without this index, that anti-join does
+          // a full scan of memory_items for every candidate event — observed to
+          // block the loop for 3 minutes every 5 minutes. THE second 5-min trigger
+          // (first one was the /api/stats background ticker I already killed).
+          const t2 = Date.now();
+          console.log('[DB] Building idx_memory_event_id (one-time)...');
+          db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_event_id ON memory_items(event_id)`);
+          console.log(`[DB] idx_memory_event_id built in ${Date.now() - t2}ms`);
+          console.log(`[DB] All deferred indexes complete in ${Date.now() - t0}ms total — subsequent boots no-op`);
+        } catch (e) {
+          console.error('[DB] Events index build failed:', e?.message);
+        }
+      }, 10_000);
+
+      // Incognito TTL cleanup — defer 10s. It's just a DB delete on stale rows,
+      // never time-critical at boot. The 5-min interval still runs.
+      setTimeout(() => {
+        try { cleanupExpiredIncognito(); } catch {}
+      }, 10_000);
+      _startupIntervals.push(setInterval(cleanupExpiredIncognito, 5 * 60 * 1000));
+
+      // ── MEMORY HEALTH MONITOR — every 2 minutes ──────────────────
+      // Tracks Node.js heap usage and alerts if it crosses thresholds.
+      // This is the first autodev mechanism: Phoenix monitors itself.
+      const HEAP_WARN_MB = 300;
+      const HEAP_CRITICAL_MB = 500;
+      let _lastMemAlert = 0;
+      function _checkMemoryHealth() {
+        const mem = process.memoryUsage();
+        const heapMB = Math.round(mem.heapUsed / 1024 / 1024);
+        const rssMB = Math.round(mem.rss / 1024 / 1024);
+        const extMB = Math.round((mem.external || 0) / 1024 / 1024);
+        // Log every check so we can spot trends
+        console.log(`[Phoenix Health] Memory: heap=${heapMB}MB rss=${rssMB}MB ext=${extMB}MB`);
+        const now = Date.now();
+        if (heapMB > HEAP_CRITICAL_MB && (now - _lastMemAlert) > 600000) {
+          _lastMemAlert = now;
+          try {
+            createAlert({
+              alert_type: 'memory_critical',
+              severity: 'critical',
+              title: `Memory critical: ${heapMB}MB heap`,
+              detail: `RSS=${rssMB}MB, External=${extMB}MB. Server may become unresponsive. Consider restarting.`,
+            });
+          } catch {}
+          console.error(`[Phoenix Health] CRITICAL: heap=${heapMB}MB exceeds ${HEAP_CRITICAL_MB}MB threshold`);
+        } else if (heapMB > HEAP_WARN_MB && (now - _lastMemAlert) > 1800000) {
+          _lastMemAlert = now;
+          try {
+            createAlert({
+              alert_type: 'memory_warning',
+              severity: 'warning',
+              title: `Memory warning: ${heapMB}MB heap`,
+              detail: `RSS=${rssMB}MB, External=${extMB}MB. Trending high — monitor for leaks.`,
+            });
+          } catch {}
+          console.warn(`[Phoenix Health] WARNING: heap=${heapMB}MB exceeds ${HEAP_WARN_MB}MB threshold`);
+        }
+      }
+      _checkMemoryHealth(); // Run on startup
+      _startupIntervals.push(setInterval(_checkMemoryHealth, 2 * 60 * 1000));
+
+      // ── BOOT TIMING ──────────────────────────────────────────────
+      // Wrap each sync boot step with a duration log. If any step blocks
+      // the event loop > 500ms it shows up immediately in carrier-piped
+      // logs and the diagnostic perf endpoint. Without this, slow boot
+      // is invisible — Craft just appears "not ready" with no clue why.
+      function _bootStep(label, fn) {
+        const t0 = performance.now();
+        try { fn(); } catch (e) { console.error(`[boot-step ${label}] threw: ${e?.message}`); }
+        const ms = Math.round(performance.now() - t0);
+        if (ms > 500) console.warn(`[boot-step] ${label}: ${ms}ms  ⚠ blocks event loop`);
+        else if (ms > 50) console.log(`[boot-step] ${label}: ${ms}ms`);
+      }
+
+      // Tier 0 Phase 6 — Verify audit chain integrity on startup and every 1 hour
+      function _verifyAuditChains() {
+        try {
+          const chainResult = verifyAllAuditChains();
+          if (chainResult.valid) {
+            console.log(`[Phoenix Audit] Chain OK — ${chainResult.entries_checked} entries across ${chainResult.orgs_checked} org(s)`);
+          } else {
+            console.warn(`[Phoenix Audit] CHAIN BROKEN at entry ${chainResult.broken_at} (${chainResult.reason}) in org ${chainResult.org_id}`);
+            // Auto-repair: re-sign the chain with the current key (key rotation or regeneration)
+            try {
+              const repair = resignAuditChain(chainResult.org_id);
+              console.log(`[Phoenix Audit] Chain repaired — re-signed ${repair.fixed}/${repair.total} entries in org ${chainResult.org_id}`);
+              // Verify again after repair
+              const recheck = verifyAllAuditChains();
+              if (recheck.valid) {
+                console.log(`[Phoenix Audit] Chain verified OK after repair`);
+              } else {
+                console.error(`[Phoenix Audit] Chain still broken after repair — creating alert`);
+                try { createAlert({ alert_type: 'audit_chain_broken', severity: 'critical', title: 'Audit chain integrity broken', detail: `Entry ${recheck.broken_at}: ${recheck.reason} in org ${recheck.org_id} (repair failed)` }); } catch {}
+              }
+            } catch (repairErr) {
+              console.error('[Phoenix Audit] Chain repair failed:', repairErr.message);
+              try { createAlert({ alert_type: 'audit_chain_broken', severity: 'critical', title: 'Audit chain integrity broken', detail: `Entry ${chainResult.broken_at}: ${chainResult.reason} in org ${chainResult.org_id}` }); } catch {}
+            }
+          }
+        } catch (e) {
+          console.error('[Phoenix Audit] Chain verification failed:', e.message);
+        }
+      }
+      // Audit chain verification — was running sync at boot, but on a 1.6GB DB
+      // with millions of audit entries this can chew seconds of sync CPU.
+      // Defer 15s after listen so /health responds promptly; the 1-hour cadence
+      // means we lose ~no integrity guarantee from a 15s delay.
+      setTimeout(() => _verifyAuditChains(), 15_000);
+      _startupIntervals.push(setInterval(_verifyAuditChains, 60 * 60 * 1000)); // every 1 hour
+
+      // Tier 0 Phase 8 — Start background personal data sync (every 1 hour)
+      if (featureEnabled('personal_sync')) startPersonalSync(60 * 60 * 1000);
+
+      // Migrate timestamp-based tab session IDs to stable name-based IDs.
+      // e.g. "dash-pan-1775843785916" → "dash-pan-main" (derived from tab_name).
+      // This runs once — stable IDs don't change, so future boots are no-ops.
+      _bootStep('migrate_tab_session_ids', () => {
+        const openTabs = all("SELECT ot.id, ot.session_id, ot.tab_name, p.name as project_name FROM open_tabs ot LEFT JOIN projects p ON p.id = ot.project_id WHERE ot.closed_at IS NULL");
+        for (const t of openTabs) {
+          if (t.session_id && /^dash-.*\d{10,}$/.test(t.session_id)) {
+            const name = (t.tab_name || t.project_name || 'shell').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+            const stableId = 'dash-' + name;
+            run("UPDATE open_tabs SET session_id = :newId WHERE id = :tabId", { ':newId': stableId, ':tabId': t.id });
+            console.log(`[Phoenix] Migrated tab "${t.tab_name}" session: ${t.session_id} → ${stableId}`);
+          }
+        }
+      });
+
+      // Chat schema (contacts, threads, messages, calls)
+      _bootStep('ensureChatSchema',    () => ensureChatSchema(db));
+      _bootStep('initEmail',           () => initEmail(db));
+      _bootStep('ensureWrapSchema',    () => ensureWrapSchema(db));
+      _bootStep('ensureMsgPrefsSchema', () => ensureMessagingPrefsSchema(db));
+      _bootStep('ensureIntuitionSchema', () => ensureIntuitionSchema(db));
+
+      // Identity schema — clusters + per-frame observations for multi-modal person identification
+      _bootStep('identity_schema_ddl', () => db.exec(`
+        CREATE TABLE IF NOT EXISTS identity_clusters (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          label TEXT,
+          hair_length TEXT, hair_color TEXT, hair_type TEXT,
+          skin_tone TEXT, facial_hair TEXT, age_range TEXT,
+          eye_color TEXT, lip_fullness TEXT, nose_bridge TEXT,
+          forehead TEXT, build TEXT, distinctive TEXT,
+          voice_profile TEXT,
+          observation_count INTEGER DEFAULT 0,
+          confidence REAL DEFAULT 0.0,
+          last_seen_at TEXT,
+          created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS identity_observations (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          cluster_id INTEGER REFERENCES identity_clusters(id),
+          camera TEXT,
+          hair_length TEXT, hair_color TEXT, hair_type TEXT,
+          skin_tone TEXT, facial_hair TEXT, age_range TEXT,
+          eye_color TEXT, lip_fullness TEXT, nose_bridge TEXT,
+          forehead TEXT, build TEXT, distinctive TEXT,
+          emotion TEXT, note TEXT,
+          match_score REAL,
+          created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_identity_obs_cluster ON identity_observations(cluster_id);
+        CREATE INDEX IF NOT EXISTS idx_identity_obs_created ON identity_observations(created_at);
+      `));
+
+      // T1 Foundation: device ownership + identity binding + capabilities + aliases.
+      // MUST run AFTER identity_clusters is created above (adds user_id column).
+      _bootStep('ensureOwnershipSchema', () => ensureOwnershipSchema(db));
+
+      // Seed sensor definitions (22 sensors)
+      _bootStep('seedSensors', () => seedSensors());
+
+      // Auto-detect local model providers (Ollama, LM Studio) — async, just kicked off
+      autoDetectLocalModels();
+
+      // Plugin setup — install Claude Code plugins + wire hooks (idempotent, runs in background)
+      import('./setup-plugins.js').then(m => m.setupPlugins()).catch(e =>
+        console.warn('[Phoenix] Plugin setup skipped:', e.message)
+      );
+
+      // Conv-state watcher — stays at boot. In-memory only, ~no cost, but
+      // the router needs it from the first request.
+      try { startConvStateWatcher(); } catch (e) { console.warn('[Phoenix] conv-state watcher failed to start:', e?.message); }
+
+      // ── POST-BOOT STAGGER (task #60) ─────────────────────────────────────
+      // Everything below was firing in parallel at boot, all importing heavy
+      // modules (face-api, tfjs-node, FFmpeg, vision pipelines) and racing
+      // for the CPU at exactly the moment Carrier needed the perf probe to
+      // come back green. Observed result: 167-second event-loop freeze during
+      // every Craft boot. Symptom users saw: a 2-3 minute dead dashboard
+      // after every swap.
+      //
+      // The fix: defer these to +20 seconds after boot, so Carrier confirms
+      // the swap with a clean baseline, the dashboard's first paint completes,
+      // and these watchers come online quietly after the user is already
+      // working. None are time-critical — screen captures, dashboard vision
+      // verifier, etc. all run on multi-second polls anyway, so a 20s
+      // late start is invisible. The cost is the first webcam/screen sample
+      // shows up ~20s later than before; nothing else changes.
+      const POST_BOOT_DELAY_MS = 20_000;
+      if (!IS_DEV) {
+        setTimeout(() => {
+          console.log('[Phoenix] post-boot stagger firing — starting deferred watchers');
+          // Capture consent (SHIP-PLAN Phase 4) — camera / screen / activity
+          // start per the user's saved consent + profile defaults, resolved in
+          // capture-consent.js. identity (camera) is OFF unless opted in;
+          // screen + activity default on in full, off in core. All toggleable
+          // live from /privacy without a restart. All DEGRADE-class
+          // (Phoenix-DEPENDENCY-MAP §4) so any of them being off never crashes
+          // intuition or the router — presence just comes from whatever's left on.
+          try { applyCaptureConsentAtBoot(); } catch (e) { console.warn('[Capture] boot apply failed:', e?.message); }
+
+          if (featureEnabled('remote_screen')) {
+            import('./remote-screen-watcher.js').then(m => m.startRemoteScreenWatcher()).catch(() => {});
+          }
+          if (featureEnabled('dashboard_watchdog')) {
+            try { startWatchdog(); } catch (e) { console.warn('[Phoenix] watchdog start failed:', e?.message); }
+          }
+          if (featureEnabled('dashboard_health')) {
+            import('./dashboard-render-health.js')
+              .then(m => m.startDashboardRenderHealth())
+              .catch(e => console.warn('[DashboardRenderHealth] failed to start:', e.message));
+          }
+          if (featureEnabled('vision_verifier')) {
+            import('./dashboard-vision-verifier.js')
+              .then(m => m.startDashboardVisionVerifier())
+              .catch(e => console.warn('[VisionVerifier] failed to start:', e.message));
+          }
+          if (featureEnabled('forge_dashboard')) {
+            import('./forge-dashboard.js')
+              .then(m => m.startForgeDashboard())
+              .catch(e => console.warn('[ForgeDashboard] failed to start:', e.message));
+          }
+          // Home Assistant event stream. No-ops when hass_token is unset, so a
+          // hub with no smart home pays nothing. Reconnects itself with
+          // backoff, except on auth_invalid where retrying is pointless.
+          import('./home-assistant.js')
+            .then(m => m.startHaEventStream())
+            .then(r => { if (r?.started) console.log('[HA] event stream started'); })
+            .catch(e => console.warn('[HA] event stream failed to start:', e.message));
+        }, POST_BOOT_DELAY_MS);
+      }
+
+      // Re-sync projects every 10 minutes (picks up renames, new .phoenix files)
+      _startupIntervals.push(setInterval(syncProjects, 10 * 60 * 1000));
+
+      // ── Hub PC heartbeat — runs in ALL modes (Craft, non-Craft, prod) ──────────
+      // The hub machine is always online since it's running the server. We update
+      // last_seen every 30s so the dashboard never shows it as stale (STALE=5min).
+      // This must NOT be in the !IS_CRAFT block — server.js always runs as a Craft.
+      if (!IS_DEV) {
+        const pcHost = hostname();
+        const existingHub = get("SELECT * FROM devices WHERE hostname = :h", { ':h': pcHost });
+
+        // BOOT FAST PATH: register/heartbeat IMMEDIATELY using hostname.
+        // The wmic call to get the hardware model was execSync with 3s timeout,
+        // but Windows WMI can stall far longer under load — observed to add
+        // 10-20s to Craft boot, contributing to the dashboard "loading..." after
+        // every swap. Run wmic async AFTER the immediate insert, then UPDATE
+        // the row when (or if) the model comes back. User never sees the gap.
+        if (!existingHub) {
+          insert(`INSERT INTO devices (hostname, name, device_type, capabilities, last_seen, org_id, online)
+            VALUES (:h, :name, 'pc', '["terminal","files","browser","apps"]', datetime('now','localtime'), 'org_personal', 1)`,
+            { ':h': pcHost, ':name': pcHost });
+          console.log(`[Phoenix] Registered hub PC: ${pcHost} (resolving model async)`);
+        } else {
+          run("UPDATE devices SET last_seen = datetime('now','localtime'), online = 1 WHERE hostname = :h", { ':h': pcHost });
+        }
+        // Async hardware-model lookup. Fires-and-forgets; updates the row when ready.
+        if (process.platform === 'win32') {
+          execFile('wmic', ['computersystem', 'get', 'model', '/value'],
+            { windowsHide: true, timeout: 8000, killSignal: 'SIGKILL' },
+            (err, stdout) => {
+              if (err || !stdout) return;
+              const model = stdout.toString().match(/Model=(.+)/)?.[1]?.trim();
+              if (!model || model === 'System Product Name' || model.length <= 2) return;
+              try {
+                // Only auto-fill name if it's still the raw hostname (never been manually named).
+                const row = get("SELECT name, hostname FROM devices WHERE hostname = :h", { ':h': pcHost });
+                if (row && row.name === row.hostname) {
+                  run("UPDATE devices SET device_type = 'pc', name = :name WHERE hostname = :h",
+                    { ':h': pcHost, ':name': model });
+                  console.log(`[Phoenix] Hub PC model resolved: ${model}`);
+                }
+              } catch {}
+            });
+        }
+
+        _startupIntervals.push(setInterval(() => {
+          try {
+            run("UPDATE devices SET last_seen = datetime('now','localtime'), online = 1 WHERE hostname = :h", { ':h': pcHost });
+          } catch {}
+        }, 30 * 1000)); // 30s — well under 5min STALE threshold
+      }
+
+      if (IS_DEV) {
+        // ── DEV-ONLY ──────────────────────────────────────────────────
+        // Full server copy — terminal, dashboard, all routes — just no
+        // system-wide singletons that would fight with prod.
+        console.log('[Phoenix DEV] Full server on port ' + PORT + ' (terminal + dashboard + API)');
+        console.log('[Phoenix DEV] Skipping: steward, device heartbeat');
+        console.log(`[Phoenix DEV] Dashboard: http://localhost:${PORT}`);
+      } else {
+        // ── PROD-ONLY (always runs as Craft in the three-tier architecture) ─────
+
+        // Phase 3: panel-broadcaster — DISABLED by default.
+        //
+        // The original design polled Craft's OWN routes via loopback HTTP
+        // every 10-60s for each topic. With dashboard tabs open, that put
+        // 6 extra concurrent handler invocations on the main thread per
+        // cycle, competing with real user traffic. Net effect was making
+        // the dashboard SLOWER, not faster. Phase 2's SWR cache already
+        // handles the "instant on tab switch" UX without server-side push.
+        //
+        // Set PAN_ENABLE_PANEL_BROADCASTER=1 to re-enable for testing once
+        // the broadcaster is refactored to read panel data DIRECTLY from
+        // the route handlers' module-level caches instead of via HTTP.
+        if (process.env.PHOENIX_ENABLE_PANEL_BROADCASTER === '1') {
+          import('./panel-broadcaster.js')
+            .then(m => m.startPanelBroadcaster())
+            .catch(err => console.warn('[Phoenix] panel-broadcaster failed to start:', err.message));
+        }
+
+        // Hybrid memory search: backfill embeddings.
+        //
+        // Schedule MUCH more conservatively than before:
+        //   - 90s startup delay (was 10s). Every Craft swap restarted the
+        //     backfill from scratch and pinned CPU at 96% within seconds,
+        //     starving Carrier's perf probes AND vision/intuition Ollama
+        //     calls — which triggered another auto-rollback, another fresh
+        //     Craft, repeat ad infinitum. Result: 20k pending events never
+        //     actually finished. 90s gives Carrier's 30s rollback window
+        //     plenty of slack to confirm the swap before any vec0 writes start.
+        //   - PAN_DISABLE_EMBEDDINGS_BACKFILL env var honors a complete pause
+        //     for users who want maximum dashboard responsiveness over
+        //     completing the index. Set to "1" to skip the auto-start entirely
+        //     (you can still trigger it manually via the MCP `pan_dev` /
+        //     embeddings endpoint).
+        if (process.env.PHOENIX_DISABLE_EMBEDDINGS_BACKFILL !== '1') {
+          setTimeout(() => {
+            backfillEmbeddings('main', 2)
+              .then(r => console.log(`[Phoenix MemorySearch] backfill: +${r.added} embeddings (${r.indexed}/${r.total})`))
+              .catch(err => console.warn('[Phoenix MemorySearch] backfill error:', err.message));
+          }, 90_000);
+        } else {
+          console.log('[Phoenix MemorySearch] backfill auto-start DISABLED via PAN_DISABLE_EMBEDDINGS_BACKFILL=1');
+        }
+
+        // Clean up stale Tailscale pan-* nodes on startup (delay to let Tailscale stabilize)
+        if (featureEnabled('tailscale_cleanup')) {
+          setTimeout(() => cleanupStaleTailscaleNodes(), 30000);
+        }
+
+        // Auto-establish a public tunnel so any new device can scan the QR code
+        // from anywhere — no Tailscale enrollment, no config, no user action needed.
+        // Priority: Tailscale Funnel (best) → Cloudflare Quick Tunnel (zero-config) → LAN IP
+        if (featureEnabled('public_tunnel')) {
+          setTimeout(async () => {
+            // 1. Try Tailscale Funnel (already set up users get this for free)
+            try {
+              execSync(`tailscale funnel ${PORT}`, { timeout: 5000, windowsHide: true, stdio: 'pipe' });
+              console.log(`[Phoenix] Tailscale Funnel active — QR codes use public ts.net URL`);
+              return; // Done — Tailscale Funnel handles it
+            } catch {
+              // Tailscale not running, or Funnel not enabled in admin console — try Cloudflare
+            }
+
+            // 2. Fall back to Cloudflare Quick Tunnel — zero config, downloads binary automatically
+            const cfURL = await startCloudflareTunnel(PORT);
+            if (cfURL) {
+              console.log(`[Phoenix] Cloudflare Tunnel active — QR codes use ${cfURL}`);
+            } else {
+              console.log('[Phoenix] No public tunnel available — QR codes will use LAN IP (same network only)');
+            }
+          }, 5000); // Delay 5s to let Tailscale daemon stabilize after boot
+        }
+
+        // UDP discovery responder — lets the installer find this hub on LAN/Tailscale
+        // without manual IP entry. Installer broadcasts "PHOENIX_DISCOVER", we reply.
+        if (featureEnabled('lan_discovery')) startDiscovery(PORT, '0.3.1');
+
+        // Ensure Windows Firewall allows inbound on PORT so LAN discovery works.
+        // Was execFileSync — netsh under heavy CPU load can block 3-8 seconds,
+        // which mattered during Craft boot (added to the 167s startup freeze).
+        // It's idempotent (returns "rule already exists" for re-adds), so we
+        // fire-and-forget. The rule exists after the first successful boot
+        // anyway; this is mostly a no-op on subsequent boots.
+        if (featureEnabled('firewall_rule')) {
+          try {
+            execFile('netsh', [
+              'advfirewall', 'firewall', 'add', 'rule',
+              `name=Phoenix Hub (${PORT})`, 'dir=in', 'action=allow',
+              'protocol=TCP', `localport=${PORT}`, 'profile=private,domain'
+            ], { windowsHide: true, timeout: 8000, killSignal: 'SIGKILL' }, () => {});
+          } catch { /* rule may already exist or not on Windows */ }
+        }
+
+        // Daily 3am benchmark — runs ALL 12 suites sequentially on the active model.
+        // Headless: all output → %LOCALAPPDATA%/Phoenix/data/benchmark.log via bmLog().
+        // Results land in `ai_benchmark` table (AutoDev panel). Failures still fire Scout.
+        // User explicitly asked these never print to the dashboard terminal (2026-05-26).
+        {
+          async function runDailyBenchmarks() {
+            try {
+              const { runBenchmark, BENCHMARK_SUITES, benchmarkLogPath } = await import('./benchmark.js');
+              const modelRow = get("SELECT value FROM settings WHERE key = 'ai_model'");
+              const model = modelRow ? modelRow.value.replace(/^"|"$/g, '') : 'cerebras:qwen-3-235b';
+              // Lazy import of bmLog via the module's file-logger
+              const fs = await import('fs');
+              const ts = () => new Date().toISOString();
+              const logLine = (lvl, msg) => { try { fs.appendFileSync(benchmarkLogPath(), `${ts()} ${lvl} ${msg}\n`, 'utf8'); } catch {} };
+              logLine('INFO ', `[Phoenix Benchmark] Daily 3am — running all ${BENCHMARK_SUITES.length} suites on model: ${model}`);
+              for (const suite of BENCHMARK_SUITES) {
+                try {
+                  await runBenchmark(suite, model);
+                } catch (e) {
+                  logLine('ERROR', `[Phoenix Benchmark] Daily suite "${suite}" failed: ${e.message}`);
+                }
+              }
+              logLine('INFO ', '[Phoenix Benchmark] Daily run complete');
+            } catch (e) {
+              // Last-resort: still file-log; never spam stdout.
+              try {
+                const fs = await import('fs');
+                const { benchmarkLogPath } = await import('./benchmark.js');
+                fs.appendFileSync(benchmarkLogPath(), `${new Date().toISOString()} ERROR [Phoenix Benchmark] Daily run failed: ${e.message}\n`, 'utf8');
+              } catch {}
+            }
+          }
+
+          async function scheduleDailyBenchmark() {
+            const now = new Date();
+            const next3am = new Date(now);
+            next3am.setHours(3, 0, 0, 0);
+            if (next3am <= now) next3am.setDate(next3am.getDate() + 1);
+            const msUntil3am = next3am - now;
+            setTimeout(async () => {
+              await runDailyBenchmarks();
+              setInterval(runDailyBenchmarks, 24 * 60 * 60 * 1000);
+            }, msUntil3am);
+            // Scheduler boot message → file only.
+            try {
+              const fs = await import('fs');
+              const { benchmarkLogPath } = await import('./benchmark.js');
+              fs.appendFileSync(benchmarkLogPath(), `${new Date().toISOString()} INFO  [Phoenix Benchmark] Daily run scheduled for 3am (in ${Math.round(msUntil3am / 60000)}m) — all 12 suites\n`, 'utf8');
+            } catch {}
+          }
+          if (featureEnabled('benchmarks_daily')) scheduleDailyBenchmark();
+        }
+
+        // Steward boots all background services in dependency order.
+        bootAll().catch(err => console.error('[Steward] Boot error:', err.message));
+
+        // Smart Steward — the LLM-driven autonomous supervisor that watches
+        // for problems Steward's fast-path can't fix on its own (e.g. a
+        // remote service down for hours, a watchdog failing in a loop, a
+        // service requiring human-decisioned action). 5-minute tick, uses
+        // Claude (not Cerebras) for careful reasoning. See smart-steward.js
+        // header for the full design + safety model.
+        if (featureEnabled('smart_steward')) {
+          import('./smart-steward.js').then(({ startSmartSteward }) => {
+            try { startSmartSteward(); } catch (e) { console.warn('[SmartSteward] startup failed:', e.message); }
+          }).catch(e => console.warn('[SmartSteward] import failed:', e.message));
+        }
+
+        // Claude Control — the always-on background Claude PTY dedicated to
+        // computer-control tasks. Separate from the dashboard terminal stack
+        // (which the user has stopped using). Voice/router dispatches
+        // computer-control intents to this PTY via the send-to-claude skill.
+        // Module-level state survives Craft swap; spawn is idempotent.
+        if (featureEnabled('claude_control')) {
+          import('./claude-control.js').then(({ startClaudeControl }) => {
+            try { startClaudeControl(); } catch (e) { console.warn('[ClaudeControl] startup failed:', e.message); }
+          }).catch(e => console.warn('[ClaudeControl] import failed:', e.message));
+        }
+      }
+
+      // Resume restart test if one was in progress before we died
+      resumeRestartTest().catch(err => console.error('[Phoenix Tests] Resume failed:', err.message));
+
+      resolve(server);
+    });
+    server.on('error', (err) => {
+      if (err.code === 'EADDRINUSE') {
+        // Retry with delay — port may be in TIME_WAIT from previous process
+        if (!server._retryCount) server._retryCount = 0;
+        server._retryCount++;
+        if (server._retryCount <= 15) {
+          console.log(`[Phoenix] Port ${PORT} in use — retry ${server._retryCount}/15 in 2s...`);
+          setTimeout(() => server.listen(PORT, HOST), 2000);
+          return;
+        }
+        console.error(`[Phoenix] Port ${PORT} still in use after 15 retries (30s). Exiting.`);
+        process.exit(1);
+        return;
+      }
+      reject(err);
+    });
+  });
+}
+
+async function stop() {
+  // Kill every tracked PTY child first on graceful shutdown.
+  // Two-phase: broadcast server_restarting FIRST, wait 200ms for WS
+  // delivery, THEN kill PTYs. This ensures the frontend receives the
+  // flag before the connection drops — without it, wasServerRestart is
+  // false and Claude never auto-relaunches after restart.
+  try {
+    const n = await killAllSessions();
+    if (n) console.log(`[Phoenix] Killed ${n} tracked PTY session(s) on shutdown`);
+  } catch (e) {
+    console.warn(`[Phoenix] killAllSessions failed: ${e.message}`);
+  }
+  shutdownAll();
+  stopPersonalSync();
+  return new Promise((resolve) => {
+    if (server) {
+      let resolved = false;
+      const done = () => { if (!resolved) { resolved = true; resolve(); } };
+      server.close(done);
+      // Force-destroy all open connections so server.close() doesn't hang on keep-alive/websockets
+      if (server._connections || server.connections) {
+        try { server.closeAllConnections(); } catch {}
+      }
+      // Safety net — force resolve after 3 seconds
+      setTimeout(done, 3000);
+    } else {
+      resolve();
+    }
+  });
+}
+
+// Graceful shutdown — kill all background jobs and close the port
+async function gracefulShutdown(signal) {
+  console.log(`\n[Phoenix] ${signal} received — shutting down...`);
+  await stop();
+  process.exit(0);
+}
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGHUP', () => gracefulShutdown('SIGHUP'));
+
+// Catch unhandled errors so the server doesn't crash and kill all PTY sessions
+// Debounce alerts for repeated errors (EPIPE, etc.) — max 1 alert per error type per 60s
+const _alertDebounce = new Map();
+function debouncedAlert(alertType, severity, title, detail) {
+  const key = alertType + ':' + title;
+  const now = Date.now();
+  const last = _alertDebounce.get(key) || 0;
+  if (now - last < 60000) return; // skip if same alert fired <60s ago
+  _alertDebounce.set(key, now);
+  // Cleanup old keys every 100 entries
+  if (_alertDebounce.size > 100) {
+    for (const [k, t] of _alertDebounce) { if (now - t > 120000) _alertDebounce.delete(k); }
+  }
+  try { createAlert({ alert_type: alertType, severity, title, detail }); } catch {}
+}
+
+process.on('uncaughtException', (err) => {
+  // EPIPE = broken pipe (writing to dead process) — harmless, don't spam alerts
+  if (err.code === 'EPIPE') return;
+  console.error(`[Phoenix] Uncaught exception (server kept alive):`, err);
+  debouncedAlert('uncaught_exception', 'critical',
+    `Uncaught exception: ${err.message?.slice(0, 100)}`,
+    JSON.stringify({ message: err.message, stack: err.stack, time: new Date().toISOString() })
+  );
+});
+process.on('unhandledRejection', (reason) => {
+  try {
+  const msg = String(reason);
+  // EPIPE in rejections too
+  if (msg.includes('EPIPE')) return;
+  console.error(`[Phoenix] Unhandled rejection (server kept alive):`, reason);
+  debouncedAlert('unhandled_rejection', 'warning',
+    `Unhandled rejection: ${msg?.slice(0, 100)}`,
+    JSON.stringify({ reason: msg, stack: reason?.stack, time: new Date().toISOString() })
+  );
+  } catch {}
+});
+
+// ==================== UI Commands (dashboard frontend polls this, not Electron main) ====================
+const uiCommandQueue = [];
+
+app.get('/api/v1/ui-commands', (req, res) => {
+  const cmds = uiCommandQueue.splice(0);
+  res.json(cmds);
+});
+
+app.post('/api/v1/ui-commands', async (req, res) => {
+  const cmd = req.body;
+  if (!cmd || !cmd.type) return res.status(400).json({ error: 'type required' });
+  // Route window commands to Tauri shell
+  if (cmd.type === 'open_window') {
+    tauriFetch('/open', { method: 'POST', body: JSON.stringify(cmd) }).catch(() => {});
+  } else if (cmd.type === 'focus_window') {
+    tauriFetch('/focus', { method: 'POST', body: JSON.stringify(cmd) }).catch(() => {});
+  } else if (cmd.type === 'close_window') {
+    tauriFetch('/close', { method: 'POST', body: JSON.stringify(cmd) }).catch(() => {});
+  } else if (cmd.type === 'screenshot') {
+    tauriFetch('/screenshot', { method: 'POST', body: JSON.stringify({ windowId: cmd.windowId || null }) }).catch(() => {});
+  }
+  uiCommandQueue.push(cmd);
+  res.json({ ok: true });
+});
+
+// ==================== Tauri Shell (port 7790) — direct HTTP, no polling ====================
+const TAURI_URL = 'http://127.0.0.1:7790';
+
+async function tauriFetch(path, options = {}) {
+  const res = await fetch(`${TAURI_URL}${path}`, {
+    ...options,
+    headers: { 'Content-Type': 'application/json', ...options.headers },
+    signal: AbortSignal.timeout(10000),
+  });
+  return res.json();
+}
+
+// Screenshot (full screen)
+app.get('/api/v1/screenshot', async (req, res) => {
+  try {
+    const windowId = req.query.window || null;
+    const result = await tauriFetch('/screenshot', {
+      method: 'POST',
+      body: JSON.stringify({ windowId }),
+    });
+    res.json(result);
+  } catch (err) {
+    res.json({ ok: false, error: `Tauri shell not responding: ${err.message}` });
+  }
+});
+
+// List all Tauri windows
+app.get('/api/v1/windows', async (req, res) => {
+  try {
+    const result = await tauriFetch('/windows');
+    res.json(result);
+  } catch (err) {
+    res.json({ ok: false, error: `Tauri shell not responding: ${err.message}` });
+  }
+});
+
+// Open window
+app.post('/api/v1/windows/open', async (req, res) => {
+  try {
+    const result = await tauriFetch('/open', {
+      method: 'POST',
+      body: JSON.stringify({ url: req.body.url, title: req.body.title }),
+    });
+    console.log(`[Phoenix Windows] Opened: ${req.body.url} → ${result.windowId}`);
+    res.json(result);
+  } catch (err) {
+    res.json({ ok: false, error: `Tauri shell not responding: ${err.message}` });
+  }
+});
+
+// Focus a window by ID
+app.post('/api/v1/windows/focus', async (req, res) => {
+  try {
+    const result = await tauriFetch('/focus', {
+      method: 'POST',
+      body: JSON.stringify({ windowId: req.body.windowId }),
+    });
+    res.json(result);
+  } catch (err) {
+    res.json({ ok: false, error: err.message });
+  }
+});
+
+// Close a window by ID
+app.post('/api/v1/windows/close', async (req, res) => {
+  try {
+    const result = await tauriFetch('/close', {
+      method: 'POST',
+      body: JSON.stringify({ windowId: req.body.windowId }),
+    });
+    res.json(result);
+  } catch (err) {
+    res.json({ ok: false, error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// Client Logs — universal telemetry from all devices
+// ═══════════════════════════════════════════════════════════════════
+
+// POST /api/v1/decisions — log a significant decision to Phoenix memory
+// Called by the pan_decide MCP tool so Claude can record architectural/design choices.
+app.post('/api/v1/decisions', (req, res) => {
+  try {
+    const { decision, rationale = '', options = [], domain = 'general', reversible = null } = req.body;
+    if (!decision || typeof decision !== 'string') {
+      return res.status(400).json({ ok: false, error: 'decision field required' });
+    }
+    const sessionId = req.headers['x-session-id'] || 'mcp-tool';
+    const id = logDecision(sessionId, decision, { rationale, options, domain, reversible });
+    res.json({ ok: true, id, decision, domain });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// GET /api/v1/decisions — query recent decisions
+app.get('/api/v1/decisions', (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 50;
+    const domain = req.query.domain;
+    let q = `SELECT id, data, created_at FROM events WHERE event_type = 'Decision'`;
+    const params = [];
+    if (domain) { q += ` AND json_extract(data, '$.domain') = ?`; params.push(domain); }
+    q += ` ORDER BY created_at DESC LIMIT ?`;
+    params.push(limit);
+    const rows = db.prepare(q).all(...params);
+    const decisions = rows.map(r => {
+      try { return { id: r.id, created_at: r.created_at, ...JSON.parse(r.data) }; }
+      catch { return { id: r.id, created_at: r.created_at, raw: r.data }; }
+    });
+    res.json({ ok: true, decisions });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// POST /api/v1/logs — accept single or batch logs
+app.post('/api/v1/logs', (req, res) => {
+  try {
+    const entries = Array.isArray(req.body) ? req.body : [req.body];
+    if (entries.length === 0) return res.json({ ok: true, inserted: 0 });
+    if (entries.length > 100) return res.status(400).json({ error: 'Max 100 logs per batch' });
+
+    const stmt = db.prepare(`INSERT INTO client_logs (device_id, device_type, level, source, message, meta, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, datetime('now','localtime'))`);
+
+    let inserted = 0;
+    const seenDevices = new Set();
+    for (const e of entries) {
+      if (!e.message) continue;
+      stmt.run(
+        e.device_id || 'unknown',
+        e.device_type || 'browser',
+        e.level || 'error',
+        e.source || 'console',
+        String(e.message).slice(0, 4000),
+        JSON.stringify(e.meta || {})
+      );
+      inserted++;
+      // Track unique device IDs to update last_seen once per batch
+      if (e.device_id && e.device_id !== 'unknown' && e.device_id !== 'phone-dashboard') {
+        seenDevices.add(e.device_id);
+      }
+    }
+    // Update last_seen + online for any real device that just sent logs
+    for (const deviceId of seenDevices) {
+      db.prepare(`UPDATE devices SET last_seen = datetime('now','localtime'), online = 1
+        WHERE hostname = ?`).run(deviceId);
+    }
+    res.json({ ok: true, inserted });
+  } catch (err) {
+    console.error('[Client Logs] Insert error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/v1/popout — same-origin proxy to the Tauri desktop shell's /open endpoint.
+// Browser fetch() to 127.0.0.1:7790 fails because Tauri's tiny-http server returns
+// 404 on the CORS preflight (OPTIONS), so the actual POST never goes out. By
+// proxying through the dashboard's own origin we sidestep CORS entirely.
+//
+// Uses node's native http module rather than global fetch — Tauri's tiny-http
+// server has keep-alive/Content-Length quirks that hang undici (Node's fetch impl).
+// Body: { url, title?, width?, height? }
+app.post('/api/v1/popout', (req, res) => {
+  const { url, title, width, height } = req.body || {};
+  if (!url || typeof url !== 'string') {
+    return res.status(400).json({ error: 'url required' });
+  }
+  const payload = JSON.stringify({
+    url,
+    title: title || 'Phoenix',
+    width: width || 900,
+    height: height || 700,
+  });
+  let responded = false;
+  const respond = (status, body) => {
+    if (responded || res.headersSent) return;
+    responded = true;
+    res.status(status).json(body);
+  };
+  const proxyReq = http.request(
+    {
+      host: '127.0.0.1',
+      port: 7790,
+      path: '/open',
+      method: 'POST',
+      timeout: 3000,
+      agent: false,  // disable keep-alive pool — Tauri's tiny-http chokes on reused sockets
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+        'Connection': 'close',
+      },
+    },
+    (proxyRes) => {
+      // Tauri's response headers have arrived — that's all we need to know it
+      // accepted (or rejected) the request. Reply to the dashboard NOW; let the
+      // body drain in the background. This avoids ~7s tail waiting for Tauri's
+      // keep-alive socket to settle.
+      if (proxyRes.statusCode === 200) {
+        respond(200, { ok: true });
+      } else {
+        respond(502, { error: `tauri returned ${proxyRes.statusCode}`, tauri_status: proxyRes.statusCode });
+      }
+      proxyRes.resume(); // drain body to allow socket cleanup
+    }
+  );
+  proxyReq.on('timeout', () => {
+    proxyReq.destroy();
+    respond(504, { error: 'tauri timeout' });
+  });
+  proxyReq.on('error', (err) => {
+    respond(503, { error: 'tauri shell unreachable', detail: err?.message || String(err) });
+  });
+  proxyReq.write(payload);
+  proxyReq.end();
+});
+
+// GET /api/v1/logs — query logs with filters
+app.get('/api/v1/logs', (req, res) => {
+  try {
+    const { device, device_type, level, source, since, limit: lim } = req.query;
+    let sql = 'SELECT * FROM client_logs WHERE 1=1';
+    const params = [];
+
+    if (device) { sql += ' AND device_id = ?'; params.push(device); }
+    if (device_type) { sql += ' AND device_type = ?'; params.push(device_type); }
+    if (level) { sql += ' AND level = ?'; params.push(level); }
+    if (source) { sql += ' AND source = ?'; params.push(source); }
+    if (since) {
+      // since=1h, since=24h, since=7d
+      const match = since.match(/^(\d+)([hmd])$/);
+      if (match) {
+        const [, n, unit] = match;
+        const mins = unit === 'h' ? n * 60 : unit === 'd' ? n * 1440 : parseInt(n);
+        sql += ` AND created_at >= datetime('now','localtime','-${mins} minutes')`;
+      }
+    }
+
+    sql += ' ORDER BY created_at DESC LIMIT ?';
+    params.push(parseInt(lim) || 100);
+
+    const rows = db.prepare(sql).all(...params);
+    res.json(rows);
+  } catch (err) {
+    console.error('[Client Logs] Query error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /api/v1/logs — retention cleanup
+app.delete('/api/v1/logs', (req, res) => {
+  try {
+    const { older_than } = req.query; // e.g. 7d, 30d
+    const match = (older_than || '30d').match(/^(\d+)([hmd])$/);
+    if (!match) return res.status(400).json({ error: 'Invalid older_than format (e.g. 7d, 24h)' });
+    const [, n, unit] = match;
+    const mins = unit === 'h' ? n * 60 : unit === 'd' ? n * 1440 : parseInt(n);
+    const result = db.prepare(`DELETE FROM client_logs WHERE created_at < datetime('now','localtime','-${mins} minutes')`).run();
+    res.json({ ok: true, deleted: result.changes });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/v1/logs/summary — quick overview of log counts by device/level
+app.get('/api/v1/logs/summary', (req, res) => {
+  try {
+    const since = req.query.since || '24h';
+    const match = since.match(/^(\d+)([hmd])$/);
+    const mins = match ? (match[2] === 'h' ? match[1] * 60 : match[2] === 'd' ? match[1] * 1440 : parseInt(match[1])) : 1440;
+    const rows = db.prepare(`SELECT device_id, device_type, level, COUNT(*) as count
+      FROM client_logs WHERE created_at >= datetime('now','localtime','-${mins} minutes')
+      GROUP BY device_id, device_type, level ORDER BY count DESC`).all();
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Dashboard health (task #505, L2 of dashboard self-heal) ──────────────────
+// Desktop dashboard ships a per-widget snapshot every 30s. Server keeps the
+// latest row per (device_id, widget, side) so the steward UI lane (#506) can
+// detect widgets stuck in 'empty' / 'stale' / 'error' for too long and file
+// bugs automatically. This is the contract that closes the "server pushes,
+// dashboard never confirms it received/rendered" gap.
+try {
+  db.exec(`CREATE TABLE IF NOT EXISTS dashboard_health (
+    device_id      TEXT NOT NULL,
+    page           TEXT NOT NULL,
+    widget         TEXT NOT NULL,
+    side           TEXT,
+    state          TEXT NOT NULL,
+    rendered_at    INTEGER,
+    data_source_at INTEGER,
+    has_data       INTEGER,
+    recorded_at    INTEGER NOT NULL,
+    PRIMARY KEY (device_id, page, widget, side)
+  )`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_dashboard_health_recorded ON dashboard_health(recorded_at)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_dashboard_health_state ON dashboard_health(state, recorded_at)`);
+} catch (e) {
+  console.warn('[dashboard_health] schema init failed:', e.message);
+}
+
+// POST /api/v1/dashboard/health — accept a batch of widget snapshots
+app.post('/api/v1/dashboard/health', (req, res) => {
+  try {
+    const body = req.body || {};
+    const deviceId = String(body.device_id || 'desktop-dashboard').slice(0, 64);
+    const page = String(body.page || 'terminal').slice(0, 64);
+    const widgets = Array.isArray(body.widgets) ? body.widgets : [];
+    if (widgets.length === 0) return res.json({ ok: true, upserted: 0 });
+    if (widgets.length > 200) return res.status(400).json({ error: 'too many widgets' });
+
+    const now = Date.now();
+    const stmt = db.prepare(`INSERT INTO dashboard_health
+      (device_id, page, widget, side, state, rendered_at, data_source_at, has_data, recorded_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(device_id, page, widget, side) DO UPDATE SET
+        state = excluded.state,
+        rendered_at = excluded.rendered_at,
+        data_source_at = excluded.data_source_at,
+        has_data = excluded.has_data,
+        recorded_at = excluded.recorded_at`);
+
+    let upserted = 0;
+    for (const w of widgets) {
+      if (!w || !w.widget) continue;
+      stmt.run(
+        deviceId,
+        page,
+        String(w.widget).slice(0, 64),
+        String(w.side || '').slice(0, 16) || null,
+        String(w.state || 'unknown').slice(0, 16),
+        Number.isFinite(+w.rendered_at) ? +w.rendered_at : null,
+        Number.isFinite(+w.data_source_at) ? +w.data_source_at : null,
+        w.has_data ? 1 : 0,
+        now,
+      );
+      upserted++;
+    }
+    res.json({ ok: true, upserted });
+  } catch (err) {
+    console.error('[dashboard_health] insert error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Debug + manual-trigger endpoints for the dashboard self-heal stack (tasks #506/507/508).
+// These let an operator (or this very Claude session) introspect what L3/L4/L5
+// are seeing without grepping logs.
+app.get('/api/v1/dashboard/render-health/debug', async (req, res) => {
+  try {
+    const m = await import('./dashboard-render-health.js');
+    res.json({
+      ok: true,
+      tracked: m._renderHealthDebug(),
+      last_error: typeof m._lastError === 'function' ? m._lastError() : null,
+      last_ok: typeof m._lastOk === 'function' ? m._lastOk() : null,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/v1/dashboard/render-health/run', async (req, res) => {
+  try {
+    const m = await import('./dashboard-render-health.js');
+    const r = typeof m.runRenderHealthOnce === 'function' ? m.runRenderHealthOnce() : { ok: false, error: 'no manual runner' };
+    res.json({
+      ...r,
+      tracked: m._renderHealthDebug(),
+      last_error: typeof m._lastError === 'function' ? m._lastError() : null,
+      last_ok: typeof m._lastOk === 'function' ? m._lastOk() : null,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/v1/dashboard/vision/run', async (req, res) => {
+  try {
+    const m = await import('./dashboard-vision-verifier.js');
+    const r = await m.runVisionVerifierOnce();
+    res.json(r);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/v1/forge/dashboard/run', async (req, res) => {
+  try {
+    const m = await import('./forge-dashboard.js');
+    const r = await m.runForgeDashboardOnce();
+    res.json(r);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/v1/dashboard/health — current snapshot for steward UI lane + UI tools.
+//   ?stale_ms=60000  → only return rows where recorded_at < now - stale_ms
+//   ?widget=intuition → filter to one widget
+app.get('/api/v1/dashboard/health', (req, res) => {
+  try {
+    let sql = 'SELECT * FROM dashboard_health WHERE 1=1';
+    const params = [];
+    if (req.query.widget) { sql += ' AND widget = ?'; params.push(req.query.widget); }
+    if (req.query.device_id) { sql += ' AND device_id = ?'; params.push(req.query.device_id); }
+    if (req.query.stale_ms) {
+      const ms = parseInt(req.query.stale_ms, 10);
+      if (Number.isFinite(ms)) { sql += ' AND recorded_at < ?'; params.push(Date.now() - ms); }
+    }
+    sql += ' ORDER BY recorded_at DESC LIMIT 500';
+    const rows = db.prepare(sql).all(...params);
+    res.json({ ok: true, rows, now: Date.now() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Restart endpoint — always does a full process restart that reloads all code from disk.
+
+// The node-windows wrapper automatically revives the process after exit.
+app.post('/api/admin/restart', async (req, res) => {
+  if (IS_CRAFT) {
+    // Running under Carrier — restart the WHOLE Carrier (not just hot-swap Craft).
+    // Hot-swap only replaces Craft (server.js). To pick up Carrier code changes,
+    // we need to kill the old Carrier and spawn a fresh `node phoenix.js start`.
+    // The new Carrier will kill whatever is on port 7777 (via killProcessOnPort)
+    // and boot a brand new Carrier + Craft from disk.
+    res.json({ ok: true, message: 'Carrier restart initiated — spawning fresh Carrier...' });
+    console.log('[Phoenix Craft] Full Carrier restart requested — spawning new Carrier process');
+    setTimeout(async () => {
+      try {
+        const { spawn } = await import('child_process');
+        const child = spawn(process.execPath, ['phoenix.js', 'start'], {
+          cwd: join(__dirname, '..'),
+          stdio: 'ignore',
+          detached: true,
+          windowsHide: true,
+          env: { ...process.env, PHOENIX_CRAFT: undefined }
+        });
+        child.unref();
+        console.log(`[Phoenix Craft] New Carrier spawned (PID ${child.pid}) — old Carrier will be killed on port bind`);
+      } catch (err) {
+        console.error('[Phoenix Craft] Failed to spawn new Carrier:', err.message);
+      }
+    }, 500);
+    return;
+  }
+  res.json({ ok: true, message: 'Restarting — process will exit and reload all code...' });
+  console.log('[Phoenix] Restart requested');
+  setTimeout(async () => {
+    console.log('[Phoenix] Stopping all services...');
+    await stop();
+    await new Promise(r => setTimeout(r, 1000));
+
+    const devPort = process.env.PHOENIX_PORT;
+    const isDev = devPort && parseInt(devPort) !== 7777;
+    if (isDev) {
+      console.log('[Phoenix] Dev mode — spawning fresh dev server...');
+      const { spawn } = await import('child_process');
+      const child = spawn(process.execPath, ['dev-server.js', String(devPort)], {
+        cwd: join(__dirname, '..'),
+        stdio: 'inherit',
+        detached: true,
+        windowsHide: true,
+        env: { ...process.env }
+      });
+      child.unref();
+    }
+
+    console.log(`[Phoenix] Exiting for restart (${isDev ? 'dev' : 'prod — wrapper will restart'})`);
+    process.exit(0);
+  }, 500);
+});
+
+export { start, stop, app };
+
+// Auto-start when forked by Carrier (PHOENIX_CRAFT=1).
+// Carrier forks this file as a child process — it doesn't call start() itself.
+if (process.env.PHOENIX_CRAFT === '1') {
+  start().catch(err => {
+    console.error('[Phoenix Craft] Failed to start:', err.message);
+    process.exit(1);
+  });
+}

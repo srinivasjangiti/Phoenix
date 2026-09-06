@@ -1,0 +1,980 @@
+use base64::Engine;
+use serde::Serialize;
+use std::collections::HashMap;
+use std::io::Cursor;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Manager, WebviewUrl, WebviewWindowBuilder,
+};
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+
+// ==================== WebView2 Permission Auto-Grant (Windows) ====================
+// Tauri 2's wry backend defers to WebView2 (Edge Chromium) on Windows. By default
+// WebView2 *silently denies* navigator.mediaDevices.getUserMedia, Geolocation API,
+// generic sensor APIs, notifications, clipboard read, autoplay, etc. — even on
+// loopback origins. There is no JS-level prompt; the promise just rejects.
+//
+// The fix is native: register an ICoreWebView2::add_PermissionRequested handler
+// per webview and set State=ALLOW for requests from http://127.0.0.1 / localhost.
+// Phoenix is a single-user personal AI shell talking to the user's own loopback server,
+// so granting locally is the correct posture. Non-loopback origins (anything the
+// user navigates to in a wrapped window) fall through to WebView2's default,
+// which still prompts via the system UI.
+#[cfg(target_os = "windows")]
+mod webview_perms {
+    use tauri::WebviewWindow;
+    use webview2_com::take_pwstr;
+    use webview2_com::Microsoft::Web::WebView2::Win32::*;
+    use webview2_com::PermissionRequestedEventHandler;
+    use windows_core::PWSTR;
+
+    pub fn attach_auto_grant(window: &WebviewWindow) {
+        let label = window.label().to_string();
+        let _ = window.with_webview(move |webview| unsafe {
+            let controller = webview.controller();
+            let core = match controller.CoreWebView2() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!(
+                        "[Phoenix Shell] CoreWebView2 fetch failed for '{}': {:?}",
+                        label, e
+                    );
+                    return;
+                }
+            };
+
+            let handler_label = label.clone();
+            let handler =
+                PermissionRequestedEventHandler::create(Box::new(move |_sender, args| {
+                    if let Some(args) = args {
+                        // SAFETY: COM out-param calls on ICoreWebView2PermissionRequestedEventArgs.
+                        {
+                            let mut kind = COREWEBVIEW2_PERMISSION_KIND_UNKNOWN_PERMISSION;
+                            let _ = args.PermissionKind(&mut kind);
+
+                            let mut uri_pwstr = PWSTR::null();
+                            let uri = if args.Uri(&mut uri_pwstr).is_ok() {
+                                take_pwstr(uri_pwstr)
+                            } else {
+                                String::new()
+                            };
+
+                            let is_local = uri.starts_with("http://127.0.0.1")
+                                || uri.starts_with("http://localhost")
+                                || uri.starts_with("https://127.0.0.1")
+                                || uri.starts_with("https://localhost");
+
+                            if is_local {
+                                let _ = args.SetState(COREWEBVIEW2_PERMISSION_STATE_ALLOW);
+                                println!(
+                                    "[Phoenix Shell] [{}] perm kind={:?} uri={} -> ALLOW",
+                                    handler_label, kind, uri
+                                );
+                            } else {
+                                // Leave State=Default so WebView2 falls back to its
+                                // built-in UI prompt for non-loopback origins.
+                                println!(
+                                    "[Phoenix Shell] [{}] perm kind={:?} uri={} -> DEFAULT (prompt)",
+                                    handler_label, kind, uri
+                                );
+                            }
+                        }
+                    }
+                    Ok(())
+                }));
+
+            let mut token: i64 = 0;
+            match core.add_PermissionRequested(&handler, &mut token) {
+                Ok(_) => println!(
+                    "[Phoenix Shell] PermissionRequested auto-grant attached to '{}'",
+                    label
+                ),
+                Err(e) => eprintln!(
+                    "[Phoenix Shell] add_PermissionRequested failed for '{}': {:?}",
+                    label, e
+                ),
+            }
+        });
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+mod webview_perms {
+    use tauri::WebviewWindow;
+    pub fn attach_auto_grant(_window: &WebviewWindow) {}
+}
+
+const PHOENIX_SERVER: &str = "http://127.0.0.1:7777";
+const SHELL_PORT: u16 = 7790;
+const DICTATE_SCRIPT: &str = r"%USERPROFILE%\Desktop\Phoenix\service\src\dictate-vad.py";
+const VOICE_START_SND: &str = r"%USERPROFILE%\Desktop\Phoenix\service\bin\sounds\voice-start.wav";
+const VOICE_STOP_SND: &str = r"%USERPROFILE%\Desktop\Phoenix\service\bin\sounds\voice-stop.wav";
+
+static DICTATE_BUSY: AtomicBool = AtomicBool::new(false);
+
+// Configurable mouse button actions — fetched from Phoenix settings at startup.
+// "winh" = trigger Win+H voice typing, "dictate" = run dictate-vad.py, "none" = disabled
+use std::sync::OnceLock;
+static XBUTTON1_ACTION: OnceLock<String> = OnceLock::new();
+static XBUTTON2_ACTION: OnceLock<String> = OnceLock::new();
+
+/// Fetch voice button config from Phoenix server settings.
+/// Keys: voice_xbutton1 and voice_xbutton2, values: "winh" | "dictate" | "none"
+fn load_voice_button_config() {
+    let (mut action1, mut action2) = ("winh".to_string(), "dictate".to_string());
+    if let Ok(resp) = ureq::get(&format!("{}/api/v1/settings", PHOENIX_SERVER)).call() {
+        if let Ok(json) = resp.into_json::<serde_json::Value>() {
+            if let Some(v) = json.get("voice_xbutton1").and_then(|v| v.as_str()) {
+                action1 = v.to_string();
+            }
+            if let Some(v) = json.get("voice_xbutton2").and_then(|v| v.as_str()) {
+                action2 = v.to_string();
+            }
+        }
+    }
+    println!("[Phoenix Shell] Voice buttons: XButton1={}, XButton2={}", action1, action2);
+    let _ = XBUTTON1_ACTION.set(action1);
+    let _ = XBUTTON2_ACTION.set(action2);
+}
+
+fn execute_voice_action(action: &str) {
+    match action {
+        "winh" => {
+            println!("[Phoenix Shell] → Win+H");
+            #[cfg(target_os = "windows")]
+            send_win_h();
+        }
+        "dictate" => {
+            println!("[Phoenix Shell] → Dictate");
+            start_dictation();
+        }
+        _ => {} // "none" or unknown — do nothing
+    }
+}
+
+// ==================== Window Registry ====================
+#[derive(Debug, Clone, Serialize)]
+struct WindowEntry {
+    id: String,
+    url: String,
+    title: String,
+    created_at: String,
+}
+
+type Registry = Arc<Mutex<HashMap<String, WindowEntry>>>;
+
+static NEXT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+fn new_window_id() -> String {
+    let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    format!("win-{}", id)
+}
+
+// ==================== Tauri Commands (callable from JS) ====================
+
+#[tauri::command]
+fn list_windows(registry: tauri::State<Registry>) -> Vec<WindowEntry> {
+    let reg = registry.lock().unwrap();
+    reg.values().cloned().collect()
+}
+
+#[tauri::command]
+async fn open_window(
+    app: AppHandle,
+    registry: tauri::State<'_, Registry>,
+    url: String,
+    title: Option<String>,
+) -> Result<String, String> {
+    let win_id = new_window_id();
+    let win_title = title.unwrap_or_else(|| "Phoenix".to_string());
+
+    let window = WebviewWindowBuilder::new(&app, &win_id, WebviewUrl::External(url.parse().map_err(|e| format!("{}", e))?))
+        .title(&win_title)
+        .inner_size(1280.0, 800.0)
+        .build()
+        .map_err(|e| format!("{}", e))?;
+
+    // Grant mic/cam/sensors for loopback before the page hits getUserMedia.
+    webview_perms::attach_auto_grant(&window);
+
+    let _ = window.maximize();
+
+    let entry = WindowEntry {
+        id: win_id.clone(),
+        url: url.clone(),
+        title: win_title,
+        created_at: chrono_now(),
+    };
+    registry.lock().unwrap().insert(win_id.clone(), entry);
+
+    // Clean up on close
+    let reg_clone = registry.inner().clone();
+    let id_clone = win_id.clone();
+    window.on_window_event(move |event| {
+        if let tauri::WindowEvent::Destroyed = event {
+            reg_clone.lock().unwrap().remove(&id_clone);
+        }
+    });
+
+    Ok(win_id)
+}
+
+#[tauri::command]
+async fn screenshot_window(
+    app: AppHandle,
+    window_id: Option<String>,
+) -> Result<String, String> {
+    // If window_id given, screenshot that specific window
+    // Otherwise screenshot the focused window or first available
+    let target_label = window_id.unwrap_or_else(|| "main".to_string());
+
+    if let Some(window) = app.get_webview_window(&target_label) {
+        // Use xcap to capture the window's screen region
+        let pos = window.outer_position().map_err(|e| format!("{}", e))?;
+        let size = window.outer_size().map_err(|e| format!("{}", e))?;
+
+        let monitors = xcap::Monitor::all().map_err(|e| format!("{}", e))?;
+        // Find the monitor that contains this window
+        let monitor = monitors.iter().find(|m| {
+            let mx = m.x();
+            let my = m.y();
+            let mw = m.width() as i32;
+            let mh = m.height() as i32;
+            pos.x >= mx && pos.x < mx + mw && pos.y >= my && pos.y < my + mh
+        }).or_else(|| monitors.first());
+        if let Some(monitor) = monitor {
+            let img = monitor.capture_image().map_err(|e| format!("{}", e))?;
+            // Crop to window region relative to this monitor
+            let crop_x = (pos.x - monitor.x()).max(0) as u32;
+            let crop_y = (pos.y - monitor.y()).max(0) as u32;
+            let crop_w = size.width.min(img.width().saturating_sub(crop_x));
+            let crop_h = size.height.min(img.height().saturating_sub(crop_y));
+            let cropped = image::imageops::crop_imm(
+                &img,
+                crop_x,
+                crop_y,
+                crop_w,
+                crop_h,
+            ).to_image();
+
+            let mut buf = Cursor::new(Vec::new());
+            cropped.write_to(&mut buf, image::ImageFormat::Png)
+                .map_err(|e| format!("{}", e))?;
+
+            let b64 = base64::engine::general_purpose::STANDARD.encode(buf.into_inner());
+            Ok(b64)
+        } else {
+            Err("No monitors found".into())
+        }
+    } else {
+        Err(format!("Window '{}' not found", target_label))
+    }
+}
+
+#[tauri::command]
+async fn screenshot_full() -> Result<String, String> {
+    let monitors = xcap::Monitor::all().map_err(|e| format!("{}", e))?;
+    if let Some(monitor) = monitors.first() {
+        let img = monitor.capture_image().map_err(|e| format!("{}", e))?;
+        let mut buf = Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Png)
+            .map_err(|e| format!("{}", e))?;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(buf.into_inner());
+        Ok(b64)
+    } else {
+        Err("No monitors found".into())
+    }
+}
+
+#[tauri::command]
+async fn focus_window(app: AppHandle, window_id: String) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window(&window_id) {
+        let _ = window.unminimize();
+        let _ = window.show();
+        window.set_focus().map_err(|e| format!("{}", e))?;
+        Ok(())
+    } else {
+        Err(format!("Window '{}' not found", window_id))
+    }
+}
+
+#[tauri::command]
+async fn close_window(app: AppHandle, window_id: String) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window(&window_id) {
+        window.close().map_err(|e| format!("{}", e))?;
+        Ok(())
+    } else {
+        Err(format!("Window '{}' not found", window_id))
+    }
+}
+
+// ==================== HTTP API (Phoenix server calls this directly) ====================
+
+fn start_http_api(app_handle: AppHandle, registry: Registry) {
+    std::thread::spawn(move || {
+        let server = tiny_http::Server::http(format!("127.0.0.1:{}", SHELL_PORT))
+            .expect("Failed to start shell HTTP server");
+        println!("[Phoenix Shell] HTTP API listening on port {}", SHELL_PORT);
+
+        for mut request in server.incoming_requests() {
+            let url = request.url().to_string();
+            let method = request.method().to_string();
+
+            let (status, body) = match (method.as_str(), url.as_str()) {
+                ("GET", "/ping") => {
+                    (200, serde_json::json!({"ok": true, "shell": "tauri"}).to_string())
+                }
+
+                ("GET", "/windows") => {
+                    let reg = registry.lock().unwrap();
+                    let list: Vec<_> = reg.values().cloned().collect();
+                    (200, serde_json::json!({"ok": true, "windows": list}).to_string())
+                }
+
+                ("POST", "/open") => {
+                    let mut body_str = String::new();
+                    let _ = request.as_reader().read_to_string(&mut body_str);
+                    match serde_json::from_str::<serde_json::Value>(&body_str) {
+                        Ok(val) => {
+                            let url = val["url"].as_str().unwrap_or("http://127.0.0.1:7777").to_string();
+                            let title = val["title"].as_str().map(|s| s.to_string());
+                            let label = val["label"].as_str().map(|s| s.to_string());
+                            let width = val["width"].as_f64();
+                            let height = val["height"].as_f64();
+                            // initScript: JS injected into the webview before every page load.
+                            // Used by wrappers (Discord, Slack, etc.) to read DOM + post back to Phoenix.
+                            let init_script = val["initScript"].as_str().map(|s| s.to_string());
+                            let handle = app_handle.clone();
+                            let reg = registry.clone();
+                            // Use provided label or auto-generate
+                            let win_id = label.unwrap_or_else(|| new_window_id());
+                            let win_title = title.unwrap_or_else(|| "Phoenix".to_string());
+                            let wid = win_id.clone();
+                            let wtitle = win_title.clone();
+                            let wurl = url.clone();
+                            let handle2 = handle.clone();
+                            let custom_size = width.is_some() || height.is_some();
+                            let w = width.unwrap_or(1280.0);
+                            let h = height.unwrap_or(800.0);
+                            let init = init_script.clone();
+                            handle.run_on_main_thread(move || {
+                                let mut builder = WebviewWindowBuilder::new(
+                                    &handle2,
+                                    &wid,
+                                    WebviewUrl::External(wurl.parse().unwrap()),
+                                )
+                                .title(&wtitle)
+                                .inner_size(w, h);
+                                if let Some(script) = init {
+                                    builder = builder.initialization_script(&script);
+                                }
+                                if let Ok(window) = builder.build()
+                                {
+                                    // Grant mic/cam/sensors for loopback origins on this webview.
+                                    webview_perms::attach_auto_grant(&window);
+
+                                    // Only maximize if no custom size was requested
+                                    if !custom_size {
+                                        let _ = window.maximize();
+                                    }
+                                    let entry = WindowEntry {
+                                        id: wid.clone(),
+                                        url: wurl,
+                                        title: wtitle,
+                                        created_at: chrono_now(),
+                                    };
+                                    reg.lock().unwrap().insert(wid.clone(), entry);
+
+                                    let reg2 = reg.clone();
+                                    let id2 = wid.clone();
+                                    window.on_window_event(move |event| {
+                                        if let tauri::WindowEvent::Destroyed = event {
+                                            reg2.lock().unwrap().remove(&id2);
+                                        }
+                                    });
+                                }
+                            }).ok();
+                            (200, serde_json::json!({"ok": true, "windowId": win_id}).to_string())
+                        }
+                        Err(e) => (400, serde_json::json!({"ok": false, "error": e.to_string()}).to_string()),
+                    }
+                }
+
+                ("POST", "/screenshot") => {
+                    let mut body_str = String::new();
+                    let _ = request.as_reader().read_to_string(&mut body_str);
+                    let val = serde_json::from_str::<serde_json::Value>(&body_str).unwrap_or_default();
+                    let window_id = val["windowId"].as_str().map(|s| s.to_string());
+
+                    if let Some(wid) = window_id {
+                        // Window-specific screenshot: find the window, find its monitor, crop
+                        let handle = app_handle.clone();
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        let handle2 = handle.clone();
+                        let wid_for_closure = wid.clone();
+                        handle.run_on_main_thread(move || {
+                            if let Some(w) = handle2.get_webview_window(&wid_for_closure) {
+                                let pos = w.outer_position().ok();
+                                let size = w.outer_size().ok();
+                                tx.send((pos, size)).ok();
+                            } else {
+                                tx.send((None, None)).ok();
+                            }
+                        }).ok();
+
+                        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                            Ok((Some(pos), Some(size))) => {
+                                match xcap::Monitor::all() {
+                                    Ok(monitors) => {
+                                        // Find which monitor contains this window
+                                        let wx = pos.x;
+                                        let wy = pos.y;
+                                        let target_mon = monitors.iter().find(|m| {
+                                            let mx = m.x();
+                                            let my = m.y();
+                                            let mw = m.width() as i32;
+                                            let mh = m.height() as i32;
+                                            wx >= mx && wx < mx + mw && wy >= my && wy < my + mh
+                                        }).or_else(|| monitors.first());
+
+                                        if let Some(monitor) = target_mon {
+                                            match monitor.capture_image() {
+                                                Ok(img) => {
+                                                    // Crop to window position relative to this monitor
+                                                    let crop_x = (wx - monitor.x()).max(0) as u32;
+                                                    let crop_y = (wy - monitor.y()).max(0) as u32;
+                                                    let crop_w = size.width.min(img.width().saturating_sub(crop_x));
+                                                    let crop_h = size.height.min(img.height().saturating_sub(crop_y));
+                                                    let cropped = image::imageops::crop_imm(&img, crop_x, crop_y, crop_w, crop_h).to_image();
+                                                    let mut buf = Cursor::new(Vec::new());
+                                                    if cropped.write_to(&mut buf, image::ImageFormat::Png).is_ok() {
+                                                        let b64 = base64::engine::general_purpose::STANDARD.encode(buf.into_inner());
+                                                        let path = std::env::temp_dir().join("phoenix-screenshot.png");
+                                                        let _ = cropped.save(&path);
+                                                        (200, serde_json::json!({
+                                                            "ok": true, "base64": b64, "windowId": wid,
+                                                            "path": path.to_string_lossy(),
+                                                            "position": {"x": pos.x, "y": pos.y},
+                                                            "size": {"w": size.width, "h": size.height}
+                                                        }).to_string())
+                                                    } else {
+                                                        (500, serde_json::json!({"ok": false, "error": "encode failed"}).to_string())
+                                                    }
+                                                }
+                                                Err(e) => (500, serde_json::json!({"ok": false, "error": e.to_string()}).to_string()),
+                                            }
+                                        } else {
+                                            (500, serde_json::json!({"ok": false, "error": "no monitors"}).to_string())
+                                        }
+                                    }
+                                    Err(e) => (500, serde_json::json!({"ok": false, "error": e.to_string()}).to_string()),
+                                }
+                            }
+                            Ok(_) => (404, serde_json::json!({"ok": false, "error": format!("Window '{}' not found or has no position", wid)}).to_string()),
+                            Err(_) => (500, serde_json::json!({"ok": false, "error": "Timeout getting window position"}).to_string()),
+                        }
+                    } else {
+                        // Full screen screenshot (all monitors stitched or first)
+                        match xcap::Monitor::all() {
+                            Ok(monitors) => {
+                                if let Some(monitor) = monitors.first() {
+                                    match monitor.capture_image() {
+                                        Ok(img) => {
+                                            let mut buf = Cursor::new(Vec::new());
+                                            if img.write_to(&mut buf, image::ImageFormat::Png).is_ok() {
+                                                let b64 = base64::engine::general_purpose::STANDARD.encode(buf.into_inner());
+                                                let path = std::env::temp_dir().join("phoenix-screenshot.png");
+                                                let _ = img.save(&path);
+                                                (200, serde_json::json!({
+                                                    "ok": true, "base64": b64,
+                                                    "path": path.to_string_lossy()
+                                                }).to_string())
+                                            } else {
+                                                (500, serde_json::json!({"ok": false, "error": "encode failed"}).to_string())
+                                            }
+                                        }
+                                        Err(e) => (500, serde_json::json!({"ok": false, "error": e.to_string()}).to_string()),
+                                    }
+                                } else {
+                                    (500, serde_json::json!({"ok": false, "error": "no monitors"}).to_string())
+                                }
+                            }
+                            Err(e) => (500, serde_json::json!({"ok": false, "error": e.to_string()}).to_string()),
+                        }
+                    }
+                }
+
+                ("POST", "/focus") => {
+                    let mut body_str = String::new();
+                    let _ = request.as_reader().read_to_string(&mut body_str);
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&body_str) {
+                        let wid = val["windowId"].as_str().unwrap_or("main").to_string();
+                        let handle = app_handle.clone();
+                        let handle2 = handle.clone();
+                        handle.run_on_main_thread(move || {
+                            if let Some(w) = handle2.get_webview_window(&wid) {
+                                let _ = w.unminimize();
+                                let _ = w.show();
+                                let _ = w.set_focus();
+                            }
+                        }).ok();
+                        (200, serde_json::json!({"ok": true}).to_string())
+                    } else {
+                        (400, serde_json::json!({"ok": false, "error": "bad json"}).to_string())
+                    }
+                }
+
+                ("POST", "/dictate") => {
+                    // Trigger or stop dictation — replaces the AHK file-trigger mechanism
+                    start_dictation();
+                    (200, serde_json::json!({"ok": true, "action": if DICTATE_BUSY.load(Ordering::SeqCst) { "started" } else { "stopped" }}).to_string())
+                }
+
+                ("POST", "/winh") => {
+                    // Trigger Win+H system voice typing
+                    #[cfg(target_os = "windows")]
+                    send_win_h();
+                    println!("[Phoenix Shell] Win+H triggered via HTTP");
+                    (200, serde_json::json!({"ok": true, "action": "winh"}).to_string())
+                }
+
+                // CORS preflight for wrapper ingest
+                ("OPTIONS", url_str) if url_str.starts_with("/wrap/") => {
+                    let response = tiny_http::Response::from_string("")
+                        .with_status_code(204)
+                        .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap())
+                        .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Methods"[..], &b"POST, GET, OPTIONS"[..]).unwrap())
+                        .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Headers"[..], &b"Content-Type"[..]).unwrap())
+                        .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Max-Age"[..], &b"86400"[..]).unwrap());
+                    let _ = request.respond(response);
+                    continue;
+                }
+
+                // Wrapper inbound: content scripts running inside wrapped apps (Discord, Slack, etc.)
+                // POST here with a JSON payload. We forward to Phoenix server on :7777 so it reaches the DB.
+                // Permissive CORS so fetch from https://discord.com works.
+                ("POST", "/wrap/inbound") => {
+                    let mut body_str = String::new();
+                    let _ = request.as_reader().read_to_string(&mut body_str);
+                    // Fire-and-forget forward to Phoenix server
+                    let fwd_body = body_str.clone();
+                    std::thread::spawn(move || {
+                        let _ = ureq::post(&format!("{}/api/v1/wrap/inbound", PHOENIX_SERVER))
+                            .set("Content-Type", "application/json")
+                            .send_string(&fwd_body);
+                    });
+                    let response = tiny_http::Response::from_string(
+                        serde_json::json!({"ok": true}).to_string()
+                    )
+                    .with_status_code(200)
+                    .with_header(tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap())
+                    .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap());
+                    let _ = request.respond(response);
+                    continue;
+                }
+
+                ("POST", "/eval") => {
+                    // Run JS inside a given webview window. Body: { windowId, js }.
+                    // Used to drive wrapped apps (e.g. window.__PHOENIX_SEND__("booty") or window.__PAN_SEND__).
+                    let mut body_str = String::new();
+                    let _ = request.as_reader().read_to_string(&mut body_str);
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&body_str) {
+                        let wid = val["windowId"].as_str().unwrap_or("").to_string();
+                        let js = val["js"].as_str().unwrap_or("").to_string();
+                        if wid.is_empty() || js.is_empty() {
+                            (400, serde_json::json!({"ok": false, "error": "windowId and js required"}).to_string())
+                        } else {
+                            let handle = app_handle.clone();
+                            let handle2 = handle.clone();
+                            let wid2 = wid.clone();
+                            let js2 = js.clone();
+                            let result = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+                            let result2 = result.clone();
+                            handle.run_on_main_thread(move || {
+                                if let Some(w) = handle2.get_webview_window(&wid2) {
+                                    match w.eval(&js2) {
+                                        Ok(_) => *result2.lock().unwrap() = "ok".to_string(),
+                                        Err(e) => *result2.lock().unwrap() = format!("eval error: {}", e),
+                                    }
+                                } else {
+                                    *result2.lock().unwrap() = "window not found".to_string();
+                                }
+                            }).ok();
+                            // small wait for main-thread execution
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                            let r = result.lock().unwrap().clone();
+                            if r == "ok" {
+                                (200, serde_json::json!({"ok": true}).to_string())
+                            } else {
+                                (500, serde_json::json!({"ok": false, "error": r}).to_string())
+                            }
+                        }
+                    } else {
+                        (400, serde_json::json!({"ok": false, "error": "bad json"}).to_string())
+                    }
+                }
+
+                ("POST", "/close") => {
+                    let mut body_str = String::new();
+                    let _ = request.as_reader().read_to_string(&mut body_str);
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&body_str) {
+                        let wid = val["windowId"].as_str().unwrap_or("").to_string();
+                        let handle = app_handle.clone();
+                        let handle2 = handle.clone();
+                        let reg = registry.clone();
+                        handle.run_on_main_thread(move || {
+                            if let Some(w) = handle2.get_webview_window(&wid) {
+                                let _ = w.close();
+                                reg.lock().unwrap().remove(&wid);
+                            }
+                        }).ok();
+                        (200, serde_json::json!({"ok": true}).to_string())
+                    } else {
+                        (400, serde_json::json!({"ok": false, "error": "bad json"}).to_string())
+                    }
+                }
+
+                _ => (404, serde_json::json!({"error": "not found"}).to_string()),
+            };
+
+            let response = tiny_http::Response::from_string(body)
+                .with_status_code(status)
+                .with_header(tiny_http::Header::from_bytes(
+                    &b"Content-Type"[..],
+                    &b"application/json"[..],
+                ).unwrap());
+            let _ = request.respond(response);
+        }
+    });
+}
+
+// ==================== Voice Hotkeys (replaces AHK) ====================
+
+/// Send Win+H to the OS via Windows SendInput API
+#[cfg(target_os = "windows")]
+fn send_win_h() {
+    unsafe {
+        use std::mem::size_of;
+        // INPUT struct on x64 is 40 bytes: u32 type + 4-byte padding + 32-byte union.
+        // KEYBDINPUT sits inside the union with tail padding to match MOUSEINPUT size.
+        #[repr(C)]
+        struct Input {
+            r#type: u32,    // INPUT_KEYBOARD = 1
+            _pad0: u32,     // padding to align union to 8 bytes
+            vk: u16,        // wVk
+            scan: u16,      // wScan
+            flags: u32,     // dwFlags (0 = down, 2 = KEYEVENTF_KEYUP)
+            time: u32,      // dwTime
+            _pad1: u32,     // alignment padding before dwExtraInfo
+            extra: usize,   // dwExtraInfo
+            _pad2: [u8; 8], // union tail padding (MOUSEINPUT is 32 bytes, KEYBDINPUT is 24)
+        }
+        extern "system" { fn SendInput(count: u32, inputs: *const Input, size: i32) -> u32; }
+        let inputs = [
+            Input { r#type: 1, _pad0: 0, vk: 0x5B, scan: 0, flags: 0, time: 0, _pad1: 0, extra: 0, _pad2: [0; 8] }, // LWin down
+            Input { r#type: 1, _pad0: 0, vk: 0x48, scan: 0, flags: 0, time: 0, _pad1: 0, extra: 0, _pad2: [0; 8] }, // H down
+            Input { r#type: 1, _pad0: 0, vk: 0x48, scan: 0, flags: 2, time: 0, _pad1: 0, extra: 0, _pad2: [0; 8] }, // H up
+            Input { r#type: 1, _pad0: 0, vk: 0x5B, scan: 0, flags: 2, time: 0, _pad1: 0, extra: 0, _pad2: [0; 8] }, // LWin up
+        ];
+        SendInput(4, inputs.as_ptr(), size_of::<Input>() as i32);
+    }
+}
+
+/// Run dictate-vad.py (Phoenix whisper dictation)
+fn start_dictation() {
+    if DICTATE_BUSY.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        // Already recording — signal stop
+        let stop_file = std::env::temp_dir().join("phoenix_dictate.wav.stop");
+        let _ = std::fs::write(&stop_file, "stop");
+        println!("[Phoenix Shell] Dictation stop signal sent");
+        return;
+    }
+    println!("[Phoenix Shell] Starting dictation...");
+    std::thread::spawn(|| {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+        // Play start sound
+        {
+            use std::process::Command;
+            let _ = Command::new("powershell")
+                .args(["-NoProfile", "-Command",
+                    &format!("(New-Object Media.SoundPlayer '{}').PlaySync()", VOICE_START_SND)])
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn();
+        }
+
+        let result = std::process::Command::new("python.exe")
+            .args([DICTATE_SCRIPT, "--no-sounds"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
+
+        match result {
+            Ok(status) => println!("[Phoenix Shell] Dictation finished: {}", status),
+            Err(e) => eprintln!("[Phoenix Shell] Dictation failed: {}", e),
+        }
+
+        // Play stop sound
+        {
+            use std::process::Command;
+            let _ = Command::new("powershell")
+                .args(["-NoProfile", "-Command",
+                    &format!("(New-Object Media.SoundPlayer '{}').PlaySync()", VOICE_STOP_SND)])
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn();
+        }
+
+        DICTATE_BUSY.store(false, Ordering::SeqCst);
+    });
+}
+
+/// Listen for mouse XButton1/XButton2 globally.
+/// On Windows: uses a native WH_MOUSE_LL hook (mouse-only, no WH_KEYBOARD_LL interference).
+/// On other platforms: falls back to rdev::listen().
+#[cfg(target_os = "windows")]
+fn start_mouse_listener() {
+    use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, GetMessageW, SetWindowsHookExW, UnhookWindowsHookEx,
+        MSLLHOOKSTRUCT, MSG, WH_MOUSE_LL, WM_XBUTTONDOWN,
+    };
+
+    // The hook callback must be an extern "system" fn (no closure capture).
+    // It reads the module-level OnceLock statics directly.
+    unsafe extern "system" fn mouse_ll_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        if code >= 0 && wparam.0 as u32 == WM_XBUTTONDOWN {
+            let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+            // High word of mouseData = XBUTTON1 (1) or XBUTTON2 (2)
+            let xbutton = (info.mouseData >> 16) as u16;
+            match xbutton {
+                1 => { if let Some(a) = XBUTTON1_ACTION.get() { execute_voice_action(a); } }
+                2 => { if let Some(a) = XBUTTON2_ACTION.get() { execute_voice_action(a); } }
+                _ => {}
+            }
+        }
+        CallNextHookEx(None, code, wparam, lparam)
+    }
+
+    std::thread::spawn(|| {
+        println!("[Phoenix Shell] Mouse button listener started (WH_MOUSE_LL, no keyboard hook)");
+        let result = unsafe {
+            SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_ll_proc), None, 0)
+        };
+        match result {
+            Ok(hook) => {
+                println!("[Phoenix Shell] WH_MOUSE_LL hook installed");
+                unsafe {
+                    let mut msg = MSG::default();
+                    // GetMessageW drives the message loop required for low-level hooks.
+                    while GetMessageW(&mut msg, None, 0, 0).as_bool() {}
+                    let _ = UnhookWindowsHookEx(hook);
+                }
+            }
+            Err(e) => {
+                eprintln!("[Phoenix Shell] WH_MOUSE_LL hook failed: {:?} — rdev fallback", e);
+                // rdev::listen installs both WH_MOUSE_LL and WH_KEYBOARD_LL; only reached
+                // if the native hook above fails (permission/OS issue).
+                let a1 = XBUTTON1_ACTION.get().map(|s| s.as_str()).unwrap_or("winh").to_string();
+                let a2 = XBUTTON2_ACTION.get().map(|s| s.as_str()).unwrap_or("dictate").to_string();
+                let _ = rdev::listen(move |event| {
+                    if let rdev::EventType::ButtonPress(rdev::Button::Unknown(code)) = event.event_type {
+                        match code {
+                            1 | 5 | 8 => execute_voice_action(&a1),
+                            2 | 6 | 9 => execute_voice_action(&a2),
+                            _ => {}
+                        }
+                    }
+                });
+            }
+        }
+    });
+}
+
+#[cfg(not(target_os = "windows"))]
+fn start_mouse_listener() {
+    std::thread::spawn(|| {
+        println!("[Phoenix Shell] Mouse button listener started (rdev)");
+        let a1 = XBUTTON1_ACTION.get().map(|s| s.as_str()).unwrap_or("winh").to_string();
+        let a2 = XBUTTON2_ACTION.get().map(|s| s.as_str()).unwrap_or("dictate").to_string();
+        if let Err(e) = rdev::listen(move |event| {
+            if let rdev::EventType::ButtonPress(rdev::Button::Unknown(code)) = event.event_type {
+                match code {
+                    1 | 5 | 8 => execute_voice_action(&a1),
+                    2 | 6 | 9 => execute_voice_action(&a2),
+                    _ => {}
+                }
+            }
+        }) {
+            eprintln!("[Phoenix Shell] rdev mouse listener error: {:?}", e);
+        }
+    });
+}
+
+// ==================== App Setup ====================
+
+fn chrono_now() -> String {
+    // Simple ISO timestamp without chrono dependency
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    format!("{}", now)
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    // ---- WebView2 (Chromium) browser flags ----
+    // Must be set BEFORE Tauri's WebView2 environment is constructed.
+    //   --use-fake-ui-for-media-stream
+    //       Auto-accepts navigator.mediaDevices.getUserMedia without requiring
+    //       a user-gesture in the calling window. WebView2's PermissionRequested
+    //       event normally fires AFTER the gesture check; popouts opened
+    //       programmatically don't carry an activation from the opener, so the
+    //       call is silently denied before our handler runs. This flag bypasses
+    //       that gate. Safe on a single-user loopback origin.
+    //   --autoplay-policy=no-user-gesture-required
+    //       Allows <audio>.play() for the TTS reply without a per-window click.
+    //       Same reasoning: the popout was opened by a real click in the parent
+    //       terminal, but the activation doesn't cross window boundaries.
+    #[cfg(target_os = "windows")]
+    {
+        let existing = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").unwrap_or_default();
+        let extra = "--use-fake-ui-for-media-stream --autoplay-policy=no-user-gesture-required";
+        let merged = if existing.is_empty() {
+            extra.to_string()
+        } else {
+            format!("{} {}", existing, extra)
+        };
+        std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", &merged);
+        println!("[Phoenix Shell] WebView2 args: {}", merged);
+    }
+
+    let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
+
+    tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new()
+            .with_handler(|app, shortcut, event| {
+                if event.state() == ShortcutState::Pressed {
+                    let win_h = Shortcut::new(Some(Modifiers::SUPER), Code::KeyH);
+                    if shortcut == &win_h {
+                        // Unregister, send real Win+H to OS, re-register.
+                        // Keep textarea focused so voice-typed text lands in the input box.
+                        let handle = app.clone();
+                        std::thread::spawn(move || {
+                            let _ = handle.global_shortcut().unregister(win_h);
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                            #[cfg(target_os = "windows")]
+                            send_win_h();
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                            let _ = handle.global_shortcut().register(win_h);
+                        });
+                    }
+                }
+            })
+            .build()
+        )
+        .manage(registry.clone())
+        .invoke_handler(tauri::generate_handler![
+            list_windows,
+            open_window,
+            screenshot_window,
+            screenshot_full,
+            focus_window,
+            close_window,
+        ])
+        .setup(move |app| {
+            // ---- WebView2 permission auto-grant on the main window (Windows) ----
+            // The main window is created from tauri.conf.json before setup() runs,
+            // so we grab it by label and attach the handler post-hoc. Any popouts
+            // (open_window cmd, /open HTTP) attach their own handlers at build time.
+            if let Some(main_window) = app.get_webview_window("main") {
+                webview_perms::attach_auto_grant(&main_window);
+            }
+
+            // ---- System Tray ----
+            let show_i = MenuItem::with_id(app, "show", "Show Dashboard", true, None::<&str>)?;
+            let quit_i = MenuItem::with_id(app, "quit", "Quit Phoenix", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show_i, &quit_i])?;
+
+            let _tray = TrayIconBuilder::new()
+                .icon(app.default_window_icon().cloned().unwrap())
+                .tooltip("Phoenix")
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "show" => {
+                        if let Some(w) = app.get_webview_window("main") {
+                            let _ = w.unminimize();
+                            let _ = w.show();
+                            let _ = w.set_focus();
+                        }
+                    }
+                    "quit" => {
+                        app.exit(0);
+                    }
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        let app = tray.app_handle();
+                        if let Some(w) = app.get_webview_window("main") {
+                            let _ = w.unminimize();
+                            let _ = w.show();
+                            let _ = w.set_focus();
+                        }
+                    }
+                })
+                .build(app)?;
+
+            // ---- Register Win+H global shortcut to bypass WebView2 interception ----
+            // Win11 reserves Win+H natively for system voice typing and refuses
+            // to let any app register it as a global hotkey. The registration
+            // call panics on Win11. Make it tolerant: try to register, log on
+            // failure, continue. Voice typing still works via the OS-native
+            // Win+H handler — the dashboard textarea stays focused as the input
+            // sink. Don't `?` the result.
+            let win_h = Shortcut::new(Some(Modifiers::SUPER), Code::KeyH);
+            if let Err(e) = app.global_shortcut().register(win_h) {
+                eprintln!("[Phoenix Shell] Win+H global shortcut not registered (OS owns it): {e}");
+            }
+
+            // ---- Load voice button config from Phoenix settings, then start listener ----
+            load_voice_button_config();
+            start_mouse_listener();
+
+            // ---- Start HTTP API so Phoenix server can call us directly ----
+            let handle = app.handle().clone();
+            start_http_api(handle, registry.clone());
+
+            // ---- Register with Phoenix server ----
+            let _handle2 = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let client = reqwest::Client::new();
+                let _ = client.post(format!("{}/api/v1/register", PHOENIX_SERVER))
+                    .json(&serde_json::json!({
+                        "name": "phoenix-shell",
+                        "device_type": "desktop-shell",
+                        "capabilities": ["windows", "screenshots", "tray"],
+                        "shell_port": SHELL_PORT
+                    }))
+                    .send()
+                    .await;
+                println!("[Phoenix Shell] Registered with Phoenix server");
+            });
+
+            Ok(())
+        })
+        .run(tauri::generate_context!())
+        .expect("error while running Phoenix Shell");
+}

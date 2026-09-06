@@ -1,0 +1,68 @@
+name: Release Installer Binaries
+
+# Triggered when a version tag is pushed: git tag v0.3.2 && git push --tags
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to create releases and upload assets
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install service dependencies
+        working-directory: service
+        run: npm install
+
+      - name: Install @yao-pkg/pkg
+        run: npm install -g @yao-pkg/pkg
+
+      - name: Build installer binaries
+        working-directory: service
+        run: node scripts/build-installer.js
+
+      - name: List built binaries
+        run: ls -lh service/bin/phoenix-installer-*
+
+      - name: Create GitHub Release with binaries
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Phoenix ${{ github.ref_name }}"
+          body: |
+            ## Phoenix Device Installer ${{ github.ref_name }}
+
+            Download the installer for your OS, run it, and follow the browser UI to connect your device to your Phoenix hub.
+
+            ### Windows
+            1. Download `phoenix-installer-win.exe`
+            2. Double-click to run — Windows may show a SmartScreen warning, click **More info → Run anyway**
+            3. Your browser will open automatically
+
+            ### Linux
+            ```bash
+            chmod +x phoenix-installer-linux
+            ./phoenix-installer-linux
+            ```
+
+            The installer:
+            - Automatically finds Phoenix hubs on your local network (LAN + Tailscale)
+            - Lets you paste an invite link if you're connecting remotely
+            - Enrolls this device and installs the phoenix-client background service
+            - Connects via WebSocket or HTTP queue (no public IP needed)
+
+            ---
+            *Built automatically from tag ${{ github.ref_name }}*
+          files: |
+            service/bin/phoenix-installer-win.exe
+            service/bin/phoenix-installer-linux

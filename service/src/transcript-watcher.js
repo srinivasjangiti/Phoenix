@@ -1,0 +1,399 @@
+// Transcript watcher — uses fs.watch to monitor Claude Code's JSONL transcript
+// files for a given project cwd. Pushes parsed messages to subscribers when
+// files change. Replaces the broken "dashboard polls /api/transcript every
+// second" model with real-time push.
+//
+// One watcher per project (keyed by cwd). Multiple WebSocket clients can
+// subscribe; they all get the same updates. Watchers are torn down when
+// the last subscriber disconnects.
+
+import { watch as fsWatch, openSync, readSync, closeSync, statSync, existsSync, readdirSync, appendFileSync } from 'fs';
+import { join } from 'path';
+import { homedir } from 'os';
+
+// cwd → { watcher, subscribers: Set<callback>, lastEmitted: Map<filepath, mtime> }
+const watchers = new Map();
+
+// Normalize cwd so backslash and forward-slash variants resolve to the same Map key.
+// Without this, hooks (which send backslash cwds from Claude Code on Windows) can't
+// find the watcher registered by the terminal (which uses forward-slash cwds).
+function normalizeCwd(cwd) {
+  return cwd.replace(/\\/g, '/').replace(/\/$/, '');
+}
+
+// Convert a project cwd to the Claude Code projects directory format.
+// Claude Code stores transcripts under ~/.claude/projects/<slug>/<sessionId>.jsonl
+// where the slug is the cwd with separators replaced by dashes.
+function cwdToClaudeDir(cwd) {
+  const normalized = cwd.replace(/\\/g, '/').replace(/\/$/, '');
+  const slug = normalized.replace(/[\/:]/g, '-');
+  return join(homedir(), '.claude', 'projects', slug);
+}
+
+// Write a system event (PTY exit, restart, disconnect, etc.) directly into the
+// most recent JSONL session file for a project cwd. This makes system events
+// persist across server restarts and appear in the transcript view permanently.
+// Event format: { type: 'system', event: 'pty_exit'|'restart'|'disconnect'|..., text: '...', timestamp: ISO }
+// Write a system event to the correct JSONL session file.
+// If meta.session_id is provided AND matches a known .jsonl filename, write to that
+// specific file. Otherwise falls back to the most recent .jsonl file.
+// This prevents PTY exit events from one tab being written to another tab's file
+// when both tabs share the same cwd.
+export function writeSystemEvent(cwd, event, text, meta = {}) {
+  cwd = normalizeCwd(cwd);
+  const dir = cwdToClaudeDir(cwd);
+  if (!existsSync(dir)) return false;
+  try {
+    const files = readdirSync(dir).filter(f => f.endsWith('.jsonl'));
+    if (files.length === 0) return false;
+
+    let target = null;
+
+    // Try to target a specific Claude session file if session_id is provided
+    if (meta.session_id) {
+      const exactFile = meta.session_id + '.jsonl';
+      if (files.includes(exactFile)) {
+        target = join(dir, exactFile);
+      }
+    }
+
+    // Fallback: most recent JSONL file
+    if (!target) {
+      const filesWithMtime = files.map(f => {
+        const full = join(dir, f);
+        try { return { full, mtime: statSync(full).mtimeMs }; }
+        catch { return { full, mtime: 0 }; }
+      }).sort((a, b) => b.mtime - a.mtime);
+      target = filesWithMtime[0].full;
+    }
+
+    const record = JSON.stringify({
+      type: 'system',
+      event,
+      text,
+      timestamp: new Date().toISOString(),
+      ...meta,
+    });
+    appendFileSync(target, '\n' + record);
+    console.log(`[transcript-watcher] Wrote system event: ${event} → ${target.split(/[/\\]/).pop()}`);
+    return true;
+  } catch (err) {
+    console.error('[transcript-watcher] writeSystemEvent error:', err.message);
+    return false;
+  }
+}
+
+// Incrementally parse a Claude Code JSONL transcript file.
+// fileState: Map<filepath, { byteOffset, partialLine, messages, agentToolCalls }>
+//   — owned by the watcher entry, torn down when the watcher is torn down.
+//
+// First call reads the whole file; every subsequent call reads only the bytes
+// appended since last time. This keeps parse cost O(new data) instead of
+// O(total file size), which matters a lot in long sessions with many tool calls.
+function parseJsonlFileIncremental(filepath, fileState) {
+  let state = fileState.get(filepath);
+  if (!state) {
+    state = { byteOffset: 0, partialLine: '', messages: [], agentToolCalls: new Map() };
+    fileState.set(filepath, state);
+  }
+
+  try {
+    let st;
+    try { st = statSync(filepath); } catch { return state.messages; }
+
+    // File was replaced / truncated — reset and re-read from scratch
+    if (st.size < state.byteOffset) {
+      state.byteOffset = 0;
+      state.partialLine = '';
+      state.messages = [];
+      state.agentToolCalls = new Map();
+    }
+
+    if (st.size === state.byteOffset) return state.messages; // Nothing new
+
+    // Read only the bytes appended since last parse
+    const newByteCount = st.size - state.byteOffset;
+    const buf = Buffer.allocUnsafe(newByteCount);
+    const fd = openSync(filepath, 'r');
+    let bytesRead = 0;
+    try {
+      bytesRead = readSync(fd, buf, 0, newByteCount, state.byteOffset);
+    } finally {
+      closeSync(fd);
+    }
+    if (bytesRead === 0) return state.messages;
+    state.byteOffset += bytesRead;
+
+    // Prepend any leftover partial line from the previous read, then split
+    const chunk = state.partialLine + buf.slice(0, bytesRead).toString('utf-8');
+    const lines = chunk.split('\n');
+    state.partialLine = lines.pop() ?? ''; // last entry may be incomplete — hold for next read
+
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      let obj;
+      try { obj = JSON.parse(line); } catch { continue; }
+
+      // System events (PTY exit, restart, disconnect, etc.) — written by writeSystemEvent()
+      if (obj.type === 'system' && obj.event) {
+        state.messages.push({ role: 'system', type: obj.event, text: obj.text || obj.event, ts: obj.timestamp });
+        continue;
+      }
+
+      // User prompt — also contains tool_result blocks (agent responses)
+      if (obj.type === 'user' && obj.message) {
+        const content = obj.message.content;
+        if (typeof content === 'string' && content.trim()) {
+          state.messages.push({ role: 'user', type: 'prompt', text: content, ts: obj.timestamp });
+        } else if (Array.isArray(content)) {
+          let textParts = [];
+          for (const block of content) {
+            if (block.type === 'text' && block.text?.trim()) {
+              textParts.push(block.text);
+            } else if (block.type === 'tool_result' && state.agentToolCalls.has(block.tool_use_id)) {
+              // This tool_result is the response from a sub-agent — emit it as a
+              // distinct 'agent_result' message instead of folding it into the leader's turn.
+              const agentInfo = state.agentToolCalls.get(block.tool_use_id);
+              let resultText = '';
+              if (typeof block.content === 'string') {
+                resultText = block.content;
+              } else if (Array.isArray(block.content)) {
+                resultText = block.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
+              }
+              if (resultText.trim()) {
+                state.messages.push({
+                  role: 'agent',
+                  type: 'agent_result',
+                  text: resultText.trim(),
+                  agentDescription: agentInfo.description,
+                  ts: obj.timestamp,
+                });
+              }
+            }
+          }
+          if (textParts.length) {
+            state.messages.push({ role: 'user', type: 'prompt', text: textParts.join('\n'), ts: obj.timestamp });
+          }
+        }
+        continue;
+      }
+
+      // Assistant messages
+      if (obj.type === 'assistant' && Array.isArray(obj.message?.content)) {
+        const model = obj.message?.model || null;
+        for (const block of obj.message.content) {
+          if (block.type === 'text' && block.text) {
+            state.messages.push({ role: 'assistant', type: 'text', text: block.text, ts: obj.timestamp, model });
+          } else if (block.type === 'tool_use') {
+            const name = block.name || 'unknown';
+            const input = block.input || {};
+            let summary = name;
+            if (name === 'Bash' && input.command) summary = `Bash: ${input.command.substring(0, 120)}`;
+            else if (name === 'Edit' && input.file_path) summary = `Edit: ${input.file_path.split(/[/\\]/).pop()}`;
+            else if (name === 'Read' && input.file_path) summary = `Read: ${input.file_path.split(/[/\\]/).pop()}`;
+            else if (name === 'Write' && input.file_path) summary = `Write: ${input.file_path.split(/[/\\]/).pop()}`;
+            else if (name === 'Grep' && input.pattern) summary = `Grep: ${input.pattern.substring(0, 60)}`;
+            else if (name === 'Glob' && input.pattern) summary = `Glob: ${input.pattern}`;
+            else if (name === 'Agent' && input.description) {
+              summary = `Agent: ${input.description}`;
+              if (block.id) state.agentToolCalls.set(block.id, { description: input.description });
+            } else if (name === 'Agent' && input.prompt) {
+              summary = `Agent: ${input.prompt.substring(0, 80)}`;
+              if (block.id) state.agentToolCalls.set(block.id, { description: input.prompt.substring(0, 60) });
+            }
+            state.messages.push({ role: 'assistant', type: 'tool', text: summary, ts: obj.timestamp });
+          }
+        }
+      }
+    }
+    return state.messages;
+  } catch (err) {
+    console.error('[transcript-watcher] incremental parse error:', filepath, err.message);
+    return state.messages;
+  }
+}
+
+// Read JSONL files in the project directory and return a sorted message list.
+// If claudeSessionIds is provided (non-empty array), only read those specific session files.
+// If empty/null, returns nothing — prevents cross-tab contamination where a tab
+// with no known sessions would read the most recent file (which might belong to
+// another tab). Tabs must discover their Claude session ID first via chat_update.
+function readAllForCwd(cwd, claudeSessionIds, fileState) {
+  const dir = cwdToClaudeDir(cwd);
+  if (!existsSync(dir)) return [];
+  let allMessages = [];
+  try {
+    const files = readdirSync(dir).filter(f => f.endsWith('.jsonl'));
+
+    let filesToRead;
+    if (claudeSessionIds && claudeSessionIds.length > 0) {
+      // Filter to only the JSONL files matching this tab's known Claude sessions
+      const sessionSet = new Set(claudeSessionIds);
+      filesToRead = files
+        .filter(f => sessionSet.has(f.replace('.jsonl', '')))
+        .map(f => join(dir, f));
+    } else {
+      // No known sessions — return empty. The tab will get data once it
+      // discovers its Claude session ID via chat_update → set_claude_sessions.
+      // Previously this read the most-recent file, which caused cross-tab
+      // contamination when multiple tabs shared the same cwd.
+      return [];
+    }
+
+    for (const full of filesToRead) {
+      allMessages.push(...parseJsonlFileIncremental(full, fileState));
+    }
+    // Sort merged messages by timestamp ascending
+    allMessages.sort((a, b) => (a.ts || '').localeCompare(b.ts || ''));
+    // Dedup by role+type+text+timestamp — timestamp prevents dropping
+    // identical user messages sent at different times (e.g. "STOP" twice).
+    const seen = new Set();
+    const out = [];
+    for (const m of allMessages) {
+      const sig = `${m.role}|${m.type}|${m.ts || ''}|${(m.text || '').replace(/\s+/g, ' ').trim()}`;
+      if (sig.length > 10 && seen.has(sig)) continue;
+      seen.add(sig);
+      out.push(m);
+    }
+    return out;
+  } catch (err) {
+    console.error('[transcript-watcher] readAllForCwd error:', err.message);
+    return [];
+  }
+}
+
+// Subscribe a callback to changes for a project cwd. Returns an object with
+// unsubscribe() and setClaudeSessions(ids) to update the session filter.
+// Callback signature: (messages: Message[]) => void. Called immediately with
+// current state on subscribe, then on every file change in that project's dir.
+// claudeSessionIds: optional array of Claude session IDs to filter transcripts to.
+export function subscribeToTranscript(cwd, callback, claudeSessionIds) {
+  if (!cwd || !callback) return { unsubscribe: () => {}, setClaudeSessions: () => {} };
+  cwd = normalizeCwd(cwd);
+
+  // Each subscriber has its own session filter — wrap the callback
+  const subscriber = {
+    claudeSessionIds: claudeSessionIds || [],
+    callback,
+    fire() {
+      try {
+        // Look up current entry to get shared fileState (incremental read cache)
+        const e = watchers.get(cwd);
+        const fileState = e?.fileState || new Map();
+        const messages = readAllForCwd(cwd, this.claudeSessionIds.length > 0 ? this.claudeSessionIds : null, fileState);
+        this.callback(messages);
+      } catch (err) { console.error('[transcript-watcher] subscriber error:', err.message); }
+    }
+  };
+
+  let entry = watchers.get(cwd);
+  if (!entry) {
+    const dir = cwdToClaudeDir(cwd);
+    let watcher = null;
+    let debounceTimer = null;
+    const emit = () => {
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => {
+        const e = watchers.get(cwd);
+        if (!e) return;
+        for (const sub of e.subscribers) {
+          sub.fire();
+        }
+      }, 100); // 100ms debounce — coalesce rapid file writes
+    };
+    if (existsSync(dir)) {
+      try {
+        watcher = fsWatch(dir, { persistent: true }, (eventType, filename) => {
+          if (filename && filename.endsWith('.jsonl')) emit();
+        });
+      } catch (err) {
+        console.error('[transcript-watcher] fs.watch failed for', dir, ':', err.message);
+      }
+    } else {
+      // Directory doesn't exist yet — fall back to polling the parent for it to appear
+      console.warn('[transcript-watcher] dir does not exist yet:', dir);
+    }
+
+    // Polling fallback: fs.watch on Windows does NOT fire events when a process
+    // appends to a file with the handle held open (Claude Code does this). So
+    // we also poll the directory's .jsonl mtimes every 500ms and emit when any
+    // change. Cheap on Linux too — and harmless since emit() is debounced.
+    const pollState = new Map(); // filepath → "mtimeMs:size"
+    const poller = setInterval(() => {
+      if (!existsSync(dir)) return;
+      try {
+        const files = readdirSync(dir).filter(f => f.endsWith('.jsonl'));
+        let changed = false;
+        const seen = new Set();
+        for (const f of files) {
+          const full = join(dir, f);
+          seen.add(full);
+          let mt = 0, sz = 0;
+          try { const st = statSync(full); mt = st.mtimeMs; sz = st.size; } catch { continue; }
+          const key = `${mt}:${sz}`;
+          if (pollState.get(full) !== key) {
+            pollState.set(full, key);
+            changed = true;
+          }
+        }
+        // Detect deletions too
+        for (const k of pollState.keys()) {
+          if (!seen.has(k)) { pollState.delete(k); changed = true; }
+        }
+        if (changed) emit();
+      } catch {}
+    }, 500);
+
+    entry = { watcher, poller, subscribers: new Set(), dir, emit, fileState: new Map() };
+    watchers.set(cwd, entry);
+  }
+  entry.subscribers.add(subscriber);
+
+  // Immediate fire with current state
+  subscriber.fire();
+
+  return {
+    unsubscribe: () => {
+      const e = watchers.get(cwd);
+      if (!e) return;
+      e.subscribers.delete(subscriber);
+      if (e.subscribers.size === 0) {
+        try { e.watcher?.close(); } catch {}
+        try { if (e.poller) clearInterval(e.poller); } catch {}
+        e.fileState.clear(); // release incremental parse cache
+        watchers.delete(cwd);
+      }
+    },
+    setClaudeSessions: (ids) => {
+      subscriber.claudeSessionIds = ids || [];
+      // Clear incremental state for any newly-added session files so they're
+      // read from scratch with the correct filter, not from a stale mid-file offset.
+      const e = watchers.get(cwd);
+      if (e && ids?.length) {
+        const dir = cwdToClaudeDir(cwd);
+        for (const id of ids) {
+          const fp = join(dir, id + '.jsonl');
+          if (!e.fileState.has(fp)) continue; // not cached yet — no action needed
+          // Only reset if byteOffset is 0 would be a no-op; if > 0 it may be mid-file
+          // Safe to always delete and let the next fire() re-read from scratch
+          e.fileState.delete(fp);
+        }
+      }
+      subscriber.fire(); // Re-read with new filter immediately
+    }
+  };
+}
+
+// Force a re-read and push of transcript data for a given cwd.
+// Called by hooks when we KNOW new data exists (UserPromptSubmit, AssistantMessage, Stop)
+// instead of waiting for the file poller to detect the change. This eliminates the
+// race condition where Windows file metadata caching prevents the poller from seeing
+// newly-written JSONL data while Claude holds the file handle open.
+export function nudgeTranscript(cwd) {
+  if (!cwd) return;
+  cwd = normalizeCwd(cwd);
+  const entry = watchers.get(cwd);
+  if (!entry) return;
+  // Use the watcher's emit (which debounces and reads fresh data)
+  if (entry.emit) entry.emit();
+}
