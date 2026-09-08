@@ -4,7 +4,13 @@ import { killProcessOnPort } from '../platform.js';
 export default async function cmdStart(args) {
   const detached = args.includes('-d') || args.includes('--detach');
   const noCarrier = args.includes('--no-carrier');
+  const isSupervised = args.includes('--supervised') || process.env.PHOENIX_SUPERVISED === '1';
+  if (isSupervised) process.env.PHOENIX_SUPERVISED = '1';
   const isDev = process.env.PHOENIX_DEV === '1';
+
+  if (isSupervised) {
+    console.log('[Phoenix] Running under Desktop Supervisor');
+  }
 
   if (detached) {
     // Spawn self as background process

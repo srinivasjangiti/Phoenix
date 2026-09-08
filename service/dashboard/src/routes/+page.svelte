@@ -6,7 +6,17 @@
 	import { goto } from '$app/navigation';
 	import { base } from '$app/paths';
 
-	onMount(() => {
+	onMount(async () => {
+		try {
+			const res = await fetch('/api/v1/readiness');
+			if (res.ok) {
+				const data = await res.json();
+				if (data && data.first_run_complete === false) {
+					goto(`${base}/setup`, { replaceState: true });
+					return;
+				}
+			}
+		} catch {}
 		goto(`${base}/terminal`, { replaceState: true });
 	});
 </script>

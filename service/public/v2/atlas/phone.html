@@ -7,18 +7,18 @@
 		<link rel="preconnect" href="https://fonts.googleapis.com">
 		<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 		<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
-		<link href="../_app/immutable/entry/start.I519eXTS.js" rel="modulepreload">
-		<link href="../_app/immutable/chunks/dQis-Gbb.js" rel="modulepreload">
-		<link href="../_app/immutable/chunks/lJg17zR0.js" rel="modulepreload">
-		<link href="../_app/immutable/chunks/K_h55RLa.js" rel="modulepreload">
-		<link href="../_app/immutable/chunks/C_oMJGr5.js" rel="modulepreload">
-		<link href="../_app/immutable/entry/app.BtvtoZr5.js" rel="modulepreload">
-		<link href="../_app/immutable/chunks/j6NluSen.js" rel="modulepreload">
-		<link href="../_app/immutable/chunks/DbQeXaZJ.js" rel="modulepreload">
-		<link href="../_app/immutable/chunks/B34qpdlx.js" rel="modulepreload">
-		<link href="../_app/immutable/chunks/7SpAA7GC.js" rel="modulepreload">
-		<link href="../_app/immutable/chunks/CrEqVSAs.js" rel="modulepreload">
-		<link href="../_app/immutable/chunks/e4QTU2zu.js" rel="modulepreload">
+		<link href="../_app/immutable/entry/start.CVp_goKp.js" rel="modulepreload">
+		<link href="../_app/immutable/chunks/BjYPDBtt.js" rel="modulepreload">
+		<link href="../_app/immutable/chunks/CUji4bWz.js" rel="modulepreload">
+		<link href="../_app/immutable/chunks/BdQguK23.js" rel="modulepreload">
+		<link href="../_app/immutable/chunks/DHEp9f8-.js" rel="modulepreload">
+		<link href="../_app/immutable/entry/app.CNSlcHEh.js" rel="modulepreload">
+		<link href="../_app/immutable/chunks/BnjOwFu5.js" rel="modulepreload">
+		<link href="../_app/immutable/chunks/DYzPI6Nj.js" rel="modulepreload">
+		<link href="../_app/immutable/chunks/BRYt70h2.js" rel="modulepreload">
+		<link href="../_app/immutable/chunks/CQZBv5Hy.js" rel="modulepreload">
+		<link href="../_app/immutable/chunks/d1e6p5NH.js" rel="modulepreload">
+		<link href="../_app/immutable/chunks/DmKFOdl0.js" rel="modulepreload">
 		
 		<style>
 			/* Loading screen — visible before SvelteKit hydrates, then fades out */
@@ -118,7 +118,7 @@
 						setTimeout(function() { el.remove(); }, 350);
 						observer.disconnect();
 						// Shell rendered — clear stuck-reload counter so future load failures get a fresh budget.
-						try { sessionStorage.removeItem('pan_stuck_reload_count'); } catch(e) {}
+						try { sessionStorage.removeItem('phoenix_stuck_reload_count'); } catch(e) {}
 					}
 				});
 				observer.observe(document.body, { childList: true, subtree: true });
@@ -140,7 +140,7 @@
 			(function() {
 				var STUCK_TIMEOUT_MS = 8000;
 				var MAX_RELOADS = 3;
-				var COUNTER_KEY = 'pan_stuck_reload_count';
+				var COUNTER_KEY = 'phoenix_stuck_reload_count';
 				function shellRendered() {
 					return phoenixAppRendered();
 				}
@@ -186,15 +186,15 @@
 			// Block mouse back/forward buttons from navigating — Phoenix uses them for voice hotkeys
 			// XButton1 (button 3) = back = Win+H voice typing
 			// XButton2 (button 4) = forward = Phoenix whisper dictation
-			var _panXbFired = {};
+			var _phoenixXbFired = {};
 			['mousedown','mouseup','pointerdown','pointerup','auxclick'].forEach(function(evt) {
 				window.addEventListener(evt, function(e) {
 					if (e.button === 3 || e.button === 4) {
 						e.preventDefault();
 						e.stopPropagation();
 						// Fire voice action on mousedown only (not repeat for mouseup etc)
-						if (evt === 'mousedown' && !_panXbFired[e.button]) {
-							_panXbFired[e.button] = true;
+						if (evt === 'mousedown' && !_phoenixXbFired[e.button]) {
+							_phoenixXbFired[e.button] = true;
 							var action = e.button === 3 ? 'winh' : 'dictate';
 							fetch('/api/v1/voice/trigger', {
 								method: 'POST',
@@ -202,7 +202,7 @@
 								body: JSON.stringify({action: action})
 							}).catch(function(){});
 						}
-						if (evt === 'mouseup') _panXbFired[e.button] = false;
+						if (evt === 'mouseup') _phoenixXbFired[e.button] = false;
 						return false;
 					}
 				}, true);
@@ -211,7 +211,7 @@
 		<div style="display: contents">
 			<script>
 				{
-					__sveltekit_1lshpoz = {
+					__sveltekit_87cnis = {
 						base: new URL("..", location).pathname.slice(0, -1),
 						assets: "/v2"
 					};
@@ -219,8 +219,8 @@
 					const element = document.currentScript.parentElement;
 
 					Promise.all([
-						import("../_app/immutable/entry/start.I519eXTS.js"),
-						import("../_app/immutable/entry/app.BtvtoZr5.js")
+						import("../_app/immutable/entry/start.CVp_goKp.js"),
+						import("../_app/immutable/entry/app.CNSlcHEh.js")
 					]).then(([kit, app]) => {
 						kit.start(app, element);
 					});

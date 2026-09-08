@@ -40,9 +40,9 @@ Thumbs.db
 docs/REFACTOR-STATE-MACHINE.md
 
 # Temp files that sometimes land in project root due to Windows path mangling
-Temp*/
-C*/
-Users*/
+/Temp*/
+/C*/
+/Users*/
 *phoenix_settings.txt
 *testout.json
 Tempusage.txt
@@ -125,3 +125,7 @@ service/public/hardware-health.html
 # Personal photos / ad-hoc screenshots — never commit these.
 temp_photos/
 service/public/screenshots/
+
+# Local release test builds and IDE metadata
+the final exe file/
+.freebuff/

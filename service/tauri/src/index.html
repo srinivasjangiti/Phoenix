@@ -1,39 +1,70 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <link rel="stylesheet" href="styles.css" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Tauri App</title>
-    <script type="module" src="/main.js" defer></script>
-  </head>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Phoenix</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="splash-container">
+    <div class="glow-orb"></div>
 
-  <body>
-    <main class="container">
-      <h1>Welcome to Tauri</h1>
-
-      <div class="row">
-        <a href="https://tauri.app" target="_blank">
-          <img src="/assets/tauri.svg" class="logo tauri" alt="Tauri logo" />
-        </a>
-        <a
-          href="https://developer.mozilla.org/en-US/docs/Web/JavaScript"
-          target="_blank"
-        >
-          <img
-            src="/assets/javascript.svg"
-            class="logo vanilla"
-            alt="JavaScript logo"
-          />
-        </a>
+    <div class="brand-card">
+      <div class="logo-wrapper">
+        <svg class="phoenix-logo" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <linearGradient id="flameGrad" x1="16" y1="56" x2="48" y2="8" gradientUnits="userSpaceOnUse">
+              <stop offset="0%" stop-color="#FF4500" />
+              <stop offset="50%" stop-color="#FF8C00" />
+              <stop offset="100%" stop-color="#FFD700" />
+            </linearGradient>
+            <linearGradient id="innerFlame" x1="24" y1="48" x2="40" y2="16" gradientUnits="userSpaceOnUse">
+              <stop offset="0%" stop-color="#FF2200" />
+              <stop offset="100%" stop-color="#FFA500" />
+            </linearGradient>
+          </defs>
+          <!-- Outer wings/flames -->
+          <path d="M32 4C32 4 20 18 20 32C20 40 25 48 32 58C39 48 44 40 44 32C44 18 32 4 32 4Z" fill="url(#flameGrad)" opacity="0.9" />
+          <path d="M22 28C14 32 8 42 12 50C16 58 26 58 32 58C28 52 24 44 22 28Z" fill="url(#flameGrad)" opacity="0.75" />
+          <path d="M42 28C50 32 56 42 52 50C48 58 38 58 32 58C36 52 40 44 42 28Z" fill="url(#flameGrad)" opacity="0.75" />
+          <!-- Inner core flame -->
+          <path d="M32 20C32 20 25 30 25 38C25 44 28 50 32 54C36 50 39 44 39 38C39 30 32 20 32 20Z" fill="url(#innerFlame)" />
+        </svg>
       </div>
-      <p>Click on the Tauri logo to learn more about the framework</p>
 
-      <form class="row" id="greet-form">
-        <input id="greet-input" placeholder="Enter a name..." />
-        <button type="submit">Greet</button>
-      </form>
-      <p id="greet-msg"></p>
-    </main>
-  </body>
+      <h1 class="brand-title">Phoenix</h1>
+      <p class="brand-tagline">Personal AI &amp; Persistent Memory</p>
+
+      <div id="loading-state" class="state-container">
+        <div class="progress-track">
+          <div class="progress-bar-shimmer"></div>
+        </div>
+        <p id="status-text" class="status-text">Phoenix is starting...</p>
+      </div>
+
+      <div id="error-state" class="state-container hidden">
+        <div class="error-badge">⚠️ Startup Notice</div>
+        <p id="error-title" class="error-title">Phoenix took longer than expected</p>
+        <p id="error-desc" class="error-desc">We had trouble connecting to the local Phoenix service. Would you like to try again?</p>
+        
+        <div class="action-row">
+          <button id="retry-btn" class="btn btn-primary">Try Again</button>
+          <button id="browser-btn" class="btn btn-secondary">Open in Browser</button>
+        </div>
+
+        <details class="logs-accordion">
+          <summary>View Technical Details</summary>
+          <pre id="log-output" class="log-pre">No logs captured yet.</pre>
+        </details>
+      </div>
+    </div>
+
+    <footer class="splash-footer">
+      <span>Local-first &bull; Encrypted on your computer</span>
+    </footer>
+  </div>
+
+  <script src="main.js"></script>
+</body>
 </html>

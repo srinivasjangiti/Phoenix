@@ -2366,7 +2366,9 @@ function getSuiteList() {
 }
 
 // ==================== Startup and Phoenix Remembers are now proper suites ====================
-SUITES['pan-remembers'] = SUITES['phoenix-remembers'];
+if (suites['pan-remembers']) {
+  suites['phoenix-remembers'] = suites['pan-remembers'];
+}
 // They run as part of the dependency chain. No separate gate logic needed.
 
 function makeResultsScreenshotTest(suiteId) {

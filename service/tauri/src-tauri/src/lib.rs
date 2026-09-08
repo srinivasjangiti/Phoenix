@@ -107,17 +107,32 @@ mod webview_perms {
     pub fn attach_auto_grant(_window: &WebviewWindow) {}
 }
 
+mod backend;
+use backend::{BackendStatus, BackendSupervisor};
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
 const PHOENIX_SERVER: &str = "http://127.0.0.1:7777";
 const SHELL_PORT: u16 = 7790;
-const DICTATE_SCRIPT: &str = r"%USERPROFILE%\Desktop\Phoenix\service\src\dictate-vad.py";
-const VOICE_START_SND: &str = r"%USERPROFILE%\Desktop\Phoenix\service\bin\sounds\voice-start.wav";
-const VOICE_STOP_SND: &str = r"%USERPROFILE%\Desktop\Phoenix\service\bin\sounds\voice-stop.wav";
+
+static SERVICE_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+fn get_dictate_script() -> PathBuf {
+    SERVICE_DIR.get()
+        .map(|p| p.join("src").join("dictate-vad.py"))
+        .unwrap_or_else(|| PathBuf::from("service/src/dictate-vad.py"))
+}
+
+fn get_voice_sound(name: &str) -> PathBuf {
+    SERVICE_DIR.get()
+        .map(|p| p.join("bin").join("sounds").join(name))
+        .unwrap_or_else(|| PathBuf::from(format!("service/bin/sounds/{}", name)))
+}
 
 static DICTATE_BUSY: AtomicBool = AtomicBool::new(false);
 
 // Configurable mouse button actions — fetched from Phoenix settings at startup.
 // "winh" = trigger Win+H voice typing, "dictate" = run dictate-vad.py, "none" = disabled
-use std::sync::OnceLock;
 static XBUTTON1_ACTION: OnceLock<String> = OnceLock::new();
 static XBUTTON2_ACTION: OnceLock<String> = OnceLock::new();
 
@@ -309,6 +324,26 @@ async fn close_window(app: AppHandle, window_id: String) -> Result<(), String> {
     } else {
         Err(format!("Window '{}' not found", window_id))
     }
+}
+
+// ==================== Backend Supervisor Commands ====================
+
+#[tauri::command]
+fn get_backend_status(supervisor: tauri::State<Arc<BackendSupervisor>>) -> BackendStatus {
+    supervisor.get_status()
+}
+
+#[tauri::command]
+fn restart_backend(app: AppHandle, supervisor: tauri::State<Arc<BackendSupervisor>>) -> Result<(), String> {
+    supervisor.shutdown();
+    supervisor.start(app);
+    Ok(())
+}
+
+#[tauri::command]
+fn shutdown_backend(supervisor: tauri::State<Arc<BackendSupervisor>>) -> Result<(), String> {
+    supervisor.shutdown();
+    Ok(())
 }
 
 // ==================== HTTP API (Phoenix server calls this directly) ====================
@@ -699,16 +734,18 @@ fn start_dictation() {
 
         // Play start sound
         {
+            let snd = get_voice_sound("voice-start.wav");
             use std::process::Command;
             let _ = Command::new("powershell")
                 .args(["-NoProfile", "-Command",
-                    &format!("(New-Object Media.SoundPlayer '{}').PlaySync()", VOICE_START_SND)])
+                    &format!("(New-Object Media.SoundPlayer '{}').PlaySync()", snd.display())])
                 .creation_flags(CREATE_NO_WINDOW)
                 .spawn();
         }
 
+        let script = get_dictate_script();
         let result = std::process::Command::new("python.exe")
-            .args([DICTATE_SCRIPT, "--no-sounds"])
+            .args([script.to_string_lossy().as_ref(), "--no-sounds"])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .creation_flags(CREATE_NO_WINDOW)
@@ -721,10 +758,11 @@ fn start_dictation() {
 
         // Play stop sound
         {
+            let snd = get_voice_sound("voice-stop.wav");
             use std::process::Command;
             let _ = Command::new("powershell")
                 .args(["-NoProfile", "-Command",
-                    &format!("(New-Object Media.SoundPlayer '{}').PlaySync()", VOICE_STOP_SND)])
+                    &format!("(New-Object Media.SoundPlayer '{}').PlaySync()", snd.display())])
                 .creation_flags(CREATE_NO_WINDOW)
                 .spawn();
         }
@@ -826,8 +864,22 @@ fn chrono_now() -> String {
     format!("{}", now)
 }
 
+pub fn log_to_file(msg: &str) {
+    use std::io::Write;
+    let path = std::path::PathBuf::from(r"C:\Personal Coding\Projects\Phoenix\desktop.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "[{}] {}", chrono_now(), msg);
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    log_to_file("Phoenix starting run()...");
+    std::panic::set_hook(Box::new(|info| {
+        log_to_file(&format!("[PANIC] {:?}", info));
+        eprintln!("[PANIC] {:?}", info);
+    }));
+
     // ---- WebView2 (Chromium) browser flags ----
     // Must be set BEFORE Tauri's WebView2 environment is constructed.
     //   --use-fake-ui-for-media-stream
@@ -855,8 +907,19 @@ pub fn run() {
     }
 
     let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
+    let supervisor = Arc::new(
+        BackendSupervisor::new().unwrap_or_else(|e| {
+            eprintln!("[Phoenix Shell] Supervisor initialization failed: {}", e);
+            panic!("Cannot initialize Phoenix supervisor: {}", e);
+        })
+    );
+    let _ = SERVICE_DIR.set(supervisor.get_service_dir());
 
-    tauri::Builder::default()
+    let supervisor_tray = supervisor.clone();
+    let supervisor_setup = supervisor.clone();
+    let supervisor_exit = supervisor.clone();
+
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new()
             .with_handler(|app, shortcut, event| {
@@ -880,6 +943,7 @@ pub fn run() {
             .build()
         )
         .manage(registry.clone())
+        .manage(supervisor.clone())
         .invoke_handler(tauri::generate_handler![
             list_windows,
             open_window,
@@ -887,6 +951,9 @@ pub fn run() {
             screenshot_full,
             focus_window,
             close_window,
+            get_backend_status,
+            restart_backend,
+            shutdown_backend,
         ])
         .setup(move |app| {
             // ---- WebView2 permission auto-grant on the main window (Windows) ----
@@ -895,6 +962,15 @@ pub fn run() {
             // (open_window cmd, /open HTTP) attach their own handlers at build time.
             if let Some(main_window) = app.get_webview_window("main") {
                 webview_perms::attach_auto_grant(&main_window);
+                let sup_win = supervisor_setup.clone();
+                let app_handle_close = app.handle().clone();
+                main_window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { .. } = event {
+                        log_to_file("[Phoenix Shell] Main window close requested — shutting down backend");
+                        sup_win.shutdown();
+                        app_handle_close.exit(0);
+                    }
+                });
             }
 
             // ---- System Tray ----
@@ -902,12 +978,18 @@ pub fn run() {
             let quit_i = MenuItem::with_id(app, "quit", "Quit Phoenix", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show_i, &quit_i])?;
 
-            let _tray = TrayIconBuilder::new()
-                .icon(app.default_window_icon().cloned().unwrap())
+            let sup_quit = supervisor_tray.clone();
+            let mut tray_builder = TrayIconBuilder::new()
                 .tooltip("Phoenix")
                 .menu(&menu)
-                .show_menu_on_left_click(false)
-                .on_menu_event(|app, event| match event.id().as_ref() {
+                .show_menu_on_left_click(false);
+
+            if let Some(icon) = app.default_window_icon() {
+                tray_builder = tray_builder.icon(icon.clone());
+            }
+
+            let _tray = tray_builder
+                .on_menu_event(move |app, event| match event.id().as_ref() {
                     "show" => {
                         if let Some(w) = app.get_webview_window("main") {
                             let _ = w.unminimize();
@@ -916,6 +998,8 @@ pub fn run() {
                         }
                     }
                     "quit" => {
+                        println!("[Phoenix Shell] Quit requested via tray");
+                        sup_quit.shutdown();
                         app.exit(0);
                     }
                     _ => {}
@@ -938,12 +1022,6 @@ pub fn run() {
                 .build(app)?;
 
             // ---- Register Win+H global shortcut to bypass WebView2 interception ----
-            // Win11 reserves Win+H natively for system voice typing and refuses
-            // to let any app register it as a global hotkey. The registration
-            // call panics on Win11. Make it tolerant: try to register, log on
-            // failure, continue. Voice typing still works via the OS-native
-            // Win+H handler — the dashboard textarea stays focused as the input
-            // sink. Don't `?` the result.
             let win_h = Shortcut::new(Some(Modifiers::SUPER), Code::KeyH);
             if let Err(e) = app.global_shortcut().register(win_h) {
                 eprintln!("[Phoenix Shell] Win+H global shortcut not registered (OS owns it): {e}");
@@ -957,9 +1035,15 @@ pub fn run() {
             let handle = app.handle().clone();
             start_http_api(handle, registry.clone());
 
-            // ---- Register with Phoenix server ----
+            // ---- Start Backend Supervisor Lifecycle ----
+            println!("[Phoenix Shell] Starting managed backend process...");
+            supervisor_setup.start(app.handle().clone());
+
+            // ---- Register with Phoenix server when healthy ----
             let _handle2 = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                // Wait briefly for backend ready
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 let client = reqwest::Client::new();
                 let _ = client.post(format!("{}/api/v1/register", PHOENIX_SERVER))
                     .json(&serde_json::json!({
@@ -974,7 +1058,18 @@ pub fn run() {
             });
 
             Ok(())
-        })
-        .run(tauri::generate_context!())
-        .expect("error while running Phoenix Shell");
+        });
+
+    let app = builder
+        .build(tauri::generate_context!())
+        .expect("error while building Phoenix Shell");
+
+    app.run(move |_app_handle, event| {
+        log_to_file(&format!("[Tauri RunEvent] {:?}", event));
+        if let tauri::RunEvent::ExitRequested { .. } = event {
+            log_to_file("[Phoenix Shell] App exit requested — stopping backend...");
+            println!("[Phoenix Shell] App exit requested — stopping backend...");
+            supervisor_exit.shutdown();
+        }
+    });
 }

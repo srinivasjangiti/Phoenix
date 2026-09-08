@@ -74,7 +74,37 @@ Phoenix doesn't just store a giant pile of text. It files information into three
 
 ---
 
-## 6. Where Does Your Data Go? (Local vs. Cloud)
+## 6. How to Actually Use Phoenix
+
+Using Phoenix is as simple as chatting with an assistant, whether you are at your desk or on the move:
+
+### Step 1: Start Phoenix
+* **One-Click Launch:** Double-click `PHOENIX.bat` on your computer (or run `cd service && node phoenix.js start`).
+* **Open the Dashboard:** Navigate to `http://localhost:7777/v2/terminal` in your web browser (or use the Phoenix desktop app).
+* **For 100% Free & Offline AI:** Install [Ollama](https://ollama.com) and pull the default lightweight models:
+  ```bash
+  ollama pull gemma4:e2b
+  ollama pull qwen3-embedding:0.6b
+  ```
+
+### Step 2: The 3 Ways to Interact
+1. **Web / Desktop Dashboard:** Chat, view your encrypted memory log, run commands, and organize tasks from `http://localhost:7777/v2/terminal`.
+2. **AI Coding Tools (Claude Code / MCP):** If you use Claude Code, Phoenix connects automatically via `.mcp.json`. Every new coding session starts with Claude already remembering your recent progress and decisions.
+3. **Android Phone App:** Tap the microphone or type to your home PC from anywhere over a private, secure connection (Tailscale).
+
+### Step 3: Everyday Prompts You Can Use
+
+| What You Want | Example Prompt | What Phoenix Does |
+| :--- | :--- | :--- |
+| **Save a fact or preference** | *"Remember that the team presentation is rescheduled to Friday at 3 PM."* | Extracts the fact and stores it in semantic memory. |
+| **Recall past information** | *"When did we say the team presentation was?"* | Searches memory and replies with Friday at 3 PM. |
+| **Check where you left off** | *"What was I working on before lunch?"* | Checks your recent window activity and screen notes. |
+| **Trigger smart home devices** | *"Turn on the desk lamp."* | Matches the name to Home Assistant and turns on the light. |
+| **Multi-device commands** | *"Did the backup finish on my desktop?"* | Checks the status of your computer even while you are on your phone. |
+
+---
+
+## 7. Where Does Your Data Go? (Local vs. Cloud)
 
 * **Your Memories & Files:** **100% on your own computer.** They are stored in an encrypted database (`phoenix.db`) on your disk. They are never uploaded to a public cloud.
 * **Local Offline AI:** Phoenix can think completely offline using **Ollama** (free local AI models like Google's Gemma 4). Unplug your internet, and it still works!
@@ -83,7 +113,7 @@ Phoenix doesn't just store a giant pile of text. It files information into three
 
 ---
 
-## 7. Reality Check: Today vs. Future
+## 8. Reality Check: Today vs. Future
 
 | Works Right Now (Today) | Future Research (Not Built Yet) |
 | :--- | :--- |
@@ -96,12 +126,13 @@ Phoenix doesn't just store a giant pile of text. It files information into three
 
 ---
 
-## 8. Fast FAQ
+## 9. Fast FAQ
 
 * **Do I need to know how to code?** No. You can talk or type to Phoenix just like any messaging app.
 * **Does it remember after I turn off my PC?** Yes. All memories are saved to disk and reload when you turn your PC back on.
 * **Can someone steal my notes?** The database is locked with an encryption key (`phoenix.key`). Without the key, the file is unreadable scramble.
 * **Does it replace Windows?** No, it runs quietly as an assistant inside Windows or Linux.
+* **How do I stop or shut down Phoenix?** You can shut it down from the dashboard's Settings panel or close the server command window.
 
 ---
 

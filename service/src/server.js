@@ -62,6 +62,7 @@ import guardianRouter from './routes/guardian.js';
 import { guardianMiddleware } from './guardian.js';
 import { privacyMiddleware } from './privacy.js';
 import privacyRouter from './routes/privacy.js';
+import { getReadinessState, completeSetup } from './readiness.js';
 import { extractUser, setImpersonation, clearImpersonation, getImpersonation } from './middleware/auth.js';
 import { requireFeature, requireNotChild, getPermissionsMatrix } from './permissions.js';
 import { requireOrg, auditLog, verifyAllAuditChains, resignAuditChain } from './middleware/org-context.js';
@@ -2884,6 +2885,26 @@ app.put('/api/v1/settings', (req, res) => {
   }
 });
 
+// GET /api/v1/readiness — Centralized subsystem readiness state machine
+app.get('/api/v1/readiness', async (req, res) => {
+  try {
+    const state = await getReadinessState();
+    res.json(state);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// POST /api/v1/setup/complete — Record First-Run Onboarding completion
+app.post('/api/v1/setup/complete', (req, res) => {
+  try {
+    const result = completeSetup(req.body);
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ==================== TTS / Voice Profiles ====================
 // Lazy-load TTS module (heavy imports, only load when needed)
 let ttsModule = null;
@@ -5250,6 +5271,7 @@ _refreshTailscaleIp();
 setInterval(_refreshTailscaleIp, TAILSCALE_IP_REFRESH_MS).unref();
 
 app.get('/health', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
   const uptimeMs = Date.now() - _serverStartedAt;
   const secs = Math.floor(uptimeMs / 1000);
   const mins = Math.floor(secs / 60);

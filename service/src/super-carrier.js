@@ -52,11 +52,11 @@ function waitForCarrier() {
 let carrierProc   = null;
 let _shuttingDown = false;
 
-async function pollCarrierHealth(maxMs = 20_000) {
+async function pollCarrierHealth(maxMs = 25_000) {
   const deadline = Date.now() + maxMs;
   while (Date.now() < deadline) {
     try {
-      const res = await fetch(`http://127.0.0.1:${CARRIER_PORT}/health`,
+      const res = await fetch(`http://127.0.0.1:${CARRIER_PORT}/api/carrier/ready`,
         { signal: AbortSignal.timeout(1000) });
       if (res.ok) return true;
     } catch {}
@@ -224,10 +224,52 @@ function proxyWs(browserWs, url) {
 
 const CARRIER_RESTART_WATCHDOG_MS = 5_000; // force-kill if Carrier hasn't exited in 5s
 
+let _lastProbe = null;
+
 const server = createServer((req, res) => {
+  // Allow cross-origin requests from Tauri webview (tauri.localhost)
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': '*',
+    });
+    res.end();
+    return;
+  }
+
+  const [urlPath, queryString] = req.url.split('?');
+
+  if (urlPath === '/api/carrier/probe') {
+    if (req.method === 'POST') {
+      let b = '';
+      req.on('data', c => b += c);
+      req.on('end', () => {
+        try { _lastProbe = JSON.parse(b); } catch { _lastProbe = b; }
+        res.writeHead(200, {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+        });
+        res.end(JSON.stringify({ ok: true }));
+      });
+      return;
+    }
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+    });
+    res.end(JSON.stringify({ ok: true, probe: _lastProbe }));
+    return;
+  }
+
   // Super-Carrier answers /health directly — instant, never blocked by Carrier state
-  if (req.url === '/health' || req.url === '/api/carrier/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
+  if (urlPath === '/health' || urlPath === '/api/carrier/health') {
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': '*',
+    });
     res.end(JSON.stringify({
       ok:              true,
       carrier:         _carrierReady,  // dashboard checks this field
@@ -236,6 +278,15 @@ const server = createServer((req, res) => {
       carrierPid:      carrierProc?.pid ?? null,
       craftHealthy:    _carrierReady,  // optimistic — carrier will report accurately
     }));
+    return;
+  }
+
+  // Graceful shutdown endpoint — cleanly shuts down Carrier, Craft, and SuperCarrier
+  if ((urlPath === '/api/v1/shutdown' || urlPath === '/api/carrier/shutdown') && req.method === 'POST') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, message: 'Phoenix shutting down' }));
+    console.log('[SuperCarrier] Received shutdown request from supervisor/API');
+    setTimeout(() => shutdown('SUPERVISOR_API'), 50);
     return;
   }
 

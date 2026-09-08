@@ -1,6 +1,7 @@
 <script>
 	import { page } from '$app/state';
 	import { base } from '$app/paths';
+	import { goto } from '$app/navigation';
 	import { onMount } from 'svelte';
 	import { isSidebarCollapsed, toggleSidebar, setPanMode, getPanMode } from '$lib/stores.svelte.js';
 	import { loadTheme, applyTheme } from '$lib/theme.js';
@@ -621,6 +622,23 @@
 		}
 	}
 
+	let firstRunEvaluated = false;
+	async function checkFirstRun() {
+		if (firstRunEvaluated) return;
+		try {
+			const res = await fetch('/api/v1/readiness');
+			if (res.ok) {
+				const data = await res.json();
+				firstRunEvaluated = true;
+				if (data.first_run_complete === false) {
+					if (!page.url.pathname.includes('/setup')) {
+						goto(`${base}/setup`, { replaceState: true });
+					}
+				}
+			}
+		} catch {}
+	}
+
 	async function loadUser() {
 		try {
 			const res = await fetch('/auth/me');
@@ -694,6 +712,7 @@
 
 	$effect(() => {
 		checkHealth();
+		checkFirstRun();
 		loadUser();
 		loadOrgs();
 		loadUnread();
@@ -733,7 +752,7 @@
 	<div class="mobile-overlay" onclick={closeMobileMenu}></div>
 {/if}
 
-{#if page.url.pathname.includes('/atlas') || page.url.pathname.includes('/atlas-v2') || page.url.pathname.includes('/kronos') || page.url.pathname.includes('/crucible') || page.url.pathname.includes('/compose') || page.url.pathname.includes('/call') || page.url.pathname.includes('/comms')}
+{#if page.url.pathname.includes('/setup') || page.url.pathname.includes('/atlas') || page.url.pathname.includes('/atlas-v2') || page.url.pathname.includes('/kronos') || page.url.pathname.includes('/crucible') || page.url.pathname.includes('/compose') || page.url.pathname.includes('/call') || page.url.pathname.includes('/comms')}
 	{@render children()}
 {:else}
 <div class="shell">

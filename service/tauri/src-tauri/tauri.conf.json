@@ -1,10 +1,9 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Phoenix Shell",
-  "version": "0.1.0",
-  "identifier": "dev.phoenix.shell",
+  "productName": "Phoenix",
+  "version": "0.4.0",
+  "identifier": "ai.phoenix.desktop",
   "build": {
-    "devUrl": "http://127.0.0.1:7777",
     "frontendDist": "../src"
   },
   "app": {
@@ -12,8 +11,8 @@
     "windows": [
       {
         "label": "main",
-        "title": "Phoenix Dashboard",
-        "url": "http://127.0.0.1:7777/v2/",
+        "title": "Phoenix",
+        "url": "index.html",
         "width": 1280,
         "height": 800,
         "maximized": true,
@@ -22,7 +21,7 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self' 'unsafe-inline' http://127.0.0.1:* ws://127.0.0.1:* http://localhost:* ws://localhost:*; img-src 'self' data: http://127.0.0.1:* https:; media-src 'self' data: blob: http://127.0.0.1:*;"
     }
   },
   "bundle": {
