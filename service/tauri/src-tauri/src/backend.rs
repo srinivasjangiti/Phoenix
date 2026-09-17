@@ -283,9 +283,10 @@ impl BackendSupervisor {
 
         #[cfg(target_os = "windows")]
         {
-            // CREATE_NO_WINDOW flag to prevent console popups
+            // CREATE_NO_WINDOW (0x08000000) prevents console window popup
+            // CREATE_NEW_PROCESS_GROUP (0x00000200) isolates child from parent console close events
             use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000);
+            cmd.creation_flags(0x08000000 | 0x00000200);
         }
 
         let mut child = match cmd.spawn() {
@@ -314,6 +315,7 @@ impl BackendSupervisor {
                 let reader = BufReader::new(stdout);
                 for line in reader.lines().map_while(Result::ok) {
                     println!("[Phoenix Node] {}", line);
+                    log_to_file(&format!("[Phoenix Node] {}", line));
                     let mut l = logs_clone.lock().unwrap();
                     if l.len() >= MAX_LOG_LINES {
                         l.pop_front();
@@ -329,6 +331,7 @@ impl BackendSupervisor {
                 let reader = BufReader::new(stderr);
                 for line in reader.lines().map_while(Result::ok) {
                     eprintln!("[Phoenix Node ERR] {}", line);
+                    log_to_file(&format!("[Phoenix Node ERR] {}", line));
                     let mut l = logs_clone.lock().unwrap();
                     if l.len() >= MAX_LOG_LINES {
                         l.pop_front();
@@ -485,10 +488,11 @@ impl BackendSupervisor {
 
 fn is_port_healthy(port: u16) -> bool {
     let url = format!("http://127.0.0.1:{}/health", port);
-    if let Ok(resp) = ureq::get(&url)
-        .timeout(Duration::from_millis(800))
-        .call()
-    {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_millis(400))
+        .timeout_read(Duration::from_millis(800))
+        .build();
+    if let Ok(resp) = agent.get(&url).call() {
         if resp.status() == 200 {
             if let Ok(json) = resp.into_json::<serde_json::Value>() {
                 let ok = json.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);

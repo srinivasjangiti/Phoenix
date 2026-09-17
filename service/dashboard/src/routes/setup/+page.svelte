@@ -18,6 +18,168 @@
 	let voiceEnabled = $state(true);
 	let activityEnabled = $state(true);
 
+	// Local AI / Ollama management state
+	let ollamaStatus = $state(null);
+	let ollamaLoading = $state(false);
+	let ollamaStarting = $state(false);
+	let ollamaInstalling = $state(false);
+	let selectedLocalModel = $state('llama3.2:1b');
+	let pullProgress = $state({ active: false, percent: 0, completed: 0, total: 0, status: '' });
+	let pullPollingInterval = null;
+	let verifying = $state(false);
+	let verifyResult = $state(null);
+
+	function formatBytes(bytes) {
+		if (!bytes || bytes === 0) return '0 MB';
+		const mb = bytes / (1024 * 1024);
+		if (mb < 1024) return `${mb.toFixed(0)} MB`;
+		return `${(mb / 1024).toFixed(2)} GB`;
+	}
+
+	async function checkOllama() {
+		ollamaLoading = true;
+		try {
+			const res = await fetch(`${window.location.origin}/api/v1/ollama/status`);
+			if (res.ok) {
+				ollamaStatus = await res.json();
+				if (ollamaStatus.selected?.model) {
+					selectedLocalModel = ollamaStatus.selected.model;
+				} else if (ollamaStatus.models?.length > 0 && !ollamaStatus.models.some(m => m.name === selectedLocalModel)) {
+					selectedLocalModel = ollamaStatus.models[0].name;
+				}
+			}
+		} catch (err) {
+			console.error('Failed to fetch Ollama status:', err);
+		} finally {
+			ollamaLoading = false;
+		}
+	}
+
+	async function startOllama() {
+		ollamaStarting = true;
+		try {
+			const res = await fetch(`${window.location.origin}/api/v1/ollama/start`, { method: 'POST' });
+			const data = await res.json();
+			if (data.ok) {
+				await checkOllama();
+			} else {
+				alert(`Could not start Ollama: ${data.error || data.message}`);
+			}
+		} catch (err) {
+			alert(`Error starting Ollama: ${err.message}`);
+		} finally {
+			ollamaStarting = false;
+		}
+	}
+
+	async function installOllama() {
+		ollamaInstalling = true;
+		try {
+			const res = await fetch(`${window.location.origin}/api/v1/ollama/install`, { method: 'POST' });
+			const data = await res.json();
+			if (data.ok) {
+				alert('Official Ollama installer launched! Complete the Windows setup, then click "Refresh".');
+				const pollInt = setInterval(async () => {
+					await checkOllama();
+					if (ollamaStatus?.running) clearInterval(pollInt);
+				}, 3000);
+			} else {
+				alert(`Failed to launch installer: ${data.error || data.message}`);
+			}
+		} catch (err) {
+			alert(`Installer launch error: ${err.message}`);
+		} finally {
+			ollamaInstalling = false;
+		}
+	}
+
+	async function startPull(modelTag) {
+		try {
+			const res = await fetch(`${window.location.origin}/api/v1/ollama/pull`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ model: modelTag }),
+			});
+			const data = await res.json();
+			if (data.ok) {
+				pollPullProgress();
+			} else {
+				alert(`Could not start download: ${data.error || 'Unknown error'}`);
+			}
+		} catch (err) {
+			alert(`Download error: ${err.message}`);
+		}
+	}
+
+	function pollPullProgress() {
+		if (pullPollingInterval) clearInterval(pullPollingInterval);
+		pullPollingInterval = setInterval(async () => {
+			try {
+				const res = await fetch(`${window.location.origin}/api/v1/ollama/pull-progress`);
+				if (res.ok) {
+					const prog = await res.json();
+					pullProgress = prog;
+					if (!prog.active) {
+						clearInterval(pullPollingInterval);
+						pullPollingInterval = null;
+						await checkOllama();
+						if (prog.error) {
+							alert(`Download failed: ${prog.error}`);
+						}
+					}
+				}
+			} catch {
+				clearInterval(pullPollingInterval);
+				pullPollingInterval = null;
+			}
+		}, 1000);
+	}
+
+	async function cancelPull() {
+		try {
+			await fetch(`${window.location.origin}/api/v1/ollama/pull-cancel`, { method: 'POST' });
+			if (pullPollingInterval) {
+				clearInterval(pullPollingInterval);
+				pullPollingInterval = null;
+			}
+			pullProgress = { active: false, percent: 0, completed: 0, total: 0, status: '' };
+			await checkOllama();
+		} catch (err) {
+			console.error('Failed to cancel download:', err);
+		}
+	}
+
+	async function verifyModel(modelTag) {
+		verifying = true;
+		verifyResult = null;
+		try {
+			const res = await fetch(`${window.location.origin}/api/v1/ollama/verify`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ model: modelTag }),
+			});
+			verifyResult = await res.json();
+		} catch (err) {
+			verifyResult = { ok: false, verified: false, message: err.message };
+		} finally {
+			verifying = false;
+		}
+	}
+
+	async function selectModel(modelTag) {
+		selectedLocalModel = modelTag;
+		try {
+			await fetch(`${window.location.origin}/api/v1/ollama/select`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ model: modelTag }),
+			});
+			await checkOllama();
+		} catch (err) {
+			console.error('Failed to select model:', err);
+		}
+	}
+
 	// Live readiness polling
 	let readinessLoading = $state(false);
 	let readinessData = $state(null);
@@ -47,6 +209,9 @@
 		if (currentStep < totalSteps) {
 			currentStep += 1;
 			if (setupBodyEl) setupBodyEl.scrollTop = 0;
+			if (currentStep === 3 && aiChoice === 'local') {
+				checkOllama();
+			}
 			if (currentStep === 7) {
 				fetchReadiness();
 			}
@@ -57,8 +222,17 @@
 		if (currentStep > 1) {
 			currentStep -= 1;
 			if (setupBodyEl) setupBodyEl.scrollTop = 0;
+			if (currentStep === 3 && aiChoice === 'local') {
+				checkOllama();
+			}
 		}
 	}
+
+	$effect(() => {
+		if (aiChoice === 'local' && currentStep === 3 && !ollamaStatus && !ollamaLoading) {
+			checkOllama();
+		}
+	});
 
 	async function completeOnboarding() {
 		submitting = true;
@@ -80,8 +254,8 @@
 			});
 
 			if (res.ok) {
-				// Navigate to the main application
-				goto(`${base}/terminal`, { replaceState: true });
+				// Navigate to the main consumer application
+				goto(`${base}/comms?view=contacts&thread=thread-phoenix-system`, { replaceState: true });
 			} else {
 				const data = await res.json();
 				alert(`Failed to save setup: ${data.error || 'Unknown error'}`);
@@ -250,6 +424,171 @@
 								<div class="option-note">
 									Requires ~4 GB to 8 GB of available RAM and free disk space for model weights.
 								</div>
+
+								{#if aiChoice === 'local'}
+									<!-- svelte-ignore a11y_click_events_have_key_events -->
+									<!-- svelte-ignore a11y_no_static_element_interactions -->
+									<div class="local-ai-panel" onclick={(e) => e.stopPropagation()}>
+										{#if ollamaLoading && !ollamaStatus}
+											<div class="local-loading">
+												<div class="spinner"></div>
+												<span>Detecting local Ollama runtime...</span>
+											</div>
+										{:else if !ollamaStatus?.installed}
+											<!-- STATE 1: NOT INSTALLED -->
+											<div class="local-status-card warning">
+												<div class="card-status-line">
+													<span class="badge badge-warning">Ollama Not Detected</span>
+													<button type="button" class="btn btn-sm btn-ghost" onclick={checkOllama} disabled={ollamaLoading}>↻ Re-check</button>
+												</div>
+												<p class="card-text">
+													Ollama runtime was not found on this machine. Phoenix can launch the official Windows installer for you.
+												</p>
+												<div class="action-btn-row">
+													<button type="button" class="btn btn-primary btn-sm" onclick={installOllama} disabled={ollamaInstalling}>
+														{ollamaInstalling ? 'Launching Installer...' : 'Download & Run Ollama Setup'}
+													</button>
+												</div>
+											</div>
+										{:else if !ollamaStatus?.running}
+											<!-- STATE 2: INSTALLED BUT INACTIVE -->
+											<div class="local-status-card alert">
+												<div class="card-status-line">
+													<span class="badge badge-action">Installed But Inactive</span>
+													<button type="button" class="btn btn-sm btn-ghost" onclick={checkOllama} disabled={ollamaLoading}>↻ Re-check</button>
+												</div>
+												<p class="card-text">
+													Ollama is installed on your PC at <code class="code-inline">{ollamaStatus.binaryPath}</code>, but the engine is currently stopped.
+												</p>
+												<div class="action-btn-row">
+													<button type="button" class="btn btn-primary btn-sm" onclick={startOllama} disabled={ollamaStarting}>
+														{ollamaStarting ? 'Starting Engine...' : 'Start Local AI Engine'}
+													</button>
+												</div>
+											</div>
+										{:else}
+											<!-- STATE 3: RUNNING & READY -->
+											<div class="local-status-card active">
+												<div class="card-status-line">
+													<span class="badge badge-ready">● Ollama Active ({ollamaStatus.ownership === 'EXTERNAL_UNMANAGED' ? 'External / User' : 'Managed'})</span>
+													<button type="button" class="btn btn-sm btn-ghost" onclick={checkOllama} disabled={ollamaLoading}>↻ Refresh</button>
+												</div>
+
+												<!-- Models Selection List -->
+												<div class="model-selection-area">
+													<div class="model-sel-heading">Recommended Models:</div>
+													<div class="model-cards-grid">
+														{#each (ollamaStatus.recommended || []) as rec}
+															{@const isInstalled = (ollamaStatus.models || []).some(m => m.name === rec.tag)}
+															{@const isSelected = selectedLocalModel === rec.tag}
+															<!-- svelte-ignore a11y_click_events_have_key_events -->
+															<div
+																class="model-picker-card"
+																class:selected={isSelected}
+																class:installed={isInstalled}
+																onclick={() => selectModel(rec.tag)}
+																role="button"
+																tabindex="0"
+															>
+																<div class="m-card-top">
+																	<div class="m-card-name">
+																		<input type="radio" name="modelRadio" value={rec.tag} checked={isSelected} />
+																		<span>{rec.name}</span>
+																	</div>
+																	{#if isInstalled}
+																		<span class="badge badge-ready">Installed</span>
+																	{:else}
+																		<span class="badge badge-outline">Needs Download</span>
+																	{/if}
+																</div>
+																<div class="m-card-desc">{rec.description}</div>
+																<div class="m-card-meta">
+																	<span>💾 {rec.estimatedDownloadSize}</span>
+																	<span>⚡ {rec.estimatedMemoryUsage}</span>
+																</div>
+															</div>
+														{/each}
+													</div>
+
+													<!-- Installed Models not in recommended list -->
+													{#if (ollamaStatus.models || []).some(m => !(ollamaStatus.recommended || []).some(r => r.tag === m.name))}
+														<div class="extra-models">
+															<div class="model-sel-heading">Other Installed Models:</div>
+															<div class="model-cards-grid">
+																{#each (ollamaStatus.models || []).filter(m => !(ollamaStatus.recommended || []).some(r => r.tag === m.name)) as extra}
+																	{@const isSelected = selectedLocalModel === extra.name}
+																	<!-- svelte-ignore a11y_click_events_have_key_events -->
+																	<div
+																		class="model-picker-card"
+																		class:selected={isSelected}
+																		class:installed={true}
+																		onclick={() => selectModel(extra.name)}
+																		role="button"
+																		tabindex="0"
+																	>
+																		<div class="m-card-top">
+																			<div class="m-card-name">
+																				<input type="radio" name="modelRadio" value={extra.name} checked={isSelected} />
+																				<span>{extra.name}</span>
+																			</div>
+																			<span class="badge badge-ready">{formatBytes(extra.size)}</span>
+																		</div>
+																	</div>
+																{/each}
+															</div>
+														</div>
+													{/if}
+
+													<!-- Action Box: Download or Test -->
+													<div class="model-action-box">
+														{#if (ollamaStatus.models || []).some(m => m.name === selectedLocalModel)}
+															<div class="installed-banner">
+																<div class="banner-text">
+																	<span>✓ Model <strong class="code-inline">{selectedLocalModel}</strong> is installed and ready.</span>
+																</div>
+																<button type="button" class="btn btn-secondary btn-sm" onclick={() => verifyModel(selectedLocalModel)} disabled={verifying}>
+																	{verifying ? 'Testing...' : 'Run Quick Test'}
+																</button>
+															</div>
+															{#if verifyResult}
+																<div class="test-result" class:success={verifyResult.verified} class:fail={!verifyResult.verified}>
+																	{#if verifyResult.verified}
+																		<span>✓ Verified live inference in {verifyResult.latencyMs}ms (Response: "{verifyResult.output || 'READY'}")</span>
+																	{:else}
+																		<span>✗ Test failed: {verifyResult.message || 'No response from model'}</span>
+																	{/if}
+																</div>
+															{/if}
+														{:else if pullProgress?.active}
+															<div class="pull-box">
+																<div class="pull-status-row">
+																	<span class="pull-title">Downloading <strong>{pullProgress.model || selectedLocalModel}</strong>...</span>
+																	<button type="button" class="btn btn-sm btn-ghost text-danger" onclick={cancelPull}>Cancel</button>
+																</div>
+																<div class="progress-bar-wrap">
+																	<div class="progress-bar-fill" style="width: {pullProgress.percent || 0}%"></div>
+																</div>
+																<div class="pull-stats-row">
+																	<span>{pullProgress.status || 'Downloading layers...'}</span>
+																	<span>{formatBytes(pullProgress.completed)} / {formatBytes(pullProgress.total)} ({pullProgress.percent || 0}%)</span>
+																</div>
+															</div>
+														{:else}
+															<div class="download-action-row">
+																<div class="need-download-text">
+																	<span>Selected model <strong>{selectedLocalModel}</strong> is not yet downloaded.</span>
+																</div>
+																<button type="button" class="btn btn-primary btn-sm" onclick={() => startPull(selectedLocalModel)}>
+																	Download {selectedLocalModel}
+																</button>
+															</div>
+														{/if}
+													</div>
+												</div>
+											</div>
+										{/if}
+									</div>
+								{/if}
 							</div>
 						</label>
 
@@ -459,6 +798,13 @@
 										<span class="badge {getStatusClass(comp.status)}">{comp.status}</span>
 									</div>
 									<div class="comp-msg">{comp.message}</div>
+									{#if comp.status === 'NEEDS_ACTION' && (key === 'selected_model' || key === 'local_ai')}
+										<div style="margin-top:8px">
+											<button type="button" class="btn btn-sm btn-ghost fix-btn" onclick={() => { currentStep = 3; checkOllama(); }}>
+												Fix in Step 3 &rarr;
+											</button>
+										</div>
+									{/if}
 								</div>
 							{/each}
 						</div>
@@ -1189,6 +1535,236 @@
 		font-size: 13px;
 		color: #f87171;
 		margin-bottom: 20px;
+	}
+
+	.local-ai-panel {
+		margin-top: 14px;
+		background: rgba(0, 0, 0, 0.35);
+		border: 1px solid rgba(255, 255, 255, 0.08);
+		border-radius: 10px;
+		padding: 16px;
+	}
+
+	.local-loading {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		font-size: 13px;
+		color: #94a3b8;
+		padding: 10px 0;
+	}
+
+	.local-status-card {
+		display: flex;
+		flex-direction: column;
+		gap: 10px;
+	}
+
+	.card-status-line {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+	}
+
+	.card-text {
+		font-size: 12.5px;
+		color: #cbd5e1;
+		margin: 0;
+		line-height: 1.5;
+	}
+
+	.code-inline {
+		background: rgba(255, 255, 255, 0.08);
+		padding: 2px 6px;
+		border-radius: 4px;
+		font-family: monospace;
+		font-size: 12px;
+		color: #ff8a00;
+	}
+
+	.action-btn-row {
+		margin-top: 6px;
+	}
+
+	.btn-ghost {
+		background: transparent;
+		border: 1px solid rgba(255, 255, 255, 0.15);
+		color: #94a3b8;
+	}
+	.btn-ghost:hover {
+		background: rgba(255, 255, 255, 0.05);
+		color: #f1f5f9;
+	}
+
+	.model-selection-area {
+		display: flex;
+		flex-direction: column;
+		gap: 12px;
+		margin-top: 8px;
+	}
+
+	.model-sel-heading {
+		font-size: 12px;
+		font-weight: 600;
+		color: #94a3b8;
+		text-transform: uppercase;
+		letter-spacing: 0.5px;
+	}
+
+	.model-cards-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+		gap: 10px;
+	}
+
+	.model-picker-card {
+		background: rgba(255, 255, 255, 0.03);
+		border: 1px solid rgba(255, 255, 255, 0.08);
+		border-radius: 8px;
+		padding: 12px;
+		cursor: pointer;
+		transition: all 0.2s ease;
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+	}
+	.model-picker-card:hover {
+		background: rgba(255, 255, 255, 0.06);
+		border-color: rgba(255, 138, 0, 0.3);
+	}
+	.model-picker-card.selected {
+		border-color: #ff8a00;
+		background: rgba(255, 138, 0, 0.08);
+	}
+
+	.m-card-top {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+	}
+	.m-card-name {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		font-weight: 600;
+		font-size: 13px;
+		color: #f8fafc;
+	}
+	.m-card-desc {
+		font-size: 11.5px;
+		color: #94a3b8;
+		line-height: 1.4;
+	}
+	.m-card-meta {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		font-size: 11px;
+		color: #64748b;
+		margin-top: 4px;
+	}
+
+	.badge-outline {
+		background: transparent;
+		border: 1px solid rgba(255, 255, 255, 0.2);
+		color: #94a3b8;
+	}
+
+	.extra-models {
+		margin-top: 4px;
+	}
+
+	.model-action-box {
+		margin-top: 6px;
+		padding: 12px;
+		background: rgba(0, 0, 0, 0.2);
+		border-radius: 8px;
+		border: 1px solid rgba(255, 255, 255, 0.05);
+	}
+
+	.installed-banner {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px;
+	}
+	.banner-text {
+		font-size: 13px;
+		color: #10b981;
+	}
+
+	.test-result {
+		margin-top: 10px;
+		font-size: 12px;
+		padding: 8px 12px;
+		border-radius: 6px;
+	}
+	.test-result.success {
+		background: rgba(16, 185, 129, 0.1);
+		border: 1px solid rgba(16, 185, 129, 0.3);
+		color: #34d399;
+	}
+	.test-result.fail {
+		background: rgba(239, 68, 68, 0.1);
+		border: 1px solid rgba(239, 68, 68, 0.3);
+		color: #f87171;
+	}
+
+	.pull-box {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+	}
+	.pull-status-row {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		font-size: 13px;
+	}
+	.text-danger {
+		color: #f87171;
+	}
+
+	.progress-bar-wrap {
+		width: 100%;
+		height: 8px;
+		background: rgba(255, 255, 255, 0.08);
+		border-radius: 4px;
+		overflow: hidden;
+	}
+	.progress-bar-fill {
+		height: 100%;
+		background: linear-gradient(90deg, #ff8a00, #e52e71);
+		border-radius: 4px;
+		transition: width 0.3s ease;
+	}
+	.pull-stats-row {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		font-size: 11px;
+		color: #94a3b8;
+	}
+
+	.download-action-row {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px;
+	}
+	.need-download-text {
+		font-size: 12.5px;
+		color: #cbd5e1;
+	}
+
+	.fix-btn {
+		padding: 4px 10px;
+		font-size: 11.5px;
+		color: #ff8a00;
+		border-color: rgba(255, 138, 0, 0.3);
+	}
+	.fix-btn:hover {
+		background: rgba(255, 138, 0, 0.1);
 	}
 
 	@media (max-height: 840px) {

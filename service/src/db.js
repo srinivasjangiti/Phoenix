@@ -941,26 +941,8 @@ try {
   // clobber a row the user has explicitly changed via the dashboard.
   const seeds = [
     ['embedding',            'ollama@local', 'qwen3-embedding:0.6b', 1024, null,  'Vector embeddings — must match event_embeddings dim'],
-    ['chat_local',           'ollama@local', 'gemma4:e2b',           null, 131072, 'Local chat / intuition / classifier fallback'],
-    // Vision + chat_local are BOTH gemma4:e2b as of 2026-08-07. History:
-    // moondream (1.7GB) was the original seed and hallucinated literally every
-    // screenshot — "circles" on a Godot editor capture, and "blue background
-    // with white text 'For more information, click here'" across 100+
-    // consecutive screen_context events. minicpm-v (5.5GB) replaced it and was
-    // accurate but slow.
-    // Benchmarked on the Mini-PC (Ryzen 7 5800H, CPU-only), same photo + prompt:
-    //   gemma4:e4b   60s  — read the "OV3660" chip label off a ribbon cable
-    //   minicpm-v   140s  — called a clear container "a bowl", missed the label
-    //   qwen2.5vl   297s  — accurate, but 5x slower than gemma4
-    //   llava-phi3   38s  — hallucinated batteries that aren't in the frame
-    // Text-only classification, warm, same prompt:
-    //   gemma4:e4b  0.53s — correct answer
-    //   qwen3:4b     3.8s — EMPTY output; it spends the whole token budget on
-    //                       <think> and never emits an answer at short budgets
-    // One model for both purposes also stops the Mini-PC thrashing between a
-    // 5.5GB and a 2.5GB model on every alternating call. gemma4 additionally
-    // accepts audio (<=30s clips), which nothing in the old stack could do.
-    ['vision',               'ollama@local', 'gemma4:e2b',           null, null,  'Screen + webcam + audio understanding'],
+    ['chat_local',           'ollama@local', 'llama3.2:1b',          null, 131072, 'Local chat / intuition / classifier fallback (Phase 3 recommended)'],
+    ['vision',               'ollama@local', 'llama3.2:1b',          null, null,  'Screen + visual understanding fallback'],
     ['reasoning_cloud',      'cerebras',          'qwen-3-235b',          null, null,  'Smart cloud reasoning (substituted by Scout if retired)'],
     ['chat_cloud_fallback',  'anthropic',         'claude-haiku-4-5-20251001', null, null, 'Universal fallback when local + reasoning_cloud both fail'],
   ];
@@ -969,34 +951,25 @@ try {
          VALUES (:p, :pr, :m, :d, :c, :n)`,
       { ':p': purpose, ':pr': provider, ':m': model, ':d': dim, ':c': ctx, ':n': notes });
   }
-  // ── Migration: upgrade moondream → minicpm-v ──
-  // INSERT OR IGNORE above skips updating already-inserted rows, so existing
-  // installs are stuck on whatever seed shipped originally. The first seed was
-  // moondream (small, fast, broken). Force-upgrade any row that still points
-  // at moondream and a non-customized provider — but leave anything else the
-  // user might have manually selected alone.
+  // ── Migration: upgrade obsolete seeds (moondream, gemma4:e2b) → llama3.2:1b ──
   try {
     const cur = get(`SELECT model FROM model_selections WHERE purpose = 'vision'`);
-    if (cur && /^(moondream|minicpm-v)/i.test(cur.model || '')) {
+    if (cur && /^(moondream|minicpm-v|gemma4:e2b)/i.test(cur.model || '')) {
       run(`UPDATE model_selections
-           SET model = 'gemma4:e2b',
-               notes = 'Auto-upgraded to gemma4:e2b — 2.3x faster than minicpm-v and reads fine detail (chip labels) that minicpm-v missed',
+           SET model = 'llama3.2:1b',
+               notes = 'Auto-aligned to llama3.2:1b for Phase 3 consumer local AI',
                updated_at = datetime('now','localtime')
            WHERE purpose = 'vision'`);
-      console.log('[DB] vision model auto-upgraded → gemma4:e2b');
+      console.log('[DB] vision model auto-aligned → llama3.2:1b');
     }
-    // qwen3:4b is a reasoning model: at short num_predict budgets it spends the
-    // entire budget inside <think> and returns an EMPTY string, which silently
-    // breaks classifier/intuition fallback. Move it to gemma4:e2b, which answers
-    // the same prompt in ~0.5s.
     const curChat = get(`SELECT model FROM model_selections WHERE purpose = 'chat_local'`);
-    if (curChat && /^qwen3:4b/i.test(curChat.model || '')) {
+    if (curChat && /^(qwen3:4b|gemma4:e2b)/i.test(curChat.model || '')) {
       run(`UPDATE model_selections
-           SET model = 'gemma4:e2b', context_window = 131072,
-               notes = 'Auto-upgraded from qwen3:4b — qwen3 returned empty output for short classification prompts (<think> consumed the budget)',
+           SET model = 'llama3.2:1b', context_window = 131072,
+               notes = 'Auto-aligned from non-existent gemma4:e2b to llama3.2:1b for Phase 3 consumer local AI',
                updated_at = datetime('now','localtime')
            WHERE purpose = 'chat_local'`);
-      console.log('[DB] chat_local model auto-upgraded: qwen3:4b → gemma4:e2b');
+      console.log('[DB] chat_local model auto-aligned: ' + curChat.model + ' → llama3.2:1b');
     }
   } catch {}
 } catch {}

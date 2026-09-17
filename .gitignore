@@ -9,6 +9,8 @@ service/bin/cloudflared.exe
 service/bin/zrok2.exe
 
 # Build artifacts
+dist/
+node.exe
 android/.gradle/
 android/.idea/
 android/app/build/

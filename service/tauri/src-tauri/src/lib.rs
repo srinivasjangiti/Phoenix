@@ -956,6 +956,7 @@ pub fn run() {
             shutdown_backend,
         ])
         .setup(move |app| {
+            log_to_file("Inside builder.setup...");
             // ---- WebView2 permission auto-grant on the main window (Windows) ----
             // The main window is created from tauri.conf.json before setup() runs,
             // so we grab it by label and attach the handler post-hoc. Any popouts
@@ -1037,7 +1038,11 @@ pub fn run() {
 
             // ---- Start Backend Supervisor Lifecycle ----
             println!("[Phoenix Shell] Starting managed backend process...");
-            supervisor_setup.start(app.handle().clone());
+            let sup_bg = supervisor_setup.clone();
+            let app_bg = app.handle().clone();
+            std::thread::spawn(move || {
+                sup_bg.start(app_bg);
+            });
 
             // ---- Register with Phoenix server when healthy ----
             let _handle2 = app.handle().clone();
@@ -1060,10 +1065,20 @@ pub fn run() {
             Ok(())
         });
 
-    let app = builder
-        .build(tauri::generate_context!())
-        .expect("error while building Phoenix Shell");
+    log_to_file("Building Tauri context...");
+    let app = match builder.build(tauri::generate_context!()) {
+        Ok(a) => {
+            log_to_file("Tauri context built successfully!");
+            a
+        }
+        Err(e) => {
+            log_to_file(&format!("[FATAL] builder.build() failed: {:?}", e));
+            eprintln!("[FATAL] builder.build() failed: {:?}", e);
+            panic!("error while building Phoenix Shell: {:?}", e);
+        }
+    };
 
+    log_to_file("Starting app.run()...");
     app.run(move |_app_handle, event| {
         log_to_file(&format!("[Tauri RunEvent] {:?}", event));
         if let tauri::RunEvent::ExitRequested { .. } = event {

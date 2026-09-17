@@ -21,11 +21,47 @@ import { getCurrentSnapshot } from './intuition/index.js';
 import { getConversationState } from './conv-state-watcher.js';
 import { recentThoughts } from './intuition/mind.js';
 import { planFromResult as planProsody } from './tts-prosody.js';
+import { humanizeError } from './error-humanizer.js';
 
 // Recall-intent sniff — only when text matches this do we run a DB lookup on
 // the first pass. Pure conversation never touches FTS5/vector. See task #744
 // (#NEW-1) and docs/CONVERSATION-AND-INTERJECTION.md.
 const RECALL_RE = /\b(remember|recall|forgot|what (did|was|were|happened)|when (did|was|were)|where (did|was|were)|who (did|was|were|said)|find.*about|look.*up|tell me about)\b/i;
+
+// Extract balanced JSON object from model output to withstand trailing hallucinations
+function extractFirstJsonObject(str) {
+  if (typeof str !== 'string') return null;
+  const start = str.indexOf('{');
+  if (start === -1) return null;
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = start; i < str.length; i++) {
+    const ch = str[i];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (ch === '\\' && inString) {
+      escape = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (!inString) {
+      if (ch === '{') depth++;
+      else if (ch === '}') {
+        depth--;
+        if (depth === 0) {
+          return str.slice(start, i + 1);
+        }
+      }
+    }
+  }
+  return null;
+}
 
 // Build the situation block from the live intuition snapshot. Returns '' when
 // no snapshot is available (boot-up, isolated tests). See task #745 (#NEW-2).
@@ -593,22 +629,56 @@ ${memoryContext}`,
     );
 
     dbg.ai_latency_ms = Date.now() - dbg.ai_started_at;
+    if (_fallbackMeta.model) dbg.model = _fallbackMeta.model;
+    dbg.served_by = _fallbackMeta.model || dbg.model;
+    dbg.is_local = String(dbg.served_by || '').startsWith('ollama:');
     dbg.raw_response = (raw || '').slice(0, 2000);
     // #996: surface fallback metadata so the "🧠 why" dashboard panel shows
-    // which backend actually answered. Single-attempt is omitted to keep payload small.
+    // which backend actually answered.
     if (_fallbackMeta.attempts && _fallbackMeta.attempts.length > 1) {
       dbg.fallback_attempts = _fallbackMeta.attempts;
-      dbg.served_by = _fallbackMeta.model;
     }
     logStep(cmdId, 'unified_response', raw.slice(0, 200));
 
     // Strip thinking tags (Qwen 235B sometimes wraps in <think>...</think>)
     let cleaned = raw.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
-    // Extract JSON if wrapped in other text
-    const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
-    if (jsonMatch) cleaned = jsonMatch[0];
 
-    const action = JSON.parse(cleaned);
+    // Multi-tier robust JSON extraction (resilient to 1B/3B trailing echoes/hallucinations)
+    let action = null;
+    const balancedJson = extractFirstJsonObject(cleaned);
+    if (balancedJson) {
+      try { action = JSON.parse(balancedJson); } catch {}
+    }
+    if (!action) {
+      const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        try { action = JSON.parse(jsonMatch[0]); } catch {}
+      }
+    }
+    if (!action) {
+      const respMatch = cleaned.match(/"response"\s*:\s*"([^"]+)"/);
+      if (respMatch) {
+        action = { intent: 'query', speech_act: 'query', response: respMatch[1], importance: 0.5 };
+      } else {
+        const fallbackText = cleaned.replace(/^[^{\w]+/, '').slice(0, 500);
+        action = { intent: 'query', speech_act: 'query', response: fallbackText || 'Understood.', importance: 0.5 };
+      }
+    }
+
+    if (action) {
+      if (typeof action.response === 'object' && action.response !== null) {
+        action.response = action.response.text || action.response.response || action.response.message || action.response.content || action.response.answer || JSON.stringify(action.response);
+      } else if (typeof action.response !== 'string' || !action.response.trim()) {
+        const candidate = action.text || action.answer || action.message || action.content || action.reply || action.output;
+        if (typeof candidate === 'string' && candidate.trim()) {
+          action.response = candidate;
+        } else if (action.response != null) {
+          action.response = String(action.response);
+        } else {
+          action.response = 'Understood.';
+        }
+      }
+    }
     dbg.intent = action.intent || null;
     dbg.why = typeof action.why === 'string' ? action.why.slice(0, 400) : null;
     dbg.mind = typeof action.mind === 'string' ? action.mind.slice(0, 500) : null;
@@ -693,13 +763,27 @@ ${memoryContext}`,
 
     const finalResult = await processUnifiedResult(action, text, context);
     dbg.total_latency_ms = Date.now() - dbg.started_at;
-    try { finalResult._debug = dbg; } catch {}
+    try {
+      finalResult._debug = dbg;
+      finalResult.served_by = dbg.served_by;
+      finalResult.is_local = String(dbg.served_by || '').startsWith('ollama:');
+    } catch {}
     return finalResult;
   } catch (e) {
     console.error('[Phoenix Router] Unified call error:', e.message, '| raw:', typeof raw === 'string' ? raw.slice(0, 300) : raw);
     dbg.error = e.message || String(e);
     dbg.total_latency_ms = Date.now() - dbg.started_at;
-    const errResult = { intent: 'query', response: 'Phoenix is having trouble thinking right now.', importance: 0.5, _debug: dbg };
+    dbg.is_local = String(dbg.served_by || '').startsWith('ollama:');
+    const humanCard = humanizeError(e, { subsystem: 'router', model: dbg.model });
+    const errResult = {
+      intent: 'query',
+      response: humanCard.description || 'Phoenix is having trouble thinking right now.',
+      importance: 0.5,
+      served_by: dbg.served_by,
+      is_local: dbg.is_local,
+      human_error: humanCard,
+      _debug: dbg,
+    };
     try { errResult.prosody = planProsody(errResult); } catch {}
     return errResult;
   }
@@ -1466,7 +1550,8 @@ async function route(text, context = {}) {
     const quick = tryQuickSystem(text);
     if (quick) {
       logStep(cmdId, 'classified', 'system (quick, no Claude)');
-      logStep(cmdId, 'completed', quick.response?.slice(0, 200));
+      const quickPreview = typeof quick.response === 'string' ? quick.response.slice(0, 200) : (quick.response ? String(quick.response).slice(0, 200) : '');
+      logStep(cmdId, 'completed', quickPreview);
       insertRouterEvent(text, quick.intent, quick.response, context);
       return quick;
     }
@@ -1548,7 +1633,13 @@ async function route(text, context = {}) {
     }
   }
 
-  logStep(cmdId, 'completed', result.response?.slice(0, 200));
+  if (result && typeof result.response !== 'string') {
+    result.response = result.response != null ? String(result.response) : '';
+  }
+  const resultPreview = typeof result?.response === 'string'
+    ? result.response.slice(0, 200)
+    : (result?.response ? String(result.response).slice(0, 200) : '');
+  logStep(cmdId, 'completed', resultPreview);
   insertRouterEvent(text, result.intent, result.response, context);
 
   // Batch 4 (#986): attach prosody plan so non-streaming consumers (older
@@ -1767,12 +1858,13 @@ ${memoryContext}`;
 
   let fullBuf = '';
   let lastLen = 0;
+  const _streamMeta = {};
 
   try {
     // #996: streaming fallback wrapper. Connect-time failures cascade through
     // chain (cerebras → claude → ollama); mid-stream failures propagate as
     // truncation (no mid-stream switching — would corrupt the chunk sequence).
-    for await (const chunk of askAIStreamWithFallback(prompt, { callerClass: 'voice', caller: 'router', maxTokens: 300, _skipAnonymize: true, source: context.source, device_id: context.device_id, signal: context.signal || null })) {
+    for await (const chunk of askAIStreamWithFallback(prompt, { callerClass: 'voice', caller: 'router', maxTokens: 300, _skipAnonymize: true, source: context.source, device_id: context.device_id, signal: context.signal || null, outMeta: _streamMeta })) {
       fullBuf += chunk;
       const { text: extracted, done } = extractResponseField(fullBuf);
       if (extracted.length > lastLen) {
@@ -1786,8 +1878,9 @@ ${memoryContext}`;
     console.error('[routeStream] LLM error:', e.message);
     // Surface the broken voice path in the Alerts panel (de-duped, fire-and-forget).
     _raiseVoiceAlert(e.message, context.source);
+    const humanCard = humanizeError(e, { subsystem: 'router_stream', model });
     // Always yield a response — silence on the phone means the user thinks Phoenix is broken
-    yield { type: 'done', result: withProsody({ intent: 'query', response: "Sorry, I ran into a problem thinking that through. Try again.", importance: 0.5 }) };
+    yield { type: 'done', result: withProsody({ intent: 'query', response: humanCard.description || "Sorry, I ran into a problem thinking that through. Try again.", importance: 0.5, human_error: humanCard }) };
     return;
   }
 
@@ -1842,7 +1935,15 @@ ${memoryContext}`;
         return;
       }
 
-      yield { type: 'done', result: withProsody({ ...parsed, response: parsed.response || (lastLen > 0 ? fullBuf.slice(fullBuf.indexOf('"response":"') + 12).split('"')[0] : '') }) };
+      yield {
+        type: 'done',
+        result: withProsody({
+          ...parsed,
+          response: parsed.response || (lastLen > 0 ? fullBuf.slice(fullBuf.indexOf('"response":"') + 12).split('"')[0] : ''),
+          served_by: _streamMeta.model || null,
+          is_local: !!_streamMeta.is_local,
+        })
+      };
     } else {
       yield { type: 'done', result: withProsody({ intent: 'query', response: "I didn't catch that — could you try again?", importance: 0.4 }) };
     }

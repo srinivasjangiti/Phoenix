@@ -8,7 +8,9 @@
   },
   "scripts": {
     "test": "node --test src/__tests__/supervisor.test.js src/__tests__/readiness.test.js && node src/__tests__/platform.test.js",
-    "build:installer": "node scripts/build-installer.js"
+    "build:installer": "node scripts/build-installer.js",
+    "build:release": "node scripts/build-release.js",
+    "package:windows": "node scripts/build-release.js"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.92",

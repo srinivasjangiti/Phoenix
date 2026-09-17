@@ -24,7 +24,15 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const SC_PORT      = parseInt(process.env.PHOENIX_PORT) || 7777;
 const CARRIER_PORT = parseInt(process.env.PHOENIX_CARRIER_INTERNAL_PORT) || 17760;
-const HOST         = '0.0.0.0';
+const HOST         = process.env.PHOENIX_HOST || '127.0.0.1';
+
+function isLoopbackAddress(ip) {
+  if (!ip) return false;
+  return ip === '127.0.0.1' ||
+         ip === '::1' ||
+         ip === '::ffff:127.0.0.1' ||
+         ip.endsWith('127.0.0.1');
+}
 
 // ── Carrier readiness gate ───────────────────────────────────────────────────
 // Requests that arrive while Carrier is restarting wait here instead of failing.
@@ -238,7 +246,26 @@ const server = createServer((req, res) => {
     return;
   }
 
+  const clientIp = req.socket?.remoteAddress;
+  const isLoopback = isLoopbackAddress(clientIp);
   const [urlPath, queryString] = req.url.split('?');
+
+  // Network boundary: Desktop dashboard, admin endpoints, and sensitive APIs are strictly loopback-only.
+  if (!isLoopback) {
+    if (urlPath === '/health' || urlPath === '/api/carrier/health') {
+      // allow public liveness check
+    } else {
+      res.writeHead(403, {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+      });
+      res.end(JSON.stringify({
+        ok: false,
+        error: 'Forbidden: Phoenix desktop APIs and dashboard are strictly restricted to loopback (127.0.0.1). Non-loopback access is blocked.',
+      }));
+      return;
+    }
+  }
 
   if (urlPath === '/api/carrier/probe') {
     if (req.method === 'POST') {
@@ -328,6 +355,11 @@ const wss = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', async (req, socket, head) => {
   try {
+    const clientIp = socket?.remoteAddress;
+    if (!isLoopbackAddress(clientIp)) {
+      socket.destroy();
+      return;
+    }
     await waitForCarrier();
     wss.handleUpgrade(req, socket, head, ws => proxyWs(ws, req.url));
   } catch {

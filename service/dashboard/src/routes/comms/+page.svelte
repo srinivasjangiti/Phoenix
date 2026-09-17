@@ -1,5 +1,6 @@
 <script>
 	import { onMount, tick } from 'svelte';
+	import HumanErrorCard from '$lib/components/HumanErrorCard.svelte';
 
 	const API_BASE = typeof window !== 'undefined' ? window.location.origin : '';
 
@@ -37,6 +38,7 @@
 	let isThinking = $state(false);       // STT → router → TTS pipeline in flight
 	let isSpeaking = $state(false);       // Phoenix is currently playing audio
 	let voiceError = $state(null);
+	let voiceErrorCard = $state(null);
 	let currentAudio = null;
 	let voiceMime = 'audio/webm';
 	// VAD tuning
@@ -600,8 +602,11 @@
 				body: JSON.stringify({ message: transcript, source: 'voice-call', thread_id: chatThreadId }),
 			});
 			const routerJson = await routerRes.json();
+			if (routerJson?.human_error) {
+				voiceErrorCard = routerJson.human_error;
+			}
 			const reply = (routerJson?.response || '').trim();
-			if (!reply) throw new Error('empty router reply');
+			if (!reply) throw new Error(routerJson?.error || 'empty router reply');
 
 			// Append both turns to the visible chat immediately. Server has
 			// already persisted them (via /api/v1/chat thread_id branch), so
@@ -697,6 +702,7 @@
 			}
 		} catch (e) {
 			voiceError = e?.message || 'Voice turn failed';
+			voiceErrorCard = e?.human_error || voiceErrorCard || null;
 			console.error('[call] turn failed:', e);
 			shipLog('error', 'voice turn failed', { msg: e?.message || String(e) });
 		} finally {
@@ -856,7 +862,11 @@
 								{:else if isRecording}Listening… {formatCallElapsed(callElapsed)}
 								{:else}Live call · {formatCallElapsed(callElapsed)}{/if}
 							</span>
-							{#if voiceError}
+							{#if voiceErrorCard}
+								<div class="call-error-card-wrap">
+									<HumanErrorCard errorCard={voiceErrorCard} onRecovered={() => { voiceErrorCard = null; voiceError = null; }} onDismiss={() => { voiceErrorCard = null; voiceError = null; }} />
+								</div>
+							{:else if voiceError}
 								<span class="call-err" title={voiceError}>⚠ {voiceError}</span>
 							{/if}
 							<button class="end-call-btn" onclick={endCall} title="End call">End</button>
@@ -887,6 +897,9 @@
 									<div class="bubble-text">{msg.body}</div>
 									<div class="bubble-time">{formatDate(msg.created_at)}</div>
 								</div>
+								{#if msg.metadata?.debug?.human_error || msg.metadata?.human_error}
+									<HumanErrorCard errorCard={msg.metadata.debug?.human_error || msg.metadata.human_error} />
+								{/if}
 								{#if msg.sender_id !== 'self'}
 									{@const dbg = extractDebug(msg)}
 									{#if dbg}

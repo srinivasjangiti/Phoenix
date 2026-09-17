@@ -3,11 +3,13 @@ import { insert, all, get, run, db, logEvent, anonymize, anonymizeEventData, all
 import { logEventScoped } from '../events.js';
 import { getActiveOrg, isIncognitoAllowed } from '../org-policy.js';
 import { requireOrg } from '../middleware/org-context.js';
-import { writeFileSync, mkdirSync, existsSync } from 'fs';
-import { join, dirname } from 'path';
+import { humanizeError } from '../error-humanizer.js';
+import { writeFileSync, mkdirSync, existsSync, readdirSync, unlinkSync, createReadStream } from 'fs';
+import { join, dirname, basename } from 'path';
 import { fileURLToPath } from 'url';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import { getDataDir } from '../platform.js';
 
 const execFilePromise = promisify(execFile);
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -139,11 +141,18 @@ router.post('/chat', async (req, res) => {
       importance: typeof result?.importance === 'number' ? result.importance : null,
       user_message_id: userMsgId,
       phoenix_message_id: phoenixMsgId,
+      served_by: result?.served_by || debug?.served_by || null,
+      is_local: result?.is_local ?? debug?.is_local ?? false,
       debug,
     });
   } catch (err) {
     console.error('[Phoenix Chat]', err.message);
-    res.status(500).json({ error: err.message });
+    const humanCard = humanizeError(err, { subsystem: 'chat' });
+    res.status(500).json({
+      ok: false,
+      error: err.message || humanCard.description,
+      human_error: humanCard,
+    });
   }
 });
 
@@ -273,7 +282,15 @@ router.post('/chat/stream', async (req, res) => {
       send({ type: 'cancelled', stream_id: streamId, partial: assembledText });
     } else {
       console.error('[chat/stream]', err.message);
-      send({ type: 'done', result: { intent: 'query', response: 'Something went wrong.' } });
+      const humanCard = humanizeError(err, { subsystem: 'chat_stream' });
+      send({
+        type: 'done',
+        result: {
+          intent: 'query',
+          response: humanCard.description || 'Something went wrong.',
+          human_error: humanCard,
+        }
+      });
     }
   } finally {
     clearInterval(keepalive);
@@ -513,14 +530,14 @@ router.post('/capture', async (req, res) => {
     const { image_base64, caption, question, device_id, on_device } = req.body || {};
     if (!image_base64) return res.status(400).json({ error: 'missing image_base64' });
 
-    // service/src/routes → ../../public/captures = service/public/captures,
-    // served at /captures/* by the root express.static in server.js.
-    const CAPTURES_DIR = join(__dirname, '..', '..', 'public', 'captures');
+    // Store user captures in private local app data directory (%LOCALAPPDATA%\Phoenix\data\captures).
+    // Not exposed via wide-open static public web directory.
+    const CAPTURES_DIR = join(getDataDir(), 'captures');
     if (!existsSync(CAPTURES_DIR)) mkdirSync(CAPTURES_DIR, { recursive: true });
     const ts = Date.now();
     const filename = `cap_${ts}.jpg`;
     const localPath = join(CAPTURES_DIR, filename);
-    const imageUrl = `/captures/${filename}`;
+    const imageUrl = `/api/v1/captures/${filename}`;
     writeFileSync(localPath, Buffer.from(image_base64, 'base64'));
 
     // One image message on the Phoenix thread — same INSERT/crypto-id shape as the
@@ -574,6 +591,109 @@ router.post('/capture', async (req, res) => {
   } catch (err) {
     console.warn('[/api/v1/capture] failed:', err.message);
     res.json({ ok: false, error: err.message });
+  }
+});
+
+// GET /api/v1/captures/:filename — securely stream capture from private data dir
+router.get('/captures/:filename', (req, res) => {
+  try {
+    const safeFilename = basename(req.params.filename || '');
+    if (!safeFilename || safeFilename.includes('..')) {
+      return res.status(400).json({ error: 'Invalid filename' });
+    }
+    const filePath = join(getDataDir(), 'captures', safeFilename);
+    if (!existsSync(filePath)) {
+      // Legacy fallback check in public/captures
+      const legacyPath = join(__dirname, '..', '..', 'public', 'captures', safeFilename);
+      if (existsSync(legacyPath)) {
+        res.setHeader('Content-Type', 'image/jpeg');
+        res.setHeader('Cache-Control', 'private, max-age=3600');
+        return createReadStream(legacyPath).pipe(res);
+      }
+      return res.status(404).json({ error: 'Capture not found' });
+    }
+    res.setHeader('Content-Type', 'image/jpeg');
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    createReadStream(filePath).pipe(res);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/v1/privacy/stored-media — inspection endpoint for stored photos & face thumbnails
+router.get('/privacy/stored-media', async (req, res) => {
+  try {
+    const capturesDir = join(getDataDir(), 'captures');
+    const thumbsDir = join(getDataDir(), 'identity-thumbs');
+    const capturesCount = existsSync(capturesDir) ? readdirSync(capturesDir).filter(f => f.endsWith('.jpg') || f.endsWith('.png')).length : 0;
+    const thumbsCount = existsSync(thumbsDir) ? readdirSync(thumbsDir).filter(f => f.endsWith('.jpg') || f.endsWith('.png')).length : 0;
+    res.json({
+      ok: true,
+      captures_count: capturesCount,
+      thumbnails_count: thumbsCount,
+      storage_directory: getDataDir(),
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// DELETE /api/v1/privacy/stored-media — user control to permanently delete stored photos & face thumbnails
+router.delete('/privacy/stored-media', async (req, res) => {
+  try {
+    let deletedCaptures = 0;
+    let deletedThumbs = 0;
+
+    // 1. Delete captures from %LOCALAPPDATA%\Phoenix\data\captures
+    const capturesDir = join(getDataDir(), 'captures');
+    if (existsSync(capturesDir)) {
+      const files = readdirSync(capturesDir);
+      for (const f of files) {
+        try {
+          unlinkSync(join(capturesDir, f));
+          deletedCaptures++;
+        } catch {}
+      }
+    }
+
+    // Also clean up any legacy captures in service/public/captures if they exist
+    const legacyCapturesDir = join(__dirname, '..', '..', 'public', 'captures');
+    if (existsSync(legacyCapturesDir)) {
+      const legacyFiles = readdirSync(legacyCapturesDir);
+      for (const f of legacyFiles) {
+        try {
+          unlinkSync(join(legacyCapturesDir, f));
+          deletedCaptures++;
+        } catch {}
+      }
+    }
+
+    // 2. Delete identity thumbs from %LOCALAPPDATA%\Phoenix\data\identity-thumbs
+    const thumbsDir = join(getDataDir(), 'identity-thumbs');
+    if (existsSync(thumbsDir)) {
+      const files = readdirSync(thumbsDir);
+      for (const f of files) {
+        try {
+          unlinkSync(join(thumbsDir, f));
+          deletedThumbs++;
+        } catch {}
+      }
+    }
+
+    // 3. Clear face thumbnail paths from DB
+    try {
+      db.prepare("UPDATE identity_clusters SET face_thumbnail_path = NULL").run();
+    } catch {}
+
+    console.log(`[Privacy] User deleted stored media: ${deletedCaptures} captures, ${deletedThumbs} thumbnails.`);
+    res.json({
+      ok: true,
+      message: 'All stored photos and facial reference crops have been permanently deleted from disk.',
+      deleted_captures: deletedCaptures,
+      deleted_thumbnails: deletedThumbs,
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 

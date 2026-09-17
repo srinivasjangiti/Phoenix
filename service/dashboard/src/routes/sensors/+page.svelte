@@ -1,5 +1,6 @@
 <script>
 	import { api } from '$lib/api.js';
+	import PrivacySensesCard from '$lib/components/PrivacySensesCard.svelte';
 
 	let devices = $state([]);
 	let selectedDeviceId = $state('');
@@ -10,6 +11,47 @@
 	let lastSensorJson = $state('');
 	let categoryFilter = $state('all'); // 'all', 'passive', 'active'
 	let searchQuery = $state('');
+
+	let settings = $state({});
+	let deletingMedia = $state(false);
+	let mediaDeleteStatus = $state('');
+
+	async function loadSettings() {
+		try {
+			const res = await api('/api/v1/settings');
+			settings = res || {};
+		} catch {}
+	}
+
+	async function savePrivacySetting(key, val) {
+		settings[key] = val;
+		try {
+			await fetch('/api/v1/settings', {
+				method: 'PUT',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ [key]: val })
+			});
+		} catch {}
+	}
+
+	async function deleteStoredMedia() {
+		if (!confirm('Are you sure you want to permanently delete all stored photos and facial reference crops from disk?')) return;
+		deletingMedia = true;
+		mediaDeleteStatus = '';
+		try {
+			const res = await fetch('/api/v1/privacy/stored-media', { method: 'DELETE' });
+			const data = await res.json();
+			if (res.ok && data.ok) {
+				mediaDeleteStatus = `Cleaned ${data.deleted_captures} photos and ${data.deleted_thumbnails} face thumbnails from disk.`;
+			} else {
+				alert('Failed to delete media: ' + (data.error || 'Unknown error'));
+			}
+		} catch (e) {
+			alert('Error deleting media: ' + e.message);
+		} finally {
+			deletingMedia = false;
+		}
+	}
 
 	async function loadDevices() {
 		try {
@@ -77,12 +119,40 @@
 
 	$effect(() => {
 		loadDevices();
+		loadSettings();
 		const iv = setInterval(loadSensors, 5000);
 		return () => clearInterval(iv);
 	});
 </script>
 
 <div class="sensors-page">
+	<div style="margin-bottom: 24px;">
+		<PrivacySensesCard
+			screenEnabled={settings.screen_enabled !== 'false'}
+			webcamPresenceEnabled={settings.webcam_presence_enabled === 'true' || settings.webcam_presence_enabled === true}
+			activityEnabled={settings.activity_tracking_enabled !== 'false'}
+			privacyEnabled={settings.privacy_enabled !== 'false'}
+			onToggle={(key, val) => savePrivacySetting(key, String(val))}
+		/>
+
+		<div class="stored-media-card">
+			<div class="stored-media-info">
+				<h4 style="margin: 0 0 6px 0; font-size: 14px; font-weight: 600; color: #cdd6f4;">Stored Photos &amp; Identity Reference Crops</h4>
+				<p style="margin: 0; font-size: 12.5px; color: #a6adc8; line-height: 1.5;">
+					User-initiated photos sent from your phone and cropped face thumbnails are stored locally on this PC in private application data (<code>%LOCALAPPDATA%\Phoenix\data\</code>). Never uploaded to the cloud. You can permanently delete all stored media at any time.
+				</p>
+			</div>
+			<div style="margin-top: 12px; display: flex; align-items: center; gap: 12px;">
+				<button class="delete-media-btn" onclick={deleteStoredMedia} disabled={deletingMedia}>
+					{deletingMedia ? 'Deleting…' : 'Delete All Stored Photos & Thumbnails'}
+				</button>
+				{#if mediaDeleteStatus}
+					<span style="color: #a6e3a1; font-size: 12px; font-weight: 500;">{mediaDeleteStatus}</span>
+				{/if}
+			</div>
+		</div>
+	</div>
+
 	<div class="sensors-header">
 		<h2>Sensors</h2>
 		<select class="device-select" value={selectedDeviceId} onchange={onDeviceChange}>
@@ -395,4 +465,35 @@
 	}
 
 	.attach-item input { accent-color: #89b4fa; cursor: pointer; }
+
+	.stored-media-card {
+		background: #181825;
+		border: 1px solid #313244;
+		border-radius: 12px;
+		padding: 16px 20px;
+		margin-top: 14px;
+	}
+
+	.delete-media-btn {
+		background: rgba(243, 139, 168, 0.15);
+		border: 1px solid #f38ba8;
+		color: #f38ba8;
+		padding: 6px 14px;
+		border-radius: 6px;
+		font-size: 12px;
+		font-weight: 600;
+		cursor: pointer;
+		transition: all 0.15s;
+		font-family: 'Inter', sans-serif;
+	}
+
+	.delete-media-btn:hover:not(:disabled) {
+		background: rgba(243, 139, 168, 0.3);
+		color: #fff;
+	}
+
+	.delete-media-btn:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
 </style>

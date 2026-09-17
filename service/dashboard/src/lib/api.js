@@ -168,8 +168,15 @@ async function _doFetch(path, options) {
 	if (res.status === 401) localStorage.removeItem('pan_token');
 	if (!res.ok) {
 		let detail = '';
-		try { const body = await res.json(); detail = body.error || ''; } catch {}
-		throw new Error(detail || `API ${path}: ${res.status}`);
+		let humanError = null;
+		try {
+			const body = await res.json();
+			detail = body.error || '';
+			humanError = body.human_error || null;
+		} catch {}
+		const err = new Error(detail || `API ${path}: ${res.status}`);
+		if (humanError) err.human_error = humanError;
+		throw err;
 	}
 	return res.json();
 }

@@ -109,7 +109,7 @@ const CARRIER_PORT = IS_UNDER_SUPER_CARRIER
 // Derive internal Craft port from Carrier port — prevents multi-instance conflicts.
 // Default: 7777 → 17700, Dev (7781) → 17704, Docker/custom → CARRIER_PORT + 9923
 const CRAFT_PORT_BASE = parseInt(process.env.PHOENIX_CRAFT_PORT_BASE) || (IS_UNDER_SUPER_CARRIER ? 17700 : (CARRIER_PORT + 9923));
-const HOST = '0.0.0.0';
+const HOST = '127.0.0.1';
 const ROLLBACK_TIMEOUT_MS = 30_000; // 30s auto-rollback if not confirmed
 
 // ==================== State ====================

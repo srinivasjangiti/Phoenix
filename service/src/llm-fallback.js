@@ -65,10 +65,36 @@ function _formatModelRef(sel) {
 }
 
 function _buildDefaultChain(kind) {
+  let aiChoice = 'local';
+  try {
+    const row = get("SELECT value FROM settings WHERE key = 'ai_choice'") || get("SELECT value FROM settings WHERE key = 'ai_engine_choice'");
+    if (row?.value) aiChoice = row.value.replace(/^"|"$/g, '');
+  } catch {}
+
   const reasoning = _formatModelRef(getModelForPurpose('reasoning_cloud'));
   const fallback  = _formatModelRef(getModelForPurpose('chat_cloud_fallback'));
   const local     = _formatModelRef(getModelForPurpose('chat_local'));
   const dedupe = (arr) => [...new Set(arr.filter(Boolean))];
+
+  if (aiChoice === 'local') {
+    // When the user has chosen Local AI, local Ollama is strictly primary.
+    // To prevent silent data leakage and ensure privacy, cloud fallback is disabled
+    // unless the user has explicitly opted into cloud fallback in settings.
+    let allowCloudFallback = false;
+    try {
+      const fbRow = get("SELECT value FROM settings WHERE key = 'allow_cloud_fallback'");
+      if (fbRow?.value) allowCloudFallback = fbRow.value === 'true' || fbRow.value === true || JSON.parse(fbRow.value) === true;
+    } catch {}
+
+    if (!allowCloudFallback) {
+      return dedupe([local]);
+    }
+    if (kind === 'background') {
+      return dedupe([local, reasoning]);
+    }
+    return dedupe([local, reasoning, fallback]);
+  }
+
   if (kind === 'background') {
     return dedupe([local, reasoning]);
   }
@@ -380,6 +406,7 @@ export async function* askAIStreamWithFallback(prompt, opts = {}) {
     callerClass = 'voice',
     chain: chainOverride,
     signal: externalSignal = null,
+    outMeta = null,
     ...passthrough
   } = opts;
 
@@ -523,6 +550,10 @@ export async function* askAIStreamWithFallback(prompt, opts = {}) {
         }
         // Got a chunk — commit to this backend.
         yieldedAny = true;
+        if (outMeta && typeof outMeta === 'object') {
+          outMeta.model = model;
+          outMeta.is_local = String(model).startsWith('ollama:');
+        }
         yield next.value;
       }
       // If we got here without returning, we broke out due to connect failure → try next backend

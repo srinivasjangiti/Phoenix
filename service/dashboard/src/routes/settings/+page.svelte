@@ -1,8 +1,14 @@
 <script>
+	import { base } from '$app/paths';
 	import { api } from '$lib/api.js';
 	import { THEMES, THEME_META, applyTheme, loadTheme } from '$lib/theme.js';
+	import PrivacySensesCard from '$lib/components/PrivacySensesCard.svelte';
 
-	let activeTab = $state('general');
+	let activeTab = $state('profile');
+	let developerMode = $state(false);
+	let aiChoice = $state('local');
+	let showGeminiKey = $state(false);
+	let advancedSubTab = $state('general');
 	let currentTheme = $state(typeof window !== 'undefined' ? (localStorage.getItem('phoenix-theme') || localStorage.getItem('pan-theme') || 'cool-guy') : 'cool-guy');
 	let settings = $state({});
 	let health = $state(null);
@@ -237,19 +243,35 @@
 	let newTeamDesc = $state('');
 	let teamMsg = $state('');
 
-	const tabs = [
-		{ id: 'appearance', label: 'Appearance' },
-		{ id: 'general', label: 'General' },
-		{ id: 'ai', label: 'AI & Usage' },
-		{ id: 'controls', label: 'Controls' },
-		{ id: 'devices', label: 'Devices' },
+	const consumerTabs = [
+		{ id: 'profile', label: 'Profile', icon: '👤' },
+		{ id: 'ai', label: 'AI Setup', icon: '⚡' },
+		{ id: 'memory', label: 'Memory & Storage', icon: '🧠' },
+		{ id: 'privacy', label: 'Privacy & Senses', icon: '🛡️' },
+		{ id: 'devices', label: 'Devices', icon: '📱' },
+		{ id: 'advanced', label: 'Advanced', icon: '⚙️' },
+	];
+
+	const devSubTabs = [
+		{ id: 'general', label: 'Server & Ports' },
 		{ id: 'orgs', label: 'Organizations' },
-		{ id: 'security', label: 'Security' },
+		{ id: 'security', label: 'Security & Keys' },
 		{ id: 'auth', label: 'Authentication' },
 		{ id: 'network', label: 'Remote Access' },
 		{ id: 'treasury', label: 'Treasury' },
-		{ id: 'email', label: 'Email' },
+		{ id: 'email', label: 'Email Server' },
+		{ id: 'controls', label: 'Raw Shortcuts' },
 	];
+
+	async function selectAiChoice(choice) {
+		aiChoice = choice;
+		await saveSetting('ai_choice', choice);
+	}
+
+	function toggleDeveloperMode(enabled) {
+		developerMode = enabled;
+		saveSetting('developer_mode', enabled ? '1' : '0');
+	}
 
 	function selectTheme(name) {
 		currentTheme = name;
@@ -294,6 +316,8 @@
 		try {
 			const s = await api('/api/v1/settings');
 			settings = s;
+			developerMode = s.developer_mode === '1' || s.developer_mode === true || s.developer_mode === 'true';
+			aiChoice = s.ai_choice || 'local';
 			customModels = s.custom_models || [];
 			jobModels = s.job_models || {};
 			treasurySettings = {
@@ -846,15 +870,24 @@
 
 <div class="settings-layout">
 	<aside class="nav">
-		{#each tabs as tab}
+		{#each consumerTabs as tab}
 			<button
 				class="nav-item"
 				class:active={activeTab === tab.id}
 				onclick={() => activeTab = tab.id}
 			>
-				{tab.label}
+				<span style="margin-right:6px">{tab.icon}</span> {tab.label}
 			</button>
 		{/each}
+		<div style="margin-top: 20px; padding-top: 14px; border-top: 1px solid #1e1e2e;">
+			<a
+				href="{base}/help"
+				class="nav-item"
+				style="text-decoration: none; color: #89b4fa; display: flex; align-items: center; gap: 8px; font-weight: 500;"
+			>
+				<span>❓</span> Help Center ↗
+			</a>
+		</div>
 	</aside>
 
 	<div class="panel">
@@ -862,9 +895,27 @@
 			<div class="toast">{statusMsg}</div>
 		{/if}
 
-		<!-- Appearance -->
-		{#if activeTab === 'appearance'}
-			<h2>Appearance</h2>
+		<!-- Profile (Consumer Tab) -->
+		{#if activeTab === 'profile'}
+			<h2>Profile &amp; Appearance</h2>
+
+			<section class="section">
+				<h3>Your Name</h3>
+				<p class="hint">How Phoenix should address you in conversations and notes.</p>
+				<div style="display:flex;gap:10px;align-items:center;max-width:440px;margin-top:8px">
+					<input
+						type="text"
+						class="input"
+						placeholder="Your name..."
+						value={settings.user_name || ''}
+						oninput={(e) => { settings.user_name = e.target.value; }}
+					/>
+					<button class="btn accent" onclick={() => { saveSetting('user_name', settings.user_name || ''); saveSetting('display_name', settings.user_name || ''); }}>
+						Save Name
+					</button>
+				</div>
+			</section>
+
 			<section class="section">
 				<h3>Theme</h3>
 				<div class="theme-grid">
@@ -884,10 +935,646 @@
 					{/each}
 				</div>
 			</section>
+
+			<section class="section">
+				<h3>Assistant Personality</h3>
+				<p class="hint">Describe how Phoenix should talk (e.g., "Helpful and concise", "Calm and measured", "Witty and energetic").</p>
+				<textarea
+					class="personality-input"
+					value={settings.personality || ''}
+					placeholder="Leave empty for standard Phoenix voice..."
+					oninput={(e) => { settings.personality = e.target.value; }}
+				></textarea>
+				<div style="margin-top:8px">
+					<button class="btn accent" onclick={() => saveSetting('personality', settings.personality || '')}>Save Personality</button>
+				</div>
+			</section>
 		{/if}
 
-		<!-- General -->
-		{#if activeTab === 'general'}
+				<!-- AI Setup (Consumer Tab) -->
+		{#if activeTab === 'ai'}
+			<h2>AI Setup</h2>
+
+			<section class="section">
+				<h3>AI Engine Mode</h3>
+				<p class="hint">Select whether Phoenix uses an on-device local model for maximum privacy, or a cloud provider.</p>
+				<div class="ai-mode-selector">
+					<button
+						type="button"
+						class="ai-mode-card"
+						class:active={aiChoice === 'local'}
+						onclick={() => selectAiChoice('local')}
+					>
+						<div class="ai-mode-icon">🖥️</div>
+						<div class="ai-mode-info">
+							<div class="ai-mode-title">On this Computer (Local AI)</div>
+							<div class="ai-mode-desc">100% private. Runs offline on your PC via Ollama. Prompts never leave your computer.</div>
+						</div>
+						{#if aiChoice === 'local'}
+							<span class="ai-mode-badge">Active</span>
+						{/if}
+					</button>
+
+					<button
+						type="button"
+						class="ai-mode-card"
+						class:active={aiChoice === 'cloud'}
+						onclick={() => selectAiChoice('cloud')}
+					>
+						<div class="ai-mode-icon">☁️</div>
+						<div class="ai-mode-info">
+							<div class="ai-mode-title">Cloud AI (External API)</div>
+							<div class="ai-mode-desc">Uses Google Gemini, Anthropic Claude, or OpenAI. Requires your own API keys.</div>
+						</div>
+						{#if aiChoice === 'cloud'}
+							<span class="ai-mode-badge">Active</span>
+						{/if}
+					</button>
+				</div>
+			</section>
+
+			<!-- Local AI Section -->
+			<section class="section" style="border-left: 3px solid {aiChoice === 'local' ? '#89b4fa' : '#313244'}">
+				<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+					<div>
+						<h3 style="margin:0">Local AI Engine (Ollama)</h3>
+						<p class="hint" style="margin:4px 0 0">Runs open-weight models locally on 127.0.0.1:11434. Prompts never leave your computer.</p>
+					</div>
+					<button class="btn btn-sm" onclick={loadOllamaStatus} disabled={ollamaLoading}>↻ Refresh</button>
+				</div>
+
+				<div class="form-grid">
+					<!-- Engine Status Row -->
+					<div class="form-row">
+						<div class="form-label">
+							<div class="fw500">Engine Status</div>
+							<div class="small muted">Ollama background runtime</div>
+						</div>
+						<div style="display:flex;align-items:center;gap:10px">
+							{#if ollamaLoading && !ollamaStatus}
+								<span class="muted small">Checking...</span>
+							{:else if !ollamaStatus?.installed}
+								<span class="badge" style="background:#f38ba8;color:#11111b;font-weight:700">Not Installed</span>
+								<button class="btn btn-sm accent" onclick={launchOllamaInstallAction} disabled={ollamaInstalling}>
+									{ollamaInstalling ? 'Launching...' : 'Run Ollama Setup'}
+								</button>
+							{:else if !ollamaStatus?.running}
+								<span class="badge" style="background:#fab387;color:#11111b;font-weight:700">Stopped</span>
+								<button class="btn btn-sm accent" onclick={startOllamaDaemonAction} disabled={ollamaStarting}>
+									{ollamaStarting ? 'Starting...' : 'Start Local AI Engine'}
+								</button>
+							{:else}
+								<span class="badge" style="background:#a6e3a1;color:#11111b;font-weight:700">Running ({ollamaStatus.ownership === 'EXTERNAL_UNMANAGED' ? 'External / User' : 'Managed'})</span>
+							{/if}
+						</div>
+					</div>
+
+					<!-- Model Selection Row -->
+					{#if ollamaStatus?.running}
+						<div class="form-row">
+							<div class="form-label">
+								<div class="fw500">Active Local Model</div>
+								<div class="small muted">Used for private on-device chat</div>
+							</div>
+							<div style="display:flex;align-items:center;gap:10px">
+								{#if (ollamaStatus.models || []).length > 0}
+									<select value={selectedOllamaModel} onchange={(e) => selectOllamaModelAction(e.target.value)} class="input" style="width:240px">
+										{#each ollamaStatus.models as m}
+											<option value={m.name}>{m.name} ({fmtBytes(m.size)})</option>
+										{/each}
+									</select>
+									<button class="btn btn-sm" onclick={() => testOllamaModelAction(selectedOllamaModel)} disabled={ollamaTesting}>
+										{ollamaTesting ? 'Testing...' : 'Test Response'}
+									</button>
+								{:else}
+									<span class="muted small">No models installed in Ollama yet</span>
+								{/if}
+							</div>
+						</div>
+
+						<!-- Test Result if present -->
+						{#if ollamaTestResult}
+							<div class="form-row" style="margin-top:-6px">
+								<div class="form-label"></div>
+								<div style="font-size:12px;padding:6px 12px;border-radius:6px;background:{ollamaTestResult.verified ? 'rgba(166,227,161,0.1)' : 'rgba(243,139,168,0.1)'};color:{ollamaTestResult.verified ? '#a6e3a1' : '#f38ba8'}">
+									{#if ollamaTestResult.verified}
+										✓ Live inference verified in {ollamaTestResult.latencyMs}ms (Response: "{ollamaTestResult.output}")
+									{:else}
+										✗ Test failed: {ollamaTestResult.message || 'No response'}
+									{/if}
+								</div>
+							</div>
+						{/if}
+
+						<!-- Download Recommended Model -->
+						<div class="form-row" style="flex-direction:column;align-items:stretch;background:rgba(255,255,255,0.02);padding:12px;border-radius:8px">
+							<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+								<div class="fw500">Download Recommended Models</div>
+								{#if ollamaPullProgress?.active}
+									<button class="btn btn-sm danger" onclick={cancelOllamaPullAction}>Cancel Download</button>
+								{/if}
+							</div>
+
+							{#if ollamaPullProgress?.active}
+								<div style="margin-top:6px">
+									<div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px">
+										<span>Downloading {ollamaPullProgress.model}... ({ollamaPullProgress.status})</span>
+										<span>{fmtBytes(ollamaPullProgress.completed)} / {fmtBytes(ollamaPullProgress.total)} ({ollamaPullProgress.percent}%)</span>
+									</div>
+									<div style="width:100%;height:6px;background:rgba(255,255,255,0.1);border-radius:3px;overflow:hidden">
+										<div style="width:{ollamaPullProgress.percent}%;height:100%;background:#fab387;transition:width 0.3s ease"></div>
+									</div>
+								</div>
+							{:else}
+								<div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(220px, 1fr));gap:10px">
+									{#each (ollamaStatus.recommended || []) as rec}
+										{@const installed = (ollamaStatus.models || []).some(m => m.name === rec.tag)}
+										<div style="border:1px solid rgba(255,255,255,0.08);border-radius:6px;padding:10px;display:flex;flex-direction:column;justify-content:space-between;gap:6px">
+											<div>
+												<div style="display:flex;align-items:center;justify-content:space-between">
+													<span style="font-weight:600;font-size:13px">{rec.name}</span>
+													{#if installed}
+														<span class="badge" style="background:#a6e3a1;color:#11111b;font-size:10px">Installed</span>
+													{/if}
+												</div>
+												<div style="font-size:11px;color:#a6adc8;margin-top:2px">{rec.description}</div>
+												<div style="font-size:10px;color:#6c7086;margin-top:4px">{rec.estimatedDownloadSize} • {rec.estimatedMemoryUsage}</div>
+											</div>
+											{#if !installed}
+												<button class="btn btn-sm accent" style="align-self:flex-start;margin-top:4px" onclick={() => startOllamaPullAction(rec.tag)}>
+													Download {rec.name}
+												</button>
+											{/if}
+										</div>
+									{/each}
+								</div>
+							{/if}
+						</div>
+					{/if}
+				</div>
+			</section>
+
+			<!-- Cloud AI Settings -->
+			<section class="section" style="border-left: 3px solid {aiChoice === 'cloud' ? '#89b4fa' : '#313244'}">
+				<h3>Cloud AI (Gemini &amp; Claude)</h3>
+				<p class="hint">When using Cloud AI, Phoenix routes requests to your configured cloud providers.</p>
+				<div class="form-grid">
+					<div class="form-row">
+						<div class="form-label">
+							<div class="fw500">Server API Model</div>
+							<div class="small muted">Used for cloud voice routing &amp; queries</div>
+						</div>
+						<input type="text" value={settings.ai_model || ''} onchange={(e) => saveAIModel(e.target.value)} placeholder="e.g. claude-haiku-4-5-20251001" class="input" style="width:260px" />
+					</div>
+
+					<div class="form-row">
+						<div class="form-label">
+							<div class="fw500">Gemini API Key</div>
+							<div class="small muted">Google AI Studio key (1,500 req/day free)</div>
+						</div>
+						<div style="display:flex;align-items:center;gap:8px">
+							<input
+								type={showGeminiKey ? "text" : "password"}
+								value={settings.gemini_api_key || ''}
+								onchange={(e) => saveSetting('gemini_api_key', e.target.value)}
+								placeholder="AIza..."
+								class="input"
+								style="width:260px"
+							/>
+							<button
+								type="button"
+								class="btn"
+								style="padding:6px 10px;font-size:12px"
+								onclick={() => showGeminiKey = !showGeminiKey}
+								title={showGeminiKey ? 'Hide key' : 'Show key'}
+							>
+								{showGeminiKey ? '🔒' : '👁️'}
+							</button>
+						</div>
+					</div>
+				</div>
+			</section>
+
+			<!-- Developer AI Options (revealed when developerMode is ON) -->
+			{#if developerMode}
+				<section class="section">
+					<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+						<h3 style="margin:0">Terminal AI (Developer)</h3>
+						<span class="badge" style="background:#89b4fa22;color:#89b4fa;font-size:10px">DEV</span>
+					</div>
+					<p class="hint">The AI that runs in your terminal sessions. Phoenix launches this when you open project tabs.</p>
+					<div class="form-grid">
+						<div class="form-row">
+							<div class="form-label">
+								<div class="fw500">CLI Provider</div>
+								<div class="small muted">Which AI CLI launches in your terminals</div>
+							</div>
+							<select bind:value={settings.terminal_ai_provider} onchange={saveTerminalAI} class="input" style="width:220px">
+								<option value="claude">Claude Code</option>
+								<option value="gemini">Gemini CLI</option>
+								<option value="aider">Aider</option>
+								<option value="copilot">GitHub Copilot</option>
+								{#if settings.terminal_ai_provider && !['claude','gemini','aider','copilot'].includes(settings.terminal_ai_provider)}
+									<option value={settings.terminal_ai_provider}>{settings.terminal_ai_provider} (custom)</option>
+								{/if}
+							</select>
+						</div>
+						<div class="form-row">
+							<div class="form-label">
+								<div class="fw500">Terminal Model</div>
+								<div class="small muted">Passed to the CLI via --model</div>
+							</div>
+							{#if settings.terminal_ai_provider === 'claude'}
+								<div style="display:flex;align-items:center;gap:6px">
+									<select bind:value={settings.terminal_ai_model} onchange={saveTerminalAI} class="input" style="width:220px">
+										<option value="">Default</option>
+										{#if claudeModels.length > 0}
+											{#each claudeModels as m}
+												<option value={m.id}>{m.name || m.id}</option>
+											{/each}
+										{:else}
+											<option value="claude-haiku-4-5-20251001">Haiku 4.5 (fast)</option>
+											<option value="claude-sonnet-4-6">Sonnet 4.6</option>
+											<option value="claude-opus-4-6">Opus 4.6</option>
+											<option value="claude-opus-4-7">Opus 4.7</option>
+										{/if}
+									</select>
+									<button class="btn btn-sm" onclick={loadClaudeModels} title={claudeModelsSource === 'anthropic_api' ? 'Live from Anthropic API' : 'Refresh from Anthropic API'} style="padding:4px 8px;font-size:11px">
+										{claudeModelsSource === 'anthropic_api' ? '🔴 live' : '↻'}
+									</button>
+								</div>
+							{:else if settings.terminal_ai_provider === 'gemini'}
+								<select bind:value={settings.terminal_ai_model} onchange={saveTerminalAI} class="input" style="width:220px">
+									<option value="">Default</option>
+									<option value="gemini-2.5-pro">Gemini 2.5 Pro</option>
+									<option value="gemini-2.0-flash">Gemini 2.0 Flash</option>
+									<option value="gemini-1.5-pro">Gemini 1.5 Pro</option>
+								</select>
+							{:else}
+								<input type="text" bind:value={settings.terminal_ai_model} onchange={saveTerminalAI} placeholder="model name..." class="input" style="width:220px" />
+							{/if}
+						</div>
+						<div class="form-row" style="flex-direction:column;align-items:stretch">
+							<div class="form-label">
+								<div class="fw500">Full CLI Command <span class="small muted">(optional — overrides provider + model above)</span></div>
+							</div>
+							<input type="text" bind:value={settings.terminal_ai_cmd} onchange={saveTerminalAI} placeholder="e.g. gemini --model pro, aider --model gpt-4o" class="input mono" style="width:100%" />
+							<div class="small muted" style="margin-top:4px">Use {'{project}'} for project name, {'{path}'} for project path.</div>
+						</div>
+					</div>
+				</section>
+
+				<section class="section">
+					<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+						<h3 style="margin:0">Job Models</h3>
+						<span class="badge" style="background:#89b4fa22;color:#89b4fa;font-size:10px">DEV</span>
+					</div>
+					<p class="hint">Each background job can use a different model. Leave empty to use the default above.</p>
+					<div class="form-grid">
+						{#each jobDefs as j}
+							<div class="form-row">
+								<div class="form-label">
+									<div class="fw500">{j.name}</div>
+									<div class="small muted">{j.desc}</div>
+								</div>
+								<input type="text" value={jobModels[j.key] || ''} onchange={(e) => saveJobModel(j.key, e.target.value)} placeholder="Use Default" class="input" style="width:180px" />
+							</div>
+						{/each}
+					</div>
+				</section>
+
+				<section class="section">
+					<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+						<h3 style="margin:0">Model Providers</h3>
+						<span class="badge" style="background:#89b4fa22;color:#89b4fa;font-size:10px">DEV</span>
+					</div>
+					<p class="hint">Add models here and they appear as suggestions everywhere. For local models, Phoenix routes API calls to their endpoints.</p>
+					{#if customModels.length}
+						<div class="form-grid" style="margin-bottom:12px">
+							{#each customModels as m, i}
+								<div class="model-card">
+									<div style="flex:1">
+										<div class="fw500">{m.name}</div>
+										<div class="small muted">{m.provider || 'openai-compat'} {m.url ? '| ' + m.url : ''} | {m.id}</div>
+									</div>
+									<button class="btn danger small" onclick={() => removeModelProvider(i)}>Remove</button>
+								</div>
+							{/each}
+						</div>
+					{:else}
+						<p class="muted small" style="margin-bottom:12px">No custom models added.</p>
+					{/if}
+					<details class="add-model-details">
+						<summary>Add Model</summary>
+						<div class="add-model-form">
+							<div style="display:flex;gap:8px;flex-wrap:wrap">
+								<input type="text" bind:value={newModelName} placeholder="Display name (e.g. Llama 3.2 8B)" class="input" style="flex:1;min-width:180px" />
+								<input type="text" bind:value={newModelType} placeholder="Provider type (e.g. ollama, lmstudio)" class="input" style="flex:0 0 200px" />
+							</div>
+							<div style="display:flex;gap:8px;flex-wrap:wrap">
+								<input type="text" bind:value={newModelUrl} placeholder="Base URL (e.g. http://localhost:11434)" class="input" style="flex:1;min-width:200px" />
+								<input type="text" bind:value={newModelId} placeholder="Model ID (e.g. llama3.2:8b)" class="input" style="flex:1;min-width:150px" />
+							</div>
+							<div style="display:flex;gap:8px;flex-wrap:wrap">
+								<input type="password" bind:value={newModelKey} placeholder="API key (optional for local)" class="input" style="flex:1;min-width:200px" />
+								<button class="btn accent" onclick={addModelProvider}>Add Model</button>
+							</div>
+						</div>
+					</details>
+				</section>
+			{/if}
+
+			<section class="section">
+				<h3>Usage</h3>
+				<div class="stat-row">
+					<div class="stat-card">
+						<div class="stat-value">{usageToday}</div>
+						<div class="stat-label">Today</div>
+					</div>
+					<div class="stat-card">
+						<div class="stat-value">{usageWeek}</div>
+						<div class="stat-label">This Week</div>
+					</div>
+					<div class="stat-card">
+						<div class="stat-value">{usageAllTime}</div>
+						<div class="stat-label">All Time</div>
+					</div>
+				</div>
+			</section>
+
+			{#if usageBreakdown.length}
+				<section class="section">
+					<h3>Cost by Feature (Today)</h3>
+					<div class="form-grid">
+						{#each usageBreakdown as item}
+							<div class="row">
+								<span class="fw500">{item.caller || item.feature || 'Unknown'}</span>
+								<span class="muted">{item.cost || '--'}</span>
+							</div>
+						{/each}
+					</div>
+				</section>
+			{/if}
+		{/if}
+
+		<!-- Memory & Storage (Consumer Tab) -->
+		{#if activeTab === 'memory'}
+			<h2>Memory &amp; Storage</h2>
+
+			<section class="section storage-hero-card">
+				<div class="storage-shield-header">
+					<span class="storage-shield-icon">🛡️</span>
+					<div>
+						<div class="storage-title">Stored 100% on this Computer</div>
+						<div class="storage-subtitle">All your thoughts, facts, notes, and conversation history are kept in an encrypted database on this PC. Prompts and memories never leave your machine.</div>
+					</div>
+				</div>
+
+				<div class="storage-details-grid">
+					<div class="storage-prop-row">
+						<span class="storage-prop-name">Database Location</span>
+						<code class="storage-prop-val">%LOCALAPPDATA%\Phoenix\data\phoenix.db</code>
+					</div>
+					<div class="storage-prop-row">
+						<span class="storage-prop-name">Database Security</span>
+						<span class="storage-badge-safe">AES-256 SQLCipher (Encrypted at Rest)</span>
+					</div>
+					<div class="storage-prop-row">
+						<span class="storage-prop-name">Cloud Sync</span>
+						<span class="storage-badge-muted">Coming soon (End-to-End Encrypted)</span>
+					</div>
+					<div class="storage-prop-row">
+						<span class="storage-prop-name">Telemetry &amp; Tracking</span>
+						<span class="storage-badge-safe">Strictly Zero (No external tracking)</span>
+					</div>
+				</div>
+			</section>
+
+			<section class="section">
+				<h3>Local Memory Safeguards</h3>
+				<p class="hint">Phoenix continuously organizes your conversations into long-term memories on your local disk.</p>
+				<div class="stat-row">
+					<div class="stat-card">
+						<div class="stat-value">Local Only</div>
+						<div class="stat-label">Privacy Model</div>
+					</div>
+					<div class="stat-card">
+						<div class="stat-value">Instant</div>
+						<div class="stat-label">Recall Speed</div>
+					</div>
+					<div class="stat-card">
+						<div class="stat-value">Private</div>
+						<div class="stat-label">On-Device Storage</div>
+					</div>
+				</div>
+				<div style="margin-top:16px;display:flex;gap:10px;align-items:center">
+					<button class="btn accent" onclick={() => flash('Local database verified: 100% intact.')}>Verify Local Database</button>
+					<span class="muted small">All data files are protected under your Windows user profile.</span>
+				</div>
+			</section>
+		{/if}
+
+		<!-- Privacy & Senses (Consumer Tab) -->
+		{#if activeTab === 'privacy'}
+			<h2>Privacy &amp; Senses</h2>
+			<PrivacySensesCard
+				screenEnabled={settings.screen_enabled !== 'false'}
+				webcamPresenceEnabled={settings.webcam_presence_enabled === 'true' || settings.webcam_presence_enabled === true}
+				activityEnabled={settings.activity_tracking_enabled !== 'false'}
+				privacyEnabled={settings.privacy_enabled !== 'false'}
+				onToggle={(key, val) => saveSetting(key, String(val))}
+			/>
+		{/if}
+
+{#if activeTab === 'devices'}
+			<h2>Devices</h2>
+
+			<section class="section">
+				<h3>App Versions</h3>
+				<div class="small muted" style="margin-bottom:8px">
+					Server-published APK vs the last build the phone reported on boot.
+					Phone fetches <code>/api/v1/apk/version</code> 8s after launch — bump <code>versionCode</code> in <code>android/app/build.gradle.kts</code> and the next launch installs OTA.
+				</div>
+				<div style="display:grid;grid-template-columns:160px 1fr;gap:6px 12px;align-items:center;font-size:13px">
+					<span class="muted">Phone (installed)</span>
+					<span>
+						{#if phoneInstalled}
+							<strong>{phoneInstalled.versionName}</strong> <span class="muted">(code {phoneInstalled.versionCode} · {phoneInstalled.appId})</span>
+						{:else}
+							<span class="muted">no Build log seen — relaunch the phone app to record it</span>
+						{/if}
+					</span>
+					<span class="muted">Server (published)</span>
+					<span>
+						{#if apkVersion}
+							<strong>{apkVersion.versionName}</strong> <span class="muted">(code {apkVersion.versionCode} · {Math.round((apkVersion.apkSize || 0) / 1024 / 1024)} MB)</span>
+						{:else}
+							<span class="muted" style="color:#f38ba8">/api/v1/apk/version unreachable</span>
+						{/if}
+					</span>
+					<span class="muted">Status</span>
+					<span>
+						{#if phoneInstalled && apkVersion && apkVersion.versionCode > phoneInstalled.versionCode}
+							<span style="color:#f9e2af">⏳ Phone behind by {apkVersion.versionCode - phoneInstalled.versionCode} — OTA on next launch</span>
+						{:else if phoneInstalled && apkVersion && apkVersion.versionCode < phoneInstalled.versionCode}
+							<span style="color:#cba6f7">↑ Phone is ahead of server (dev build?)</span>
+						{:else if phoneInstalled && apkVersion}
+							<span style="color:#a6e3a1">✓ In sync</span>
+						{:else}
+							<span class="muted">—</span>
+						{/if}
+					</span>
+					{#if apkVersion?.sha256}
+						<span class="muted">SHA-256</span>
+						<code style="font-size:11px;word-break:break-all">{apkVersion.sha256}</code>
+					{/if}
+				</div>
+				<button class="btn" style="margin-top:10px;padding:4px 10px;font-size:12px" onclick={loadVersions}>Refresh</button>
+				<a class="btn" style="margin-top:10px;margin-left:6px;padding:4px 10px;font-size:12px;text-decoration:none" href="/atlas/phone" target="_blank">Open Phone Atlas →</a>
+			</section>
+
+			<section class="section">
+				<h3>Connected Devices</h3>
+				{#if devices.length}
+					{#each devices as d}
+						{@const isHub = d.device_type === 'pc' && !d.client_version}
+						{@const staleMs = d.device_type === 'phone' ? 15 * 60 * 1000 : 5 * 60 * 1000}
+						{@const ageMs = d.last_seen ? Date.now() - new Date(d.last_seen).getTime() : Infinity}
+						{@const isOnline = ageMs < staleMs}
+						<div class="device-card" class:expanded={expandedDeviceId === d.id}>
+							<div class="device-row">
+								<div style="flex:1">
+									<div class="fw500" style="display:flex;align-items:center;gap:6px">
+										{#if renameDeviceId === d.id}
+											<input
+												type="text"
+												class="input"
+												style="width:160px;padding:2px 6px;font-size:13px"
+												bind:value={renameDeviceName}
+												onkeydown={(e) => { if (e.key === 'Enter') renameDevice(); if (e.key === 'Escape') { renameDeviceId = null; renameDeviceName = ''; } }}
+											/>
+											<button class="btn accent" style="padding:2px 10px;font-size:12px" onclick={renameDevice}>Save</button>
+											<button class="btn" style="padding:2px 10px;font-size:12px" onclick={() => { renameDeviceId = null; renameDeviceName = ''; }}>Cancel</button>
+										{:else}
+											<span>{d.name || d.device_name || 'Unknown'}</span>
+											<button class="btn-icon" style="opacity:0.5;font-size:11px" title="Rename" onclick={() => { renameDeviceId = d.id; renameDeviceName = d.name || d.device_name || ''; }}>✏️</button>
+										{/if}
+										{#if isHub}
+											<span style="font-size:10px;font-weight:600;padding:1px 6px;border-radius:4px;background:#89b4fa22;color:#89b4fa;border:1px solid #89b4fa44">HUB</span>
+										{:else if d.client_version}
+											<span style="font-size:10px;font-weight:600;padding:1px 6px;border-radius:4px;background:#a6e3a122;color:#a6e3a1;border:1px solid #a6e3a144">CLIENT</span>
+										{/if}
+									</div>
+									<div class="small muted">{d.device_type || '--'} · {d.hostname || ''} · Last seen: {fmtTime(d.last_seen)}</div>
+								</div>
+								<div style="display:flex;align-items:center;gap:10px">
+									<span class="small muted">Remote Access</span>
+									<label class="toggle">
+										<input
+											type="checkbox"
+											checked={deviceSettings[d.id]?.remote_access_enabled || false}
+											onchange={(e) => toggleDeviceRemoteAccess(d.id, e.target.checked)}
+										/>
+										<span class="slider"></span>
+									</label>
+									<span class="dot" class:online={isOnline} class:stale={!isOnline}></span>
+									{#if !isHub}
+										<button class="btn-icon" onclick={() => { expandedDeviceId = expandedDeviceId === d.id ? null : d.id; confirmRemoveDeviceId = null; confirmRemoveTyped = ''; }} title="More options">
+											<span class="chevron" class:rotated={expandedDeviceId === d.id}>&#9656;</span>
+										</button>
+									{/if}
+								</div>
+							</div>
+							{#if expandedDeviceId === d.id && !isHub}
+								<div class="device-options">
+									<div class="device-option">
+										<span class="small muted">ID: {d.id} | Hostname: {d.hostname}{d.client_version ? ` | Client v${d.client_version}` : ''}</span>
+									</div>
+									{#if confirmRemoveDeviceId === d.id}
+										<div class="device-option danger-zone">
+											<span class="small" style="display:block;margin-bottom:8px">To remove <strong>{d.name || d.hostname}</strong>, type the device name to confirm:</span>
+											<input
+												type="text"
+												class="input"
+												style="width:220px;margin-bottom:8px"
+												placeholder={d.name || d.hostname}
+												bind:value={confirmRemoveTyped}
+											/>
+											<div style="display:flex;gap:8px">
+												<button
+													class="btn danger"
+													disabled={confirmRemoveTyped.trim() !== (d.name || d.hostname)}
+													onclick={() => removeDevice(d.id)}
+												>Confirm Remove</button>
+												<button class="btn" onclick={() => { confirmRemoveDeviceId = null; confirmRemoveTyped = ''; }}>Cancel</button>
+											</div>
+										</div>
+									{:else}
+										<div class="device-option">
+											<button class="btn danger-outline" onclick={() => { confirmRemoveDeviceId = d.id; confirmRemoveTyped = ''; }}>Remove Device</button>
+										</div>
+									{/if}
+								</div>
+							{/if}
+						</div>
+					{/each}
+				{:else}
+					<span class="muted">No devices registered</span>
+				{/if}
+			</section>
+		{/if}
+
+
+
+		<!-- Advanced (Developer Mode) Tab -->
+		{#if activeTab === 'advanced'}
+			<h2>Advanced Settings</h2>
+
+			<section class="section dev-mode-toggle-card">
+				<div style="display:flex;align-items:center;justify-content:space-between;gap:16px">
+					<div>
+						<div style="display:flex;align-items:center;gap:10px">
+							<h3 style="margin:0">Developer Mode</h3>
+							{#if developerMode}
+								<span class="badge" style="background:#fab387;color:#11111b;font-weight:700">UNLOCKED</span>
+							{:else}
+								<span class="badge" style="background:#6c7086;color:#11111b;font-weight:700">SAFE MODE</span>
+							{/if}
+						</div>
+						<p class="hint" style="margin:6px 0 0">
+							{#if developerMode}
+								Developer mode is currently active. Advanced system diagnostics, port settings, multi-tenant organizations, and raw server configurations are available below.
+							{:else}
+								Developer mode is turned off. Technical server configurations, raw ports, multi-user orgs, and treasury tools are hidden to keep your settings safe and simple.
+							{/if}
+						</p>
+					</div>
+					<label class="toggle">
+						<input
+							type="checkbox"
+							checked={developerMode}
+							onchange={(e) => toggleDeveloperMode(e.target.checked)}
+						/>
+						<span class="slider"></span>
+					</label>
+				</div>
+			</section>
+
+			{#if developerMode}
+				<!-- Developer Sub-Navigation Bar -->
+				<div class="dev-subnav">
+					{#each devSubTabs as subTab}
+						<button
+							class="dev-subnav-btn"
+							class:active={advancedSubTab === subTab.id}
+							onclick={() => advancedSubTab = subTab.id}
+						>
+							{subTab.label}
+						</button>
+					{/each}
+				</div>
+
+{#if advancedSubTab === 'general'}
 			<h2>General</h2>
 
 			<section class="section">
@@ -1055,369 +1742,9 @@
 			</section>
 		{/if}
 
-		<!-- AI & Usage -->
-		{#if activeTab === 'ai'}
-			<h2>AI & Usage</h2>
 
-			<section class="section">
-				<h3>Terminal AI</h3>
-				<p class="hint">The AI that runs in your terminal sessions. Phoenix launches this when you open project tabs.</p>
-				<div class="form-grid">
-					<div class="form-row">
-						<div class="form-label">
-							<div class="fw500">CLI Provider</div>
-							<div class="small muted">Which AI CLI launches in your terminals</div>
-						</div>
-						<select bind:value={settings.terminal_ai_provider} onchange={saveTerminalAI} class="input" style="width:220px">
-							<option value="claude">Claude Code</option>
-							<option value="gemini">Gemini CLI</option>
-							<option value="aider">Aider</option>
-							<option value="copilot">GitHub Copilot</option>
-							{#if settings.terminal_ai_provider && !['claude','gemini','aider','copilot'].includes(settings.terminal_ai_provider)}
-								<option value={settings.terminal_ai_provider}>{settings.terminal_ai_provider} (custom)</option>
-							{/if}
-						</select>
-					</div>
-					<div class="form-row">
-						<div class="form-label">
-							<div class="fw500">Terminal Model</div>
-							<div class="small muted">Passed to the CLI via --model</div>
-						</div>
-						{#if settings.terminal_ai_provider === 'claude'}
-							<div style="display:flex;align-items:center;gap:6px">
-								<select bind:value={settings.terminal_ai_model} onchange={saveTerminalAI} class="input" style="width:220px">
-									<option value="">Default</option>
-									{#if claudeModels.length > 0}
-										{#each claudeModels as m}
-											<option value={m.id}>{m.name || m.id}</option>
-										{/each}
-									{:else}
-										<option value="claude-haiku-4-5-20251001">Haiku 4.5 (fast)</option>
-										<option value="claude-sonnet-4-6">Sonnet 4.6</option>
-										<option value="claude-opus-4-6">Opus 4.6</option>
-										<option value="claude-opus-4-7">Opus 4.7</option>
-									{/if}
-								</select>
-								<button class="btn btn-sm" onclick={loadClaudeModels} title={claudeModelsSource === 'anthropic_api' ? 'Live from Anthropic API' : 'Refresh from Anthropic API'} style="padding:4px 8px;font-size:11px">
-									{claudeModelsSource === 'anthropic_api' ? '🔴 live' : '↻'}
-								</button>
-							</div>
-						{:else if settings.terminal_ai_provider === 'gemini'}
-							<select bind:value={settings.terminal_ai_model} onchange={saveTerminalAI} class="input" style="width:220px">
-								<option value="">Default</option>
-								<option value="gemini-2.5-pro">Gemini 2.5 Pro</option>
-								<option value="gemini-2.0-flash">Gemini 2.0 Flash</option>
-								<option value="gemini-1.5-pro">Gemini 1.5 Pro</option>
-							</select>
-						{:else}
-							<input type="text" bind:value={settings.terminal_ai_model} onchange={saveTerminalAI} placeholder="model name..." class="input" style="width:220px" />
-						{/if}
-					</div>
-					<div class="form-row" style="flex-direction:column;align-items:stretch">
-						<div class="form-label">
-							<div class="fw500">Full CLI Command <span class="small muted">(optional — overrides provider + model above)</span></div>
-						</div>
-						<input type="text" bind:value={settings.terminal_ai_cmd} onchange={saveTerminalAI} placeholder="e.g. gemini --model pro, aider --model gpt-4o" class="input mono" style="width:100%" />
-						<div class="small muted" style="margin-top:4px">Use {'{project}'} for project name, {'{path}'} for project path.</div>
-					</div>
-				</div>
-			</section>
 
-			<section class="section">
-				<h3>Server API Model</h3>
-				<p class="hint">The model Phoenix uses for its own API calls -- voice routing, background jobs, phone queries.</p>
-				<div class="form-row">
-					<div class="form-label">
-						<div class="fw500">Default API Model</div>
-					</div>
-					<input type="text" value={settings.ai_model || ''} onchange={(e) => saveAIModel(e.target.value)} placeholder="e.g. claude-haiku-4-5-20251001" class="input" style="width:260px" />
-				</div>
-			</section>
-
-			<section class="section">
-				<h3>Phone AI (Gemini Flash)</h3>
-				<p class="hint">Gemini Flash handles complex voice commands directly from the phone with sub-second latency. Free tier: 1,500 requests/day.</p>
-				<div class="form-row">
-					<div class="form-label">
-						<div class="fw500">Gemini API Key</div>
-						<div class="small muted">Get free from aistudio.google.com/apikey</div>
-					</div>
-					<input type="password" value={settings.gemini_api_key || ''} onchange={(e) => saveSetting('gemini_api_key', e.target.value)} placeholder="AIza..." class="input" style="width:260px" />
-				</div>
-			</section>
-
-			<section class="section">
-				<h3>Job Models</h3>
-				<p class="hint">Each background job can use a different model. Leave empty to use the default above.</p>
-				<div class="form-grid">
-					{#each jobDefs as j}
-						<div class="form-row">
-							<div class="form-label">
-								<div class="fw500">{j.name}</div>
-								<div class="small muted">{j.desc}</div>
-							</div>
-							<input type="text" value={jobModels[j.key] || ''} onchange={(e) => saveJobModel(j.key, e.target.value)} placeholder="Use Default" class="input" style="width:180px" />
-						</div>
-					{/each}
-				</div>
-			</section>
-
-			<section class="section">
-				<h3>Model Providers</h3>
-				<p class="hint">Add models here and they appear as suggestions everywhere. For local models, Phoenix routes API calls to their endpoints.</p>
-				{#if customModels.length}
-					<div class="form-grid" style="margin-bottom:12px">
-						{#each customModels as m, i}
-							<div class="model-card">
-								<div style="flex:1">
-									<div class="fw500">{m.name}</div>
-									<div class="small muted">{m.provider || 'openai-compat'} {m.url ? '| ' + m.url : ''} | {m.id}</div>
-								</div>
-								<button class="btn danger small" onclick={() => removeModelProvider(i)}>Remove</button>
-							</div>
-						{/each}
-					</div>
-				{:else}
-					<p class="muted small" style="margin-bottom:12px">No custom models added.</p>
-				{/if}
-				<details class="add-model-details">
-					<summary>Add Model</summary>
-					<div class="add-model-form">
-						<div style="display:flex;gap:8px;flex-wrap:wrap">
-							<input type="text" bind:value={newModelName} placeholder="Display name (e.g. Llama 3.2 8B)" class="input" style="flex:1;min-width:180px" />
-							<input type="text" bind:value={newModelType} placeholder="Provider type (e.g. ollama, lmstudio)" class="input" style="flex:0 0 200px" />
-						</div>
-						<div style="display:flex;gap:8px;flex-wrap:wrap">
-							<input type="text" bind:value={newModelUrl} placeholder="Base URL (e.g. http://localhost:11434)" class="input" style="flex:1;min-width:200px" />
-							<input type="text" bind:value={newModelId} placeholder="Model ID (e.g. llama3.2:8b)" class="input" style="flex:1;min-width:150px" />
-						</div>
-						<div style="display:flex;gap:8px;flex-wrap:wrap">
-							<input type="password" bind:value={newModelKey} placeholder="API key (optional for local)" class="input" style="flex:1;min-width:200px" />
-							<button class="btn accent" onclick={addModelProvider}>Add Model</button>
-						</div>
-					</div>
-				</details>
-			</section>
-
-			<section class="section">
-				<h3>Usage</h3>
-				<div class="stat-row">
-					<div class="stat-card">
-						<div class="stat-value">{usageToday}</div>
-						<div class="stat-label">Today</div>
-					</div>
-					<div class="stat-card">
-						<div class="stat-value">{usageWeek}</div>
-						<div class="stat-label">This Week</div>
-					</div>
-					<div class="stat-card">
-						<div class="stat-value">{usageAllTime}</div>
-						<div class="stat-label">All Time</div>
-					</div>
-				</div>
-			</section>
-
-			{#if usageBreakdown.length}
-				<section class="section">
-					<h3>Cost by Feature (Today)</h3>
-					<div class="form-grid">
-						{#each usageBreakdown as item}
-							<div class="row">
-								<span class="fw500">{item.caller || item.feature || 'Unknown'}</span>
-								<span class="muted">{item.cost || '--'}</span>
-							</div>
-						{/each}
-					</div>
-				</section>
-			{/if}
-		{/if}
-
-		<!-- Controls -->
-		{#if activeTab === 'controls'}
-			<h2>Controls</h2>
-
-			<section class="section">
-				<h3>Voice-to-Text</h3>
-				<p class="hint">Press this key anywhere in the dashboard to start voice input. Speak, and your words go straight to the terminal.</p>
-				<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-					<input
-						type="text"
-						value={settings.control_voice_key || ''}
-						readonly
-						placeholder="Click and press a key..."
-						class="input"
-						style="width:200px;text-align:center;font-weight:600;cursor:pointer"
-						onfocus={() => voiceKeyCapturing = true}
-						onblur={() => voiceKeyCapturing = false}
-					/>
-					<button class="btn accent" onclick={() => saveControlSetting('voice_key', settings.control_voice_key || '')}>Save</button>
-					<button class="btn secondary" onclick={() => { settings.control_voice_key = ''; saveControlSetting('voice_key', ''); }}>Clear</button>
-				</div>
-				<p class="hint" style="margin-top:6px">Default: Win+H (Windows built-in voice typing)</p>
-			</section>
-
-			<section class="section">
-				<h3>Screenshots</h3>
-				<div class="hint">
-					<div style="margin-bottom:6px"><kbd>Print Screen</kbd> -- capture screenshot</div>
-					<div><kbd>Ctrl+V</kbd> -- paste into terminal chat</div>
-				</div>
-			</section>
-
-			<section class="section">
-				<h3>Voice Permission Approval</h3>
-				<div class="toggle-row">
-					<label class="toggle">
-						<input type="checkbox" checked={settings.voice_permission_approval === 'true'} onchange={(e) => toggleVoicePermApproval(e.target.checked)} />
-						<span class="slider"></span>
-					</label>
-					<span>Approve Permissions by Voice</span>
-				</div>
-				<p class="hint">When enabled, say "permission granted" to approve Claude's permission requests instead of tapping the notification.</p>
-			</section>
-		{/if}
-
-		<!-- Devices -->
-		{#if activeTab === 'devices'}
-			<h2>Devices</h2>
-
-			<section class="section">
-				<h3>App Versions</h3>
-				<div class="small muted" style="margin-bottom:8px">
-					Server-published APK vs the last build the phone reported on boot.
-					Phone fetches <code>/api/v1/apk/version</code> 8s after launch — bump <code>versionCode</code> in <code>android/app/build.gradle.kts</code> and the next launch installs OTA.
-				</div>
-				<div style="display:grid;grid-template-columns:160px 1fr;gap:6px 12px;align-items:center;font-size:13px">
-					<span class="muted">Phone (installed)</span>
-					<span>
-						{#if phoneInstalled}
-							<strong>{phoneInstalled.versionName}</strong> <span class="muted">(code {phoneInstalled.versionCode} · {phoneInstalled.appId})</span>
-						{:else}
-							<span class="muted">no Build log seen — relaunch the phone app to record it</span>
-						{/if}
-					</span>
-					<span class="muted">Server (published)</span>
-					<span>
-						{#if apkVersion}
-							<strong>{apkVersion.versionName}</strong> <span class="muted">(code {apkVersion.versionCode} · {Math.round((apkVersion.apkSize || 0) / 1024 / 1024)} MB)</span>
-						{:else}
-							<span class="muted" style="color:#f38ba8">/api/v1/apk/version unreachable</span>
-						{/if}
-					</span>
-					<span class="muted">Status</span>
-					<span>
-						{#if phoneInstalled && apkVersion && apkVersion.versionCode > phoneInstalled.versionCode}
-							<span style="color:#f9e2af">⏳ Phone behind by {apkVersion.versionCode - phoneInstalled.versionCode} — OTA on next launch</span>
-						{:else if phoneInstalled && apkVersion && apkVersion.versionCode < phoneInstalled.versionCode}
-							<span style="color:#cba6f7">↑ Phone is ahead of server (dev build?)</span>
-						{:else if phoneInstalled && apkVersion}
-							<span style="color:#a6e3a1">✓ In sync</span>
-						{:else}
-							<span class="muted">—</span>
-						{/if}
-					</span>
-					{#if apkVersion?.sha256}
-						<span class="muted">SHA-256</span>
-						<code style="font-size:11px;word-break:break-all">{apkVersion.sha256}</code>
-					{/if}
-				</div>
-				<button class="btn" style="margin-top:10px;padding:4px 10px;font-size:12px" onclick={loadVersions}>Refresh</button>
-				<a class="btn" style="margin-top:10px;margin-left:6px;padding:4px 10px;font-size:12px;text-decoration:none" href="/atlas/phone" target="_blank">Open Phone Atlas →</a>
-			</section>
-
-			<section class="section">
-				<h3>Connected Devices</h3>
-				{#if devices.length}
-					{#each devices as d}
-						{@const isHub = d.device_type === 'pc' && !d.client_version}
-						{@const staleMs = d.device_type === 'phone' ? 15 * 60 * 1000 : 5 * 60 * 1000}
-						{@const ageMs = d.last_seen ? Date.now() - new Date(d.last_seen).getTime() : Infinity}
-						{@const isOnline = ageMs < staleMs}
-						<div class="device-card" class:expanded={expandedDeviceId === d.id}>
-							<div class="device-row">
-								<div style="flex:1">
-									<div class="fw500" style="display:flex;align-items:center;gap:6px">
-										{#if renameDeviceId === d.id}
-											<input
-												type="text"
-												class="input"
-												style="width:160px;padding:2px 6px;font-size:13px"
-												bind:value={renameDeviceName}
-												onkeydown={(e) => { if (e.key === 'Enter') renameDevice(); if (e.key === 'Escape') { renameDeviceId = null; renameDeviceName = ''; } }}
-											/>
-											<button class="btn accent" style="padding:2px 10px;font-size:12px" onclick={renameDevice}>Save</button>
-											<button class="btn" style="padding:2px 10px;font-size:12px" onclick={() => { renameDeviceId = null; renameDeviceName = ''; }}>Cancel</button>
-										{:else}
-											<span>{d.name || d.device_name || 'Unknown'}</span>
-											<button class="btn-icon" style="opacity:0.5;font-size:11px" title="Rename" onclick={() => { renameDeviceId = d.id; renameDeviceName = d.name || d.device_name || ''; }}>✏️</button>
-										{/if}
-										{#if isHub}
-											<span style="font-size:10px;font-weight:600;padding:1px 6px;border-radius:4px;background:#89b4fa22;color:#89b4fa;border:1px solid #89b4fa44">HUB</span>
-										{:else if d.client_version}
-											<span style="font-size:10px;font-weight:600;padding:1px 6px;border-radius:4px;background:#a6e3a122;color:#a6e3a1;border:1px solid #a6e3a144">CLIENT</span>
-										{/if}
-									</div>
-									<div class="small muted">{d.device_type || '--'} · {d.hostname || ''} · Last seen: {fmtTime(d.last_seen)}</div>
-								</div>
-								<div style="display:flex;align-items:center;gap:10px">
-									<span class="small muted">Remote Access</span>
-									<label class="toggle">
-										<input
-											type="checkbox"
-											checked={deviceSettings[d.id]?.remote_access_enabled || false}
-											onchange={(e) => toggleDeviceRemoteAccess(d.id, e.target.checked)}
-										/>
-										<span class="slider"></span>
-									</label>
-									<span class="dot" class:online={isOnline} class:stale={!isOnline}></span>
-									{#if !isHub}
-										<button class="btn-icon" onclick={() => { expandedDeviceId = expandedDeviceId === d.id ? null : d.id; confirmRemoveDeviceId = null; confirmRemoveTyped = ''; }} title="More options">
-											<span class="chevron" class:rotated={expandedDeviceId === d.id}>&#9656;</span>
-										</button>
-									{/if}
-								</div>
-							</div>
-							{#if expandedDeviceId === d.id && !isHub}
-								<div class="device-options">
-									<div class="device-option">
-										<span class="small muted">ID: {d.id} | Hostname: {d.hostname}{d.client_version ? ` | Client v${d.client_version}` : ''}</span>
-									</div>
-									{#if confirmRemoveDeviceId === d.id}
-										<div class="device-option danger-zone">
-											<span class="small" style="display:block;margin-bottom:8px">To remove <strong>{d.name || d.hostname}</strong>, type the device name to confirm:</span>
-											<input
-												type="text"
-												class="input"
-												style="width:220px;margin-bottom:8px"
-												placeholder={d.name || d.hostname}
-												bind:value={confirmRemoveTyped}
-											/>
-											<div style="display:flex;gap:8px">
-												<button
-													class="btn danger"
-													disabled={confirmRemoveTyped.trim() !== (d.name || d.hostname)}
-													onclick={() => removeDevice(d.id)}
-												>Confirm Remove</button>
-												<button class="btn" onclick={() => { confirmRemoveDeviceId = null; confirmRemoveTyped = ''; }}>Cancel</button>
-											</div>
-										</div>
-									{:else}
-										<div class="device-option">
-											<button class="btn danger-outline" onclick={() => { confirmRemoveDeviceId = d.id; confirmRemoveTyped = ''; }}>Remove Device</button>
-										</div>
-									{/if}
-								</div>
-							{/if}
-						</div>
-					{/each}
-				{:else}
-					<span class="muted">No devices registered</span>
-				{/if}
-			</section>
-		{/if}
-
-		<!-- Organizations -->
-		{#if activeTab === 'orgs'}
+{#if advancedSubTab === 'orgs'}
 			<h2>Organizations</h2>
 
 			{#if orgMsg}
@@ -1679,8 +2006,9 @@
 			{/if}
 		{/if}
 
-		<!-- Security -->
-		{#if activeTab === 'security'}
+
+
+{#if advancedSubTab === 'security'}
 			<h2>Security</h2>
 
 			<section class="section">
@@ -1694,8 +2022,9 @@
 			</section>
 		{/if}
 
-		<!-- Authentication -->
-		{#if activeTab === 'auth'}
+
+
+{#if advancedSubTab === 'auth'}
 			<h2>Authentication</h2>
 
 			<section class="section">
@@ -1733,8 +2062,9 @@
 			</section>
 		{/if}
 
-		<!-- Remote Access -->
-		{#if activeTab === 'network'}
+
+
+{#if advancedSubTab === 'network'}
 			<h2>Remote Access</h2>
 
 			<section class="section">
@@ -1798,8 +2128,9 @@
 			</div>
 		{/if}
 
-		<!-- Treasury -->
-		{#if activeTab === 'treasury'}
+
+
+{#if advancedSubTab === 'treasury'}
 			<h2>Treasury</h2>
 
 			<section class="section">
@@ -1916,8 +2247,9 @@
 			</div>
 		{/if}
 
-		<!-- Email -->
-		{#if activeTab === 'email'}
+
+
+{#if advancedSubTab === 'email'}
 			<h2>Email</h2>
 			{#if emailMsg}
 				<div class="flash-msg">{emailMsg}</div>
@@ -2014,6 +2346,61 @@
 					<strong style="color:var(--text)">Custom:</strong> Enter your provider's IMAP/SMTP host and port. Port 993 = SSL, 587 = STARTTLS.
 				</div>
 			</section>
+		{/if}
+
+
+{#if advancedSubTab === 'controls'}
+			<h2>Controls</h2>
+
+			<section class="section">
+				<h3>Voice-to-Text</h3>
+				<p class="hint">Press this key anywhere in the dashboard to start voice input. Speak, and your words go straight to the terminal.</p>
+				<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+					<input
+						type="text"
+						value={settings.control_voice_key || ''}
+						readonly
+						placeholder="Click and press a key..."
+						class="input"
+						style="width:200px;text-align:center;font-weight:600;cursor:pointer"
+						onfocus={() => voiceKeyCapturing = true}
+						onblur={() => voiceKeyCapturing = false}
+					/>
+					<button class="btn accent" onclick={() => saveControlSetting('voice_key', settings.control_voice_key || '')}>Save</button>
+					<button class="btn secondary" onclick={() => { settings.control_voice_key = ''; saveControlSetting('voice_key', ''); }}>Clear</button>
+				</div>
+				<p class="hint" style="margin-top:6px">Default: Win+H (Windows built-in voice typing)</p>
+			</section>
+
+			<section class="section">
+				<h3>Screenshots</h3>
+				<div class="hint">
+					<div style="margin-bottom:6px"><kbd>Print Screen</kbd> -- capture screenshot</div>
+					<div><kbd>Ctrl+V</kbd> -- paste into terminal chat</div>
+				</div>
+			</section>
+
+			<section class="section">
+				<h3>Voice Permission Approval</h3>
+				<div class="toggle-row">
+					<label class="toggle">
+						<input type="checkbox" checked={settings.voice_permission_approval === 'true'} onchange={(e) => toggleVoicePermApproval(e.target.checked)} />
+						<span class="slider"></span>
+					</label>
+					<span>Approve Permissions by Voice</span>
+				</div>
+				<p class="hint">When enabled, say "permission granted" to approve Claude's permission requests instead of tapping the notification.</p>
+			</section>
+		{/if}
+
+
+			{:else}
+				<div class="dev-locked-notice">
+					<div class="dev-locked-icon">🔒</div>
+					<h4>Developer Tools are Locked</h4>
+					<p>Turn on <strong>Developer Mode</strong> above if you need to configure raw ports, multi-tenant organizations, remote network tunnels, Cardano treasury staking, or email server credentials.</p>
+				</div>
+			{/if}
 		{/if}
 	</div>
 </div>
@@ -2822,4 +3209,206 @@
 		color: var(--phoenix-accent, #89b4fa);
 		font-weight: 700;
 	}
+
+	/* Consumer AI & Storage Styles */
+	.ai-mode-selector {
+		display: grid;
+		grid-template-columns: 1fr 1fr;
+		gap: 12px;
+		margin-top: 10px;
+	}
+
+	.ai-mode-card {
+		display: flex;
+		align-items: flex-start;
+		gap: 12px;
+		padding: 14px;
+		border-radius: 8px;
+		background: #181825;
+		border: 1px solid #313244;
+		cursor: pointer;
+		text-align: left;
+		transition: all 0.15s ease;
+		color: #cdd6f4;
+		position: relative;
+	}
+
+	.ai-mode-card:hover {
+		border-color: #89b4fa;
+		background: #1e1e2e;
+	}
+
+	.ai-mode-card.active {
+		border-color: #89b4fa;
+		background: rgba(137, 180, 250, 0.08);
+	}
+
+	.ai-mode-icon {
+		font-size: 24px;
+		line-height: 1;
+	}
+
+	.ai-mode-title {
+		font-weight: 600;
+		font-size: 14px;
+		color: #cdd6f4;
+		margin-bottom: 4px;
+	}
+
+	.ai-mode-desc {
+		font-size: 12px;
+		color: #a6adc8;
+		line-height: 1.4;
+	}
+
+	.ai-mode-badge {
+		position: absolute;
+		top: 10px;
+		right: 10px;
+		font-size: 10px;
+		font-weight: 700;
+		text-transform: uppercase;
+		padding: 2px 6px;
+		border-radius: 4px;
+		background: #a6e3a1;
+		color: #11111b;
+	}
+
+	.storage-hero-card {
+		background: linear-gradient(135deg, rgba(30, 30, 46, 0.9), rgba(17, 17, 27, 0.95));
+		border: 1px solid rgba(137, 180, 250, 0.2);
+	}
+
+	.storage-shield-header {
+		display: flex;
+		align-items: center;
+		gap: 14px;
+		margin-bottom: 16px;
+	}
+
+	.storage-shield-icon {
+		font-size: 32px;
+	}
+
+	.storage-title {
+		font-size: 16px;
+		font-weight: 700;
+		color: #89b4fa;
+	}
+
+	.storage-subtitle {
+		font-size: 13px;
+		color: #a6adc8;
+		margin-top: 2px;
+		line-height: 1.4;
+	}
+
+	.storage-details-grid {
+		display: flex;
+		flex-direction: column;
+		gap: 10px;
+		padding-top: 12px;
+		border-top: 1px solid #313244;
+	}
+
+	.storage-prop-row {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		font-size: 13px;
+	}
+
+	.storage-prop-name {
+		color: #a6adc8;
+	}
+
+	.storage-prop-val {
+		font-family: monospace;
+		font-size: 12px;
+		background: #11111b;
+		padding: 3px 8px;
+		border-radius: 4px;
+		color: #cdd6f4;
+	}
+
+	.storage-badge-safe {
+		font-size: 11px;
+		font-weight: 600;
+		color: #a6e3a1;
+		background: rgba(166, 227, 161, 0.1);
+		padding: 2px 8px;
+		border-radius: 4px;
+		border: 1px solid rgba(166, 227, 161, 0.2);
+	}
+
+	.storage-badge-muted {
+		font-size: 11px;
+		color: #6c7086;
+		background: rgba(108, 112, 134, 0.1);
+		padding: 2px 8px;
+		border-radius: 4px;
+	}
+
+	.dev-subnav {
+		display: flex;
+		gap: 6px;
+		flex-wrap: wrap;
+		padding: 10px 0 16px 0;
+		border-bottom: 1px solid #1e1e2e;
+		margin-bottom: 16px;
+	}
+
+	.dev-subnav-btn {
+		padding: 6px 12px;
+		font-size: 12px;
+		font-weight: 500;
+		border: 1px solid #313244;
+		border-radius: 6px;
+		background: #181825;
+		color: #a6adc8;
+		cursor: pointer;
+		transition: all 0.15s ease;
+	}
+
+	.dev-subnav-btn:hover {
+		background: #1e1e2e;
+		color: #cdd6f4;
+		border-color: #45475a;
+	}
+
+	.dev-subnav-btn.active {
+		background: #89b4fa;
+		color: #11111b;
+		border-color: #89b4fa;
+		font-weight: 600;
+	}
+
+	.dev-locked-notice {
+		text-align: center;
+		padding: 40px 20px;
+		background: rgba(255, 255, 255, 0.02);
+		border-radius: 8px;
+		border: 1px dashed #313244;
+		margin-top: 16px;
+	}
+
+	.dev-locked-icon {
+		font-size: 36px;
+		margin-bottom: 10px;
+	}
+
+	.dev-locked-notice h4 {
+		margin: 0 0 8px 0;
+		font-size: 15px;
+		color: #cdd6f4;
+	}
+
+	.dev-locked-notice p {
+		margin: 0 auto;
+		max-width: 460px;
+		font-size: 13px;
+		color: #a6adc8;
+		line-height: 1.5;
+	}
+
 </style>

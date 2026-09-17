@@ -1,7 +1,6 @@
 <script>
-	// Root route — redirect to /terminal so Phoenix dashboard lands on the
-	// terminal view by default instead of the chat view.
-	// Chat view is preserved at /chat.
+	// Root route — redirect to /comms so Phoenix dashboard lands on the
+	// consumer Assistant hub by default instead of the developer CLI.
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { base } from '$app/paths';
@@ -17,11 +16,11 @@
 				}
 			}
 		} catch {}
-		goto(`${base}/terminal`, { replaceState: true });
+		goto(`${base}/comms?view=contacts&thread=thread-phoenix-system`, { replaceState: true });
 	});
 </script>
 
-<div class="redirecting">Loading Terminal…</div>
+<div class="redirecting">Loading Phoenix Assistant…</div>
 
 <style>
 	.redirecting {

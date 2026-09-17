@@ -63,6 +63,17 @@ import { guardianMiddleware } from './guardian.js';
 import { privacyMiddleware } from './privacy.js';
 import privacyRouter from './routes/privacy.js';
 import { getReadinessState, completeSetup } from './readiness.js';
+import {
+  getOllamaStatus,
+  startOllamaDaemon,
+  launchOfficialInstaller,
+  pullModelStream,
+  cancelActivePull,
+  getActivePullProgress,
+  testModelInference,
+  selectLocalModel
+} from './ollama-manager.js';
+import { humanizeError, sanitizeDiagnostics } from './error-humanizer.js';
 import { extractUser, setImpersonation, clearImpersonation, getImpersonation } from './middleware/auth.js';
 import { requireFeature, requireNotChild, getPermissionsMatrix } from './permissions.js';
 import { requireOrg, auditLog, verifyAllAuditChains, resignAuditChain } from './middleware/org-context.js';
@@ -98,7 +109,7 @@ import { redactSettings, getSecret } from './secrets.js';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const PORT = parseInt(process.env.PHOENIX_PORT) || 7777;
-const HOST = '0.0.0.0'; // Listen on all interfaces (phone needs LAN access)
+const HOST = '127.0.0.1'; // Listen strictly on loopback (desktop-only security)
 // Dev mode: PAN_DEV=1 runs server on a separate port with no side-effects.
 // Skips steward, device registration, service boots — just
 // Express + API + DB (read-safe via WAL) + test runner. Safe to run alongside prod.
@@ -2905,6 +2916,107 @@ app.post('/api/v1/setup/complete', (req, res) => {
   }
 });
 
+// ==================== Phase 3: Ollama & Local AI Endpoints ====================
+
+// GET /api/v1/ollama/status — Comprehensive status of daemon and models
+app.get('/api/v1/ollama/status', async (req, res) => {
+  try {
+    const status = await getOllamaStatus();
+    res.json(status);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// POST /api/v1/ollama/start — Start Ollama daemon safely
+app.post('/api/v1/ollama/start', async (req, res) => {
+  try {
+    const result = await startOllamaDaemon();
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// POST /api/v1/ollama/install — Launch official Windows installer
+app.post('/api/v1/ollama/install', async (req, res) => {
+  try {
+    const result = await launchOfficialInstaller();
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// POST /api/v1/ollama/pull — Initiate model pull stream
+app.post('/api/v1/ollama/pull', async (req, res) => {
+  try {
+    const { model } = req.body || {};
+    if (!model) return res.status(400).json({ ok: false, error: 'model name is required' });
+    const result = await pullModelStream(model);
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// GET /api/v1/ollama/pull-progress — Poll download progress
+app.get('/api/v1/ollama/pull-progress', (req, res) => {
+  try {
+    const progress = getActivePullProgress();
+    res.json(progress);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// POST /api/v1/ollama/pull-cancel — Cancel active download
+app.post('/api/v1/ollama/pull-cancel', (req, res) => {
+  try {
+    const result = cancelActivePull();
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// POST /api/v1/ollama/verify — Run live test inference
+app.post('/api/v1/ollama/verify', async (req, res) => {
+  try {
+    const { model } = req.body || {};
+    if (!model) return res.status(400).json({ ok: false, error: 'model name is required' });
+    const result = await testModelInference(model);
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// POST /api/v1/ollama/select — Bind selected model
+app.post('/api/v1/ollama/select', async (req, res) => {
+  try {
+    const { model } = req.body || {};
+    if (!model) return res.status(400).json({ ok: false, error: 'model name is required' });
+    const result = await selectLocalModel(model);
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ==================== Phase 4: Human-Readable Error & Recovery Endpoints ====================
+
+// POST /api/v1/error/humanize — Convert raw exception into a consumer-friendly HumanErrorCard
+app.post('/api/v1/error/humanize', (req, res) => {
+  try {
+    const { error, code, status, subsystem, model } = req.body || {};
+    const card = humanizeError({ message: error, code, status }, { subsystem, model });
+    res.json({ ok: true, human_error: card });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ==================== TTS / Voice Profiles ====================
 // Lazy-load TTS module (heavy imports, only load when needed)
 let ttsModule = null;
@@ -3569,6 +3681,9 @@ app.get('/auth/google/callback', (req, res) => {
 
 // Serve captured photos (stored in src/data/photos by api.js)
 app.use('/photos', express.static(join(__dirname, 'data', 'photos')));
+
+// Legacy captures redirect to secure /api/v1/captures
+app.get('/captures/:filename', (req, res) => res.redirect('/api/v1/captures/' + req.params.filename));
 
 // Serve clipboard images (pasted screenshots from dashboard)
 app.use('/clipboard', express.static(join(process.env.TEMP || '%USERPROFILE%\\AppData\\Local\\Temp', 'phoenix-clipboard')));
@@ -6672,6 +6787,18 @@ app.post('/api/admin/restart', async (req, res) => {
     console.log(`[Phoenix] Exiting for restart (${isDev ? 'dev' : 'prod — wrapper will restart'})`);
     process.exit(0);
   }, 500);
+});
+
+// ==================== Phase 4: Global Express Error Middleware ====================
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  const humanCard = humanizeError(err, { path: req.path, method: req.method });
+  const statusCode = Number(err.status || err.statusCode) || 500;
+  res.status(statusCode).json({
+    ok: false,
+    error: err.message || humanCard.description,
+    human_error: humanCard,
+  });
 });
 
 export { start, stop, app };

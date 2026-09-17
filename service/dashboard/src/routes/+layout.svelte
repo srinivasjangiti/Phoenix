@@ -10,17 +10,34 @@
 
 	let { children } = $props();
 
+	let developerMode = $state(false);
+	async function loadDeveloperMode() {
+		try {
+			const res = await fetch('/api/v1/settings');
+			if (res.ok) {
+				const s = await res.json();
+				developerMode = s.developer_mode === '1' || s.developer_mode === true || s.developer_mode === 'true';
+			}
+		} catch {}
+	}
+
 	const allTabs = [
-		{ label: 'Terminal', href: `${base}/terminal`, icon: '⌨', userOnly: true },
+		{ label: 'Assistant', href: `${base}/comms`, icon: '💬' },
 		{ label: 'Automation', href: `${base}/automation`, icon: '⚡' },
 		{ label: 'Projects', href: `${base}/projects`, icon: '📁' },
 		{ label: 'Sensors', href: `${base}/sensors`, icon: '📡' },
 		{ label: 'Data', href: `${base}/data`, icon: '🗄' },
 		{ label: 'Settings', href: `${base}/settings`, icon: '⚙' },
+		{ label: 'Help', href: `${base}/help`, icon: '❓' },
+		{ label: 'Terminal', href: `${base}/terminal`, icon: '⌨', devOnly: true, userOnly: true },
 	];
-	// Hide userOnly tabs (Terminal) when the connected server is in service mode.
-	// Until /health responds we render all tabs (assume user mode by default).
-	let tabs = $derived(allTabs.filter(t => !(t.userOnly && getPanMode() === 'service')));
+	// Hide userOnly tabs when server is in service mode.
+	// Hide devOnly tabs (Terminal) when developerMode is false.
+	let tabs = $derived(allTabs.filter(t => {
+		if (t.userOnly && getPanMode() === 'service') return false;
+		if (t.devOnly && !developerMode) return false;
+		return true;
+	}));
 
 	let commsOpen = $state(typeof window !== 'undefined' && localStorage.getItem('pan_comms_open') === '1');
 	let commsView = $state('contacts'); // 'contacts' | 'calendar' | 'mail'
@@ -622,6 +639,7 @@
 		}
 	}
 
+	let isFirstRun = $state(null); // null = verifying, true = first-run needed, false = complete
 	let firstRunEvaluated = false;
 	async function checkFirstRun() {
 		if (firstRunEvaluated) return;
@@ -631,12 +649,21 @@
 				const data = await res.json();
 				firstRunEvaluated = true;
 				if (data.first_run_complete === false) {
+					isFirstRun = true;
 					if (!page.url.pathname.includes('/setup')) {
 						goto(`${base}/setup`, { replaceState: true });
 					}
+					return;
+				} else {
+					isFirstRun = false;
 				}
 			}
-		} catch {}
+		} catch (e) {
+			console.warn('[Phoenix RouteGuard] readiness fetch failed:', e);
+		}
+		// Fallback if offline/failed: allow shell to display offline banner
+		firstRunEvaluated = true;
+		if (isFirstRun === null) isFirstRun = false;
 	}
 
 	async function loadUser() {
@@ -713,10 +740,17 @@
 	$effect(() => {
 		checkHealth();
 		checkFirstRun();
+		loadDeveloperMode();
 		loadUser();
 		loadOrgs();
 		loadUnread();
 		checkVersion();
+
+		// Guard: if non-developer user navigates to /terminal, redirect to /comms
+		if (firstRunEvaluated && isFirstRun === false && !developerMode && page.url.pathname.includes('/terminal')) {
+			goto(`${base}/comms`, { replaceState: true });
+		}
+
 		// Phase 2: warm the SWR cache with the panels the user is most
 		// likely to navigate to. Fire-and-forget — failures fall through
 		// to a normal fetch when the user actually clicks the tab.
@@ -752,8 +786,18 @@
 	<div class="mobile-overlay" onclick={closeMobileMenu}></div>
 {/if}
 
-{#if page.url.pathname.includes('/setup') || page.url.pathname.includes('/atlas') || page.url.pathname.includes('/atlas-v2') || page.url.pathname.includes('/kronos') || page.url.pathname.includes('/crucible') || page.url.pathname.includes('/compose') || page.url.pathname.includes('/call') || page.url.pathname.includes('/comms')}
+{#if page.url.pathname.includes('/setup') || page.url.pathname.includes('/atlas') || page.url.pathname.includes('/atlas-v2') || page.url.pathname.includes('/kronos') || page.url.pathname.includes('/crucible') || page.url.pathname.includes('/compose') || page.url.pathname.includes('/call') || (page.url.pathname.includes('/comms') && page.url.searchParams.get('popup') === '1')}
 	{@render children()}
+{:else if isFirstRun === true && !page.url.pathname.includes('/setup')}
+	<div class="first-run-gate-splash">
+		<div class="gate-spinner"></div>
+		<div class="gate-text">Redirecting to setup…</div>
+	</div>
+{:else if isFirstRun === null && !page.url.pathname.includes('/setup')}
+	<div class="first-run-gate-splash">
+		<div class="gate-spinner"></div>
+		<div class="gate-text">Connecting to Phoenix…</div>
+	</div>
 {:else}
 <div class="shell">
 	{#if currentTheme === 'vibe'}
@@ -1083,6 +1127,7 @@
 					<div class="user-dropdown-backdrop" onclick={closeUserMenu}></div>
 					<div class="user-dropdown">
 						<a href="{base}/settings" class="dropdown-item" onclick={closeUserMenu}>Settings</a>
+						<a href="{base}/help" class="dropdown-item" onclick={closeUserMenu}>Help &amp; User Guide</a>
 						<button class="dropdown-item danger" onclick={() => { localStorage.removeItem('phoenix_token'); localStorage.removeItem('pan_token'); location.reload(); }}>Sign Out</button>
 					</div>
 				{/if}
@@ -1104,6 +1149,18 @@
 			<div class="topbar-spacer"></div>
 			<TopbarStatus />
 		</div>
+		{#if serverStatus === 'offline'}
+			<div class="offline-recovery-bar">
+				<div class="offline-bar-left">
+					<span class="offline-dot"></span>
+					<span class="offline-title">Phoenix Service Disconnected</span>
+					<span class="offline-sub">The local Phoenix engine is resting or unreachable.</span>
+				</div>
+				<button class="offline-reconnect-btn" onclick={checkHealth}>
+					Reconnect Now
+				</button>
+			</div>
+		{/if}
 		<div class="content-body">
 			{@render children()}
 		</div>
@@ -1129,6 +1186,52 @@
 		color: var(--phoenix-text, #cdd6f4);
 		overflow: hidden;
 		height: 100%;
+	}
+
+	.offline-recovery-bar {
+		background: rgba(239, 68, 68, 0.15);
+		border-bottom: 1px solid rgba(239, 68, 68, 0.3);
+		padding: 10px 20px;
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		color: #fecaca;
+		font-size: 0.88rem;
+		flex-shrink: 0;
+	}
+	.offline-bar-left {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+	}
+	.offline-dot {
+		width: 8px;
+		height: 8px;
+		border-radius: 50%;
+		background: #ef4444;
+		box-shadow: 0 0 8px #ef4444;
+	}
+	.offline-title {
+		font-weight: 600;
+		color: #ffffff;
+	}
+	.offline-sub {
+		color: #fca5a5;
+		font-size: 0.82rem;
+	}
+	.offline-reconnect-btn {
+		background: rgba(239, 68, 68, 0.25);
+		color: #ffffff;
+		border: 1px solid rgba(239, 68, 68, 0.5);
+		padding: 4px 12px;
+		border-radius: 6px;
+		font-size: 0.82rem;
+		font-weight: 500;
+		cursor: pointer;
+		transition: all 0.15s ease;
+	}
+	.offline-reconnect-btn:hover {
+		background: rgba(239, 68, 68, 0.4);
 	}
 
 	:global(::-webkit-scrollbar) { width: 6px; height: 6px; }
@@ -3165,5 +3268,36 @@
 		line-height: 1;
 		letter-spacing: 8px;
 		user-select: none;
+	}
+
+	/* First run route gate splash */
+	.first-run-gate-splash {
+		height: 100vh;
+		width: 100vw;
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		justify-content: center;
+		background: #0a0a0f;
+		color: #89b4fa;
+		font-family: inherit;
+		gap: 16px;
+	}
+	.gate-spinner {
+		width: 32px;
+		height: 32px;
+		border: 3px solid rgba(137, 180, 250, 0.2);
+		border-top-color: #89b4fa;
+		border-radius: 50%;
+		animation: gate-spin 0.8s linear infinite;
+	}
+	@keyframes gate-spin {
+		to { transform: rotate(360deg); }
+	}
+	.gate-text {
+		font-size: 14px;
+		font-weight: 500;
+		color: #cdd6f4;
+		letter-spacing: 0.5px;
 	}
 </style>

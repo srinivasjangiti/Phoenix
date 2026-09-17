@@ -232,11 +232,11 @@ export async function getReadinessState() {
     };
   }
 
-  // 6. Selected AI Model
-  let selectedModelName = 'none';
+  // 6. Selected AI Model — Truthful readiness with zero fake substitutions
+  let configuredModel = null;
   try {
-    const sel = get("SELECT model, provider FROM model_selections WHERE purpose = 'vision' OR purpose = 'general' LIMIT 1");
-    if (sel) selectedModelName = sel.model;
+    const sel = get("SELECT model, provider FROM model_selections WHERE purpose = 'chat_local' LIMIT 1");
+    if (sel?.model) configuredModel = sel.model;
   } catch {}
 
   if (aiChoice === 'keyword') {
@@ -266,22 +266,30 @@ export async function getReadinessState() {
   } else {
     // Local AI mode
     if (ollamaProbe.reachable) {
-      const hasModel = ollamaProbe.models.some(m =>
-        m.startsWith('gemma4') || m.startsWith('llama') || m.startsWith('qwen') || m.startsWith('mistral')
-      );
-      if (hasModel) {
+      const probeModelList = ollamaProbe.models.map(m => typeof m === 'object' ? (m.name || m.model) : m);
+      const isConfiguredInstalled = configuredModel && probeModelList.includes(configuredModel);
+
+      if (isConfiguredInstalled) {
         components.selected_model = {
           label: 'Selected AI Model',
           status: 'READY',
-          message: `Local model ready (${ollamaProbe.models[0]})`,
-          details: { active_model: ollamaProbe.models[0] },
+          message: `Local model ready (${configuredModel})`,
+          details: { active_model: configuredModel, verified: true },
+        };
+      } else if (probeModelList.length > 0) {
+        // Models are installed in Ollama, but the configured one is not among them
+        components.selected_model = {
+          label: 'Selected AI Model',
+          status: 'NEEDS_ACTION',
+          message: `Configured model "${configuredModel || 'none'}" is not installed in local Ollama`,
+          details: { configured: configuredModel, installed: probeModelList },
         };
       } else {
         components.selected_model = {
           label: 'Selected AI Model',
           status: 'NEEDS_ACTION',
-          message: 'Local AI is running, but no suitable model has been downloaded yet',
-          details: { available_models: ollamaProbe.models },
+          message: 'Local AI is running, but no AI models are installed yet',
+          details: { configured: configuredModel, installed: [] },
         };
       }
     } else {
@@ -289,7 +297,7 @@ export async function getReadinessState() {
         label: 'Selected AI Model',
         status: components.local_ai.status === 'UNAVAILABLE' ? 'UNAVAILABLE' : 'NEEDS_ACTION',
         message: 'Waiting for local AI engine before model can be loaded',
-        details: {},
+        details: { configured: configuredModel },
       };
     }
   }
@@ -375,6 +383,7 @@ export function completeSetup(payload = {}) {
   const entries = [
     ['first_run_complete', '1'],
     ['first_run_at', new Date().toISOString()],
+    ['ai_choice', aiChoice],
     ['ai_engine_choice', aiChoice],
     ['permissions_confirmed', '1'],
     ['screen_enabled', screenEnabled ? '1' : '0'],
